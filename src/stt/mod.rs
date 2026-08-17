@@ -25,6 +25,8 @@ const EVENT_QUEUE_CAPACITY: usize = 64;
 const STABLE_PASSES_TO_FINAL: u8 = 2;
 // เวิร์กเกอร์พักสั้น ๆ ระหว่างรอบเพื่อรับคำสั่งได้ไวโดยไม่วนใช้ CPU เปล่า
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(10);
+// ระดับ RMS ต่ำกว่านี้ถือเป็นความเงียบและไม่ส่งเข้าโมเดล Whisper
+const SILENCE_RMS_THRESHOLD: f32 = 0.001;
 
 /// ค่าคงที่ที่ใช้สร้างเซสชันอนุมาน Whisper ภายในเครื่องหนึ่งเซสชัน
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -335,6 +337,8 @@ struct ActiveStt {
     previous_hypothesis: String,
     /// จำนวนรอบต่อเนื่องที่สมมติฐานไม่เปลี่ยน
     stable_passes: u8,
+    /// ป้องกันการสร้างขอบเขต segment ซ้ำทุกครั้งที่รับ sample เงียบต่อเนื่อง
+    silence_active: bool,
 }
 
 /// ผลจากการอนุมานหนึ่งรอบพร้อมค่าหน่วงเวลาสำหรับหน้า Performance
@@ -388,6 +392,7 @@ impl ActiveStt {
             segment_id: 1,
             previous_hypothesis: String::new(),
             stable_passes: 0,
+            silence_active: true,
         })
     }
 
@@ -423,9 +428,22 @@ impl ActiveStt {
         if self.samples_since_inference < self.step_samples {
             return Ok(None);
         }
+        let pending_samples = self.samples_since_inference.min(self.rolling_audio.len());
         self.samples_since_inference = 0;
 
         let audio = self.rolling_audio.make_contiguous();
+        let pending_start = audio.len().saturating_sub(pending_samples);
+        let input_is_silent = !has_audible_signal(&audio[pending_start..]);
+        if input_is_silent {
+            if self.silence_active {
+                self.reset_audio();
+            } else {
+                self.reset_discontinuity();
+            }
+            return Ok(None);
+        }
+        self.silence_active = false;
+
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         params.set_language(Some(&self.config.language));
         params.set_translate(false);
@@ -531,6 +549,7 @@ impl ActiveStt {
         self.previous_hypothesis.clear();
         self.stable_passes = 0;
         self.segment_id = self.segment_id.saturating_add(1);
+        self.silence_active = true;
     }
 }
 
@@ -557,6 +576,20 @@ fn validate_config(config: &SttStartConfig) -> Result<(), String> {
 /// แปลงมิลลิวินาทีเป็นจำนวนตัวอย่างตามอัตราตัวอย่างกลางของระบบ
 fn milliseconds_to_samples(milliseconds: u32) -> usize {
     (u64::from(milliseconds) * u64::from(SAMPLE_RATE_HZ) / 1_000) as usize
+}
+
+/// ตรวจว่าช่วง sample ใหม่มีพลังงานพอที่จะคุ้มกับการเรียก Whisper หรือไม่
+fn has_audible_signal(samples: &[f32]) -> bool {
+    if samples.is_empty() {
+        return false;
+    }
+
+    let mean_square = samples
+        .iter()
+        .map(|sample| f64::from(*sample) * f64::from(*sample))
+        .sum::<f64>()
+        / samples.len() as f64;
+    mean_square.sqrt() >= f64::from(SILENCE_RMS_THRESHOLD)
 }
 
 /// รวมทุกช่วงข้อความดิบของ Whisper เพื่อให้ผู้เรียกกรองและบันทึกเทียบกันได้
