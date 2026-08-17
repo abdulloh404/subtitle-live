@@ -234,7 +234,7 @@ impl DynamicApplications {
             )
             .valign(gtk::Align::Center)
             .build();
-        row.add_suffix(&app_switch);
+        row.add_action(&app_switch);
 
         let identity = group.identity.clone();
         let dynamic = self.clone();

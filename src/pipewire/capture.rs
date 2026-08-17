@@ -1,8 +1,8 @@
 use std::{mem::size_of, time::Instant};
 
+use libspa_sys as spa_sys;
 use pipewire as pw;
-use pw::{properties::properties, spa};
-use spa::pod::Pod;
+use pw::{prelude::*, spa};
 
 use crate::audio::{LatestQueue, SAMPLE_RATE_HZ, SourceAudioChunk};
 
@@ -14,8 +14,7 @@ struct CaptureUserData {
 }
 
 pub(super) struct CaptureSession {
-    _listener: pw::stream::StreamListener<CaptureUserData>,
-    stream: pw::stream::StreamRc,
+    stream: pw::stream::Stream<CaptureUserData>,
 }
 
 impl CaptureSession {
@@ -25,7 +24,7 @@ impl CaptureSession {
 }
 
 pub(super) fn create_capture(
-    core: &pw::core::CoreRc,
+    mainloop: &pw::MainLoop,
     info: &StreamInfo,
     audio: LatestQueue<SourceAudioChunk>,
     events: std::sync::mpsc::Sender<PipeWireEvent>,
@@ -42,30 +41,25 @@ pub(super) fn create_capture(
             )
         })?;
 
-    // Literal keys keep compatibility with the crate's baseline feature set.
-    let stream = pw::stream::StreamRc::new(
-        core.clone(),
+    let stream = pw::stream::Stream::with_user_data(
+        mainloop,
         "subtitle-live-selected-capture",
-        properties! {
+        pw::properties! {
             *pw::keys::MEDIA_TYPE => "Audio",
             *pw::keys::MEDIA_CATEGORY => "Capture",
             *pw::keys::MEDIA_ROLE => "Speech",
             "target.object" => target,
             "node.dont-reconnect" => "true",
         },
+        CaptureUserData {
+            audio,
+            source_id: info.runtime_id,
+        },
     )
-    .map_err(|error| {
-        format!(
-            "failed to create capture for stream {}: {error}",
-            info.runtime_id
-        )
-    })?;
-
-    let state_events = events.clone();
-    let source_id = info.runtime_id;
-    let listener = stream
-        .add_local_listener_with_user_data(CaptureUserData { audio, source_id })
-        .state_changed(move |_, _, _, state| match state {
+    .state_changed({
+        let state_events = events.clone();
+        let source_id = info.runtime_id;
+        move |_, state| match state {
             pw::stream::StreamState::Streaming => {
                 let _ = state_events.send(PipeWireEvent::CaptureStarted(source_id));
             }
@@ -78,70 +72,92 @@ pub(super) fn create_capture(
                 });
             }
             _ => {}
-        })
-        .process(|stream, user_data| {
-            let Some(mut buffer) = stream.dequeue_buffer() else {
-                return;
-            };
-            let Some(data) = buffer.datas_mut().first_mut() else {
-                return;
-            };
+        }
+    })
+    .process(|stream, user_data| {
+        let Some(mut buffer) = stream.dequeue_buffer() else {
+            return;
+        };
+        let Some(data) = buffer.datas_mut().first_mut() else {
+            return;
+        };
 
-            let offset = data.chunk().offset() as usize;
-            let size = data.chunk().size() as usize;
-            let Some(bytes) = data.data() else {
-                return;
-            };
-            let end = offset.saturating_add(size).min(bytes.len());
-            if offset >= end {
-                return;
-            }
+        let offset = data.chunk().offset() as usize;
+        let size = data.chunk().size() as usize;
+        let Some(bytes) = data.data() else {
+            return;
+        };
+        let end = offset.saturating_add(size).min(bytes.len());
+        if offset >= end {
+            return;
+        }
 
-            let samples: Vec<_> = bytes[offset..end]
-                .chunks_exact(size_of::<f32>())
-                .map(|sample| f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]))
-                .collect();
-            let captured_end = Instant::now();
-            let sample_duration =
-                std::time::Duration::from_secs_f64(samples.len() as f64 / SAMPLE_RATE_HZ as f64);
-            user_data.audio.push_latest(SourceAudioChunk {
-                source_id: user_data.source_id,
-                samples,
-                captured_at: captured_end.checked_sub(sample_duration).unwrap_or(captured_end),
-            });
-        })
-        .register()
-        .map_err(|error| {
-            format!(
-                "failed to register capture listener for stream {}: {error}",
-                info.runtime_id
-            )
-        })?;
+        let samples: Vec<_> = bytes[offset..end]
+            .chunks_exact(size_of::<f32>())
+            .map(|sample| f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]))
+            .collect();
+        let captured_end = Instant::now();
+        let sample_duration =
+            std::time::Duration::from_secs_f64(samples.len() as f64 / SAMPLE_RATE_HZ as f64);
+        user_data.audio.push_latest(SourceAudioChunk {
+            source_id: user_data.source_id,
+            samples,
+            captured_at: captured_end.checked_sub(sample_duration).unwrap_or(captured_end),
+        });
+    })
+    .create()
+    .map_err(|error| {
+        format!(
+            "failed to create capture for stream {}: {error}",
+            info.runtime_id
+        )
+    })?;
 
-    let mut audio_info = spa::param::audio::AudioInfoRaw::new();
-    audio_info.set_format(spa::param::audio::AudioFormat::F32LE);
-    audio_info.set_rate(SAMPLE_RATE_HZ);
-    audio_info.set_channels(1);
-    let values = pw::spa::pod::serialize::PodSerializer::serialize(
+    let format = spa::pod::Value::Object(spa::pod::Object {
+        type_: spa_sys::SPA_TYPE_OBJECT_Format,
+        id: spa_sys::SPA_PARAM_EnumFormat,
+        properties: vec![
+            spa::pod::Property {
+                key: spa_sys::SPA_FORMAT_mediaType,
+                flags: spa::pod::PropertyFlags::empty(),
+                value: spa::pod::Value::Id(spa::utils::Id(spa_sys::SPA_MEDIA_TYPE_audio)),
+            },
+            spa::pod::Property {
+                key: spa_sys::SPA_FORMAT_mediaSubtype,
+                flags: spa::pod::PropertyFlags::empty(),
+                value: spa::pod::Value::Id(spa::utils::Id(spa_sys::SPA_MEDIA_SUBTYPE_raw)),
+            },
+            spa::pod::Property {
+                key: spa_sys::SPA_FORMAT_AUDIO_format,
+                flags: spa::pod::PropertyFlags::empty(),
+                value: spa::pod::Value::Id(spa::utils::Id(spa_sys::SPA_AUDIO_FORMAT_F32_LE)),
+            },
+            spa::pod::Property {
+                key: spa_sys::SPA_FORMAT_AUDIO_rate,
+                flags: spa::pod::PropertyFlags::empty(),
+                value: spa::pod::Value::Int(SAMPLE_RATE_HZ as i32),
+            },
+            spa::pod::Property {
+                key: spa_sys::SPA_FORMAT_AUDIO_channels,
+                flags: spa::pod::PropertyFlags::empty(),
+                value: spa::pod::Value::Int(1),
+            },
+        ],
+    });
+    let values = spa::pod::serialize::PodSerializer::serialize(
         std::io::Cursor::new(Vec::new()),
-        &pw::spa::pod::Value::Object(pw::spa::pod::Object {
-            type_: pw::spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
-            id: pw::spa::param::ParamType::EnumFormat.as_raw(),
-            properties: audio_info.into(),
-        }),
+        &format,
     )
     .map_err(|error| format!("failed to serialize capture format: {error}"))?
     .0
     .into_inner();
-    let mut params = [Pod::from_bytes(&values)
-        .ok_or_else(|| "failed to create PipeWire capture format".to_owned())?];
+    let mut params = [values.as_ptr().cast()];
 
     stream
         .connect(
-            spa::utils::Direction::Input,
+            spa::Direction::Input,
             None,
-            pw::stream::StreamFlags::AUTOCONNECT
-                | pw::stream::StreamFlags::MAP_BUFFERS,
+            pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
             &mut params,
         )
         .map_err(|error| {
@@ -151,8 +167,5 @@ pub(super) fn create_capture(
             )
         })?;
 
-    Ok(CaptureSession {
-        _listener: listener,
-        stream,
-    })
+    Ok(CaptureSession { stream })
 }

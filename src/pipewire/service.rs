@@ -8,6 +8,7 @@ use std::{
 };
 
 use pipewire as pw;
+use pw::spa::prelude::*;
 
 use crate::audio::{LatestQueue, SourceAudioChunk};
 
@@ -16,6 +17,7 @@ use super::{
     capture::{CaptureSession, create_capture},
 };
 
+#[derive(Clone)]
 enum Command {
     SetSelected(Vec<CaptureTarget>),
     StopCapture,
@@ -122,12 +124,12 @@ fn run_service(
     pw::init();
 
     let result = (|| -> Result<(), pw::Error> {
-        let mainloop = pw::main_loop::MainLoopRc::new(None)?;
-        let context = pw::context::ContextRc::new(&mainloop, None)?;
-        let core = context.connect_rc(None)?;
-        let registry = core.get_registry_rc()?;
+        let mainloop = pw::MainLoop::new()?;
+        let context = pw::Context::new(&mainloop)?;
+        let core = context.connect(None)?;
+        let registry = core.get_registry()?;
         let state = Rc::new(RefCell::new(ServiceState::new(
-            core.clone(),
+            mainloop.clone(),
             events.clone(),
             audio,
         )));
@@ -159,7 +161,7 @@ fn run_service(
 
         let command_state = Rc::clone(&state);
         let command_loop = mainloop.clone();
-        let _commands = command_receiver.attach(mainloop.loop_(), move |command| {
+        let _commands = command_receiver.attach(&mainloop, move |command| {
             let mut state = command_state.borrow_mut();
             match command {
                 Command::SetSelected(targets) => state.set_selected(targets),
@@ -184,7 +186,7 @@ fn run_service(
 }
 
 struct ServiceState {
-    core: pw::core::CoreRc,
+    mainloop: pw::MainLoop,
     events: mpsc::Sender<PipeWireEvent>,
     audio: LatestQueue<SourceAudioChunk>,
     streams: HashMap<u32, StreamInfo>,
@@ -195,12 +197,12 @@ struct ServiceState {
 
 impl ServiceState {
     fn new(
-        core: pw::core::CoreRc,
+        mainloop: pw::MainLoop,
         events: mpsc::Sender<PipeWireEvent>,
         audio: LatestQueue<SourceAudioChunk>,
     ) -> Self {
         Self {
-            core,
+            mainloop,
             events,
             audio,
             streams: HashMap::new(),
@@ -265,7 +267,7 @@ impl ServiceState {
             .filter_map(|runtime_id| self.streams.get(&runtime_id).cloned())
             .collect();
         for stream in missing {
-            match create_capture(&self.core, &stream, self.audio.clone(), self.events.clone()) {
+            match create_capture(&self.mainloop, &stream, self.audio.clone(), self.events.clone()) {
                 Ok(capture) => {
                     self.captures.insert(stream.runtime_id, capture);
                 }
@@ -295,12 +297,12 @@ impl ServiceState {
 }
 
 fn normalize_stream(
-    object: &pw::registry::GlobalObject<&pw::spa::utils::dict::DictRef>,
+    object: &pw::registry::GlobalObject<pw::spa::dict::ForeignDict>,
 ) -> Option<StreamInfo> {
     if object.type_ != pw::types::ObjectType::Node {
         return None;
     }
-    let properties = object.props?;
+    let properties = object.props.as_ref()?;
     if properties.get(*pw::keys::MEDIA_CLASS) != Some("Stream/Output/Audio") {
         return None;
     }
@@ -318,7 +320,7 @@ fn normalize_stream(
     })
 }
 
-fn owned_property(properties: &pw::spa::utils::dict::DictRef, key: &str) -> Option<String> {
+fn owned_property(properties: &pw::spa::dict::ForeignDict, key: &str) -> Option<String> {
     properties
         .get(key)
         .filter(|value| !value.is_empty())
