@@ -11,6 +11,8 @@ use gtk::{gdk, glib};
 
 use crate::{config::SubtitleConfig, subtitle::CaptionLineBuffer};
 
+use super::shell::ShellOverlayBridge;
+
 /// ระยะเวลาคงข้อความ final ไว้ก่อนซ่อนเมื่อไม่มีข้อความรุ่นใหม่
 const FINAL_HOLD_TIME: Duration = Duration::from_secs(4);
 // พื้นหลังเว้นซ้ายและขวาข้างละ 20 พิกเซล จึงต้องหักออกก่อนวัดข้อความ
@@ -32,6 +34,8 @@ pub struct OverlayPresenter {
     label: gtk::Label,
     /// ข้อความต้นทางล่าสุดสำหรับจัดรูปแบบใหม่เมื่อ config เปลี่ยน
     last_text: RefCell<String>,
+    /// renderer ของ GNOME Shell ซึ่งอยู่เหนือหน้าต่างและไม่ปรากฏใน Overview
+    shell_bridge: Option<ShellOverlayBridge>,
     /// กล่องที่กำหนดตำแหน่ง anchor บนหน้าจอ
     surface: gtk::Box,
     /// หน้าต่างโปร่งใสที่ไม่รับ input
@@ -74,10 +78,7 @@ impl OverlayPresenter {
             .valign(gtk::Align::Fill)
             .build();
         root.add_css_class("subtitle-live-overlay-root");
-        let canvas = gtk::Box::builder()
-            .hexpand(true)
-            .vexpand(true)
-            .build();
+        let canvas = gtk::Box::builder().hexpand(true).vexpand(true).build();
         root.set_child(Some(&canvas));
         root.add_overlay(&surface);
 
@@ -102,6 +103,15 @@ impl OverlayPresenter {
         });
         window.maximize();
 
+        let shell_bridge = ShellOverlayBridge::new(application, config)
+            .inspect_err(|error| {
+                tracing::warn!(
+                    error = %error,
+                    "เริ่ม GNOME Shell overlay ไม่ได้; จะใช้ GTK fallback"
+                );
+            })
+            .ok();
+
         let presenter = Self {
             applied_config: RefCell::new(None),
             css_provider,
@@ -110,6 +120,7 @@ impl OverlayPresenter {
             generation: Rc::new(Cell::new(0)),
             label,
             last_text: RefCell::new(String::new()),
+            shell_bridge,
             surface,
             window,
         };
@@ -126,11 +137,7 @@ impl OverlayPresenter {
         if source_text.is_empty() {
             return;
         }
-        let config = self
-            .applied_config
-            .borrow()
-            .clone()
-            .unwrap_or_default();
+        let config = self.applied_config.borrow().clone().unwrap_or_default();
         let text = self.format_caption(source_text, &config);
         if text.is_empty() {
             return;
@@ -138,9 +145,10 @@ impl OverlayPresenter {
 
         self.label.set_label(&text);
         self.last_text.replace(source_text.to_owned());
-        // GTK toplevel ปกติขอ always-on-top แบบถาวรบน GNOME Wayland ไม่ได้
-        // จึง present ใหม่ทุก frame เพื่อขอยกหน้าต่างโดยไม่รับ focus หรือ input
-        self.window.present();
+        if let Some(bridge) = &self.shell_bridge {
+            bridge.show(&text, is_final);
+        }
+        self.sync_renderer();
 
         let next_generation = self.generation.get().wrapping_add(1);
         self.generation.set(next_generation);
@@ -159,11 +167,13 @@ impl OverlayPresenter {
 
     /// ล้างข้อความและซ่อนหน้าต่าง พร้อมยกเลิก final timeout รุ่นก่อนหน้า
     pub fn hide(&self) {
-        self.generation
-            .set(self.generation.get().wrapping_add(1));
+        self.generation.set(self.generation.get().wrapping_add(1));
         self.label.set_label("");
         self.line_buffer.borrow_mut().clear();
         self.last_text.borrow_mut().clear();
+        if let Some(bridge) = &self.shell_bridge {
+            bridge.hide();
+        }
         self.window.hide();
     }
 
@@ -177,15 +187,24 @@ impl OverlayPresenter {
 
     /// นำตำแหน่ง รูปแบบ และขอบเขตบรรทัดใหม่ไปใช้กับข้อความปัจจุบัน
     pub fn apply_config(&self, config: &SubtitleConfig) {
+        // renderer อาจเพิ่ง register หรือ unregister โดย config ไม่เปลี่ยน
+        self.sync_renderer();
         if self.applied_config.borrow().as_ref() == Some(config) {
             return;
         }
+        if let Some(bridge) = &self.shell_bridge {
+            bridge.configure(config);
+        }
 
-        let layout_changed = self.applied_config.borrow().as_ref().is_none_or(|previous| {
-            previous.font_size != config.font_size
-                || previous.width_px != config.width_px
-                || previous.max_lines != config.max_lines
-        });
+        let layout_changed = self
+            .applied_config
+            .borrow()
+            .as_ref()
+            .is_none_or(|previous| {
+                previous.font_size != config.font_size
+                    || previous.width_px != config.width_px
+                    || previous.max_lines != config.max_lines
+            });
         self.set_enabled(config.visible);
         apply_position(&self.surface, &config.position);
         // ปล่อยให้พื้นหลังขยายตามข้อความจริง ส่วน width_px ใช้เป็นเพดานตอนตัดบรรทัด
@@ -205,6 +224,23 @@ impl OverlayPresenter {
             }
         }
         self.applied_config.replace(Some(config.clone()));
+    }
+
+    /// เลือก renderer เพียงตัวเดียว และให้ GTK กลับมาเมื่อ Extension หยุดทำงาน
+    fn sync_renderer(&self) {
+        if self
+            .shell_bridge
+            .as_ref()
+            .is_some_and(ShellOverlayBridge::renderer_active)
+        {
+            // ไม่ส่งคำสั่ง hide ซ้ำ 50 ครั้งต่อวินาทีใน runtime poll
+            if self.window.is_visible() {
+                self.window.hide();
+            }
+        } else if self.enabled.get() && !self.label.label().is_empty() {
+            // GTK toplevel เป็น fallback สำหรับ desktop ที่ไม่มี Extension
+            self.window.present();
+        }
     }
 
     /// วัดข้อความด้วย Pango ตามขนาดฟอนต์จริง แล้วส่งผลให้คิวตัดและดันบรรทัด

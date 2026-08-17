@@ -1,5 +1,5 @@
 # คำสั่งลัดสำหรับ build, run, ตรวจรูปแบบ และดาวน์โหลดโมเดล
-.PHONY: build release run format lint test model
+.PHONY: build release run format lint test model install-extension
 
 # สร้าง debug binary สำหรับพัฒนา
 build:
@@ -28,3 +28,7 @@ test:
 # ดาวน์โหลดและตรวจ checksum ของโมเดล small.en เริ่มต้น
 model:
 	./scripts/download-model.sh
+
+# ติดตั้งและเปิด GNOME Shell overlay สำหรับ user ปัจจุบัน
+install-extension:
+	./scripts/install-gnome-extension.sh

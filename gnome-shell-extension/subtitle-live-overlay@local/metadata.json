@@ -1,0 +1,7 @@
+{
+  "uuid": "subtitle-live-overlay@local",
+  "name": "Subtitle-live Overlay",
+  "description": "แสดงคำบรรยายของ Subtitle-live เหนือหน้าต่างบน GNOME Shell",
+  "shell-version": ["42"],
+  "version": 2
+}
