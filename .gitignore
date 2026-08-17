@@ -4,3 +4,6 @@
 # Local model assets are installed separately and must not be committed.
 /models/
 
+# Document file
+/*.md
+/docs/*.md

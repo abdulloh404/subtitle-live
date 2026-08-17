@@ -4,7 +4,7 @@ use adw::prelude::*;
 use gtk::glib;
 
 use crate::{
-    app::{AppCommand, ApplicationController, ApplicationState},
+    app::{AppCommand, AppEvent, ApplicationController, ApplicationState},
     config::AppConfig,
 };
 
@@ -20,6 +20,7 @@ pub fn present_settings(
     }
 
     let snapshot = UiSnapshot::from_controller(&controller.borrow());
+    let status_label = value_label(&snapshot.status);
     let window = adw::PreferencesWindow::builder()
         .application(application)
         .default_height(680)
@@ -30,16 +31,32 @@ pub fn present_settings(
         .build();
     window.set_widget_name(SETTINGS_WINDOW_NAME);
 
-    window.add(&general_page(&snapshot, controller));
+    window.add(&general_page(
+        &snapshot,
+        Rc::clone(&controller),
+        status_label.clone(),
+    ));
     window.add(&audio_sources_page(&snapshot));
     window.add(&speech_recognition_page(&snapshot));
     window.add(&subtitle_page(&snapshot));
-    window.add(&performance_page(&snapshot));
+    window.add(&performance_page(&snapshot, &status_label));
     window.add(&about_page());
 
-    window.connect_close_request(|window| {
-        window.hide();
-        glib::Propagation::Stop
+    window.connect_close_request(move |window| {
+        if controller
+            .borrow()
+            .config()
+            .general
+            .keep_running_when_closed
+        {
+            window.hide();
+            glib::Propagation::Stop
+        } else {
+            if let Some(application) = window.application() {
+                application.quit();
+            }
+            glib::Propagation::Proceed
+        }
     });
     window.present();
 }
@@ -55,6 +72,7 @@ fn existing_settings_window(application: &adw::Application) -> Option<adw::Prefe
 fn general_page(
     snapshot: &UiSnapshot,
     controller: Rc<RefCell<ApplicationController>>,
+    status_label: gtk::Label,
 ) -> adw::PreferencesPage {
     let page = preferences_page("General", "preferences-system-symbolic");
     let group = adw::PreferencesGroup::builder().title("General").build();
@@ -65,23 +83,33 @@ fn general_page(
         snapshot.live_subtitles,
         true,
     );
+    let live_controller = Rc::clone(&controller);
     live_switch.connect_state_set(move |_, active| {
         let command = if active {
             AppCommand::StartSubtitles
         } else {
             AppCommand::StopSubtitles
         };
-        let _ = controller.borrow_mut().handle_command(command);
+        let event = live_controller.borrow_mut().handle_command(command);
+        if let AppEvent::StateChanged(state) = event {
+            status_label.set_label(state_label(state));
+        }
         glib::Propagation::Proceed
     });
     group.add(&live_row);
 
-    let (keep_running_row, _) = switch_row(
+    let (keep_running_row, keep_running_switch) = switch_row(
         "Keep Running When Closed",
         "Closing this window hides it without stopping subtitles",
         snapshot.keep_running_when_closed,
-        false,
+        true,
     );
+    keep_running_switch.connect_state_set(move |_, active| {
+        let _ = controller
+            .borrow_mut()
+            .handle_command(AppCommand::SetKeepRunningWhenClosed(active));
+        glib::Propagation::Proceed
+    });
     group.add(&keep_running_row);
     page.add(&group);
     page
@@ -143,9 +171,7 @@ fn speech_recognition_page(snapshot: &UiSnapshot) -> adw::PreferencesPage {
 
 fn subtitle_page(snapshot: &UiSnapshot) -> adw::PreferencesPage {
     let page = preferences_page("Subtitle", "insert-text-symbolic");
-    let appearance_group = adw::PreferencesGroup::builder()
-        .title("Appearance")
-        .build();
+    let appearance_group = adw::PreferencesGroup::builder().title("Appearance").build();
 
     let (visible_row, _) = switch_row(
         "Show Subtitle",
@@ -171,11 +197,11 @@ fn subtitle_page(snapshot: &UiSnapshot) -> adw::PreferencesPage {
     page
 }
 
-fn performance_page(snapshot: &UiSnapshot) -> adw::PreferencesPage {
+fn performance_page(snapshot: &UiSnapshot, status_label: &gtk::Label) -> adw::PreferencesPage {
     let page = preferences_page("Performance", "utilities-system-monitor-symbolic");
 
     let status_group = adw::PreferencesGroup::builder().title("Pipeline").build();
-    status_group.add(&value_row("Status", &snapshot.status));
+    status_group.add(&value_row_with_label("Status", status_label));
     status_group.add(&value_row("Model", &snapshot.model));
     status_group.add(&value_row("Backend", &snapshot.backend));
     page.add(&status_group);
@@ -200,7 +226,9 @@ fn performance_page(snapshot: &UiSnapshot) -> adw::PreferencesPage {
 
 fn about_page() -> adw::PreferencesPage {
     let page = preferences_page("About", "help-about-symbolic");
-    let group = adw::PreferencesGroup::builder().title("Subtitle-live").build();
+    let group = adw::PreferencesGroup::builder()
+        .title("Subtitle-live")
+        .build();
     group.add(&message_row(
         "Local English Live Subtitles",
         "Captures selected application audio and processes it locally.",
@@ -239,15 +267,22 @@ fn switch_row(
 }
 
 fn value_row(title: &str, value: &str) -> adw::ActionRow {
-    let value_label = gtk::Label::builder()
+    value_row_with_label(title, &value_label(value))
+}
+
+fn value_label(value: &str) -> gtk::Label {
+    let label = gtk::Label::builder()
         .label(value)
         .selectable(true)
         .valign(gtk::Align::Center)
         .build();
-    value_label.add_css_class("dim-label");
+    label.add_css_class("dim-label");
+    label
+}
 
+fn value_row_with_label(title: &str, value_label: &gtk::Label) -> adw::ActionRow {
     let row = adw::ActionRow::builder().title(title).build();
-    row.add_suffix(&value_label);
+    row.add_suffix(value_label);
     row
 }
 
@@ -304,8 +339,7 @@ impl UiSnapshot {
             subtitle_visible: config.subtitle.visible,
             subtitle_position: display_identifier(&config.subtitle.position),
             font_size: config.subtitle.font_size,
-            background_opacity_percent: (config.subtitle.background_opacity * 100.0).round()
-                as u32,
+            background_opacity_percent: (config.subtitle.background_opacity * 100.0).round() as u32,
             maximum_lines: config.subtitle.max_lines,
             show_metrics: config.performance.show_metrics,
             status: state_label(controller.state()).to_owned(),

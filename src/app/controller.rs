@@ -10,15 +10,12 @@ pub struct ApplicationController {
 impl ApplicationController {
     pub fn new(config: AppConfig) -> Self {
         let state = if config.general.live_subtitles {
-            ApplicationState::Running
+            ApplicationState::Starting
         } else {
             ApplicationState::Stopped
         };
 
-        Self {
-            config,
-            state,
-        }
+        Self { config, state }
     }
 
     pub const fn state(&self) -> ApplicationState {
@@ -33,13 +30,17 @@ impl ApplicationController {
         match command {
             AppCommand::StartSubtitles => {
                 self.config.general.live_subtitles = true;
-                self.state = ApplicationState::Running;
+                self.state = ApplicationState::Starting;
                 AppEvent::StateChanged(self.state)
             }
             AppCommand::StopSubtitles => {
                 self.config.general.live_subtitles = false;
                 self.state = ApplicationState::Stopped;
                 AppEvent::StateChanged(self.state)
+            }
+            AppCommand::SetKeepRunningWhenClosed(enabled) => {
+                self.config.general.keep_running_when_closed = enabled;
+                AppEvent::ConfigChanged("general.keep_running_when_closed")
             }
             AppCommand::ShowSettings => AppEvent::SettingsRequested,
             AppCommand::Quit => AppEvent::QuitRequested,

@@ -2,6 +2,7 @@
 pub enum AppCommand {
     StartSubtitles,
     StopSubtitles,
+    SetKeepRunningWhenClosed(bool),
     ShowSettings,
     Quit,
 }
