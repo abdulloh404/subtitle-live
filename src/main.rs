@@ -1,4 +1,10 @@
-use std::{cell::RefCell, rc::Rc, time::Duration};
+//! จุดเริ่มต้นของแอป GTK และสะพานส่ง event จาก runtime ไปยังหน้าต่าง Settings/Overlay
+
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    time::Duration,
+};
 
 use adw::prelude::*;
 use gtk::glib;
@@ -12,14 +18,20 @@ use subtitle_live::{
     ui::SettingsPresenter,
 };
 
+/// รวม presenter ที่ต้องมีอายุเท่ากับ desktop application
 struct DesktopUi {
+    /// หน้าต่างตั้งค่าและสถานะ pipeline
     settings: SettingsPresenter,
+    /// หน้าต่างโปร่งใสที่แสดง subtitle เหนือหน้าจอ
     overlay: OverlayPresenter,
 }
 
+/// โหลด config, สร้าง GTK application และปิด worker อย่างเป็นระเบียบเมื่อ event loop จบ
 fn main() -> Result<(), AppError> {
+    // เริ่ม tracing ก่อนทำ I/O เพื่อให้ข้อผิดพลาดช่วง startup ปรากฏใน terminal
     logging::init()?;
 
+    // ถ้า config เสีย แอปยังเปิดได้ด้วยค่า default แต่จะไม่เขียนทับไฟล์เดิมโดยไม่ตั้งใจ
     let config_path = config::default_path()?;
     let loaded = config::load_config(&config_path)?;
     let persistence_enabled = loaded.warning.is_none();
@@ -58,6 +70,7 @@ fn main() -> Result<(), AppError> {
     let startup_runtime = Rc::clone(&runtime);
     let startup_config_path = config_path.clone();
     application.connect_startup(move |_| {
+        // สร้าง worker เพียงครั้งเดียว แม้ desktop environment จะ activate แอปซ้ำ
         if startup_runtime.borrow().is_none() {
             *startup_runtime.borrow_mut() = Some(ApplicationRuntime::new(
                 Rc::clone(&startup_controller),
@@ -74,6 +87,7 @@ fn main() -> Result<(), AppError> {
     let activate_runtime = Rc::clone(&runtime);
     let activate_desktop = Rc::clone(&desktop);
     application.connect_activate(move |application| {
+        // Presenter เป็น GTK object จึงต้องสร้างและใช้งานบน main thread เท่านั้น
         if activate_desktop.borrow().is_none() {
             let settings = SettingsPresenter::new(application, Rc::clone(&activate_controller));
             let subtitle_config = activate_controller.borrow().config().subtitle.clone();
@@ -116,6 +130,7 @@ fn main() -> Result<(), AppError> {
     Ok(())
 }
 
+/// Poll ช่องทาง background ทุก 50 ms แล้วนำเฉพาะ diff ไปใช้กับ GTK widgets
 fn install_runtime_poll(
     application: &adw::Application,
     controller: Rc<RefCell<ApplicationController>>,
@@ -152,6 +167,7 @@ fn install_runtime_poll(
         };
         let subtitle_config = controller.borrow().config().subtitle.clone();
         if let Some(desktop) = desktop.borrow().as_ref() {
+            // งานส่วนนี้มีเฉพาะการอัปเดต widget; model load และ inference อยู่บน worker ทั้งหมด
             desktop.settings.update_state(state, last_error.as_deref());
             desktop.settings.update_metrics(metrics);
             desktop.overlay.apply_config(&subtitle_config);

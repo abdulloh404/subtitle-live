@@ -1,4 +1,5 @@
 {
+    // แสดง .git ใน file explorer เพื่อให้ตรวจสถานะ repository ได้จาก workspace
     "files.exclude": {
         "**/.git": false
     }

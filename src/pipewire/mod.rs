@@ -1,4 +1,4 @@
-//! PipeWire graph discovery and selected-stream capture boundary.
+//! ขอบเขตสำหรับค้นหา graph ของ PipeWire และ capture เฉพาะ stream ที่เลือก
 
 mod capture;
 mod service;

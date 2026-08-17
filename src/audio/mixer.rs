@@ -1,3 +1,9 @@
+//! mixer ที่จัดแนวเสียงจาก application stream ที่เลือกด้วย timestamp
+//!
+//! worker จะจัด source buffer เป็น frame คงที่ขนาด 20 ms รอ source ที่ active
+//! ชั่วครู่ให้เวลาเสียงตรงกัน เฉลี่ยระดับเสียงเพื่อป้องกัน clipping และส่ง frame
+//! ล่าสุดต่อไปโดยไม่ขวาง capture callback
+
 use std::{
     collections::{HashMap, VecDeque},
     sync::{
@@ -10,19 +16,25 @@ use std::{
 
 use super::{LatestQueue, MIX_FRAME_SAMPLES, MixedAudioChunk, SourceAudioChunk};
 
+/// นำ source ออกจากชุดที่กำลังผสมเมื่อไม่มีเสียงนานเกินค่านี้
 const SOURCE_IDLE_TIMEOUT: Duration = Duration::from_millis(250);
+/// เวลารอสูงสุดให้ source อื่นมีข้อมูลครอบคลุม frame เดียวกัน
 const MIX_SYNC_GRACE: Duration = Duration::from_millis(30);
-
+/// ตัวควบคุมอายุและการ reset สถานะของ mixer worker เบื้องหลัง
 pub struct MixerHandle {
+    /// generation ที่เพิ่มขึ้นทุกครั้งเมื่อ caller ขอ reset
     reset_generation: Arc<AtomicU64>,
+    /// flag สำหรับขอให้ worker ออกจาก loop
     running: Arc<AtomicBool>,
 }
 
 impl MixerHandle {
+    /// ขอให้ worker หยุดอย่างร่วมมือโดยไม่บล็อกผู้เรียก
     pub fn stop(&self) {
         self.running.store(false, Ordering::Release);
     }
 
+    /// ล้าง source buffer หลังเปลี่ยนรายการ capture หรือเริ่ม pipeline ใหม่
     pub fn reset(&self) {
         self.reset_generation.fetch_add(1, Ordering::AcqRel);
     }
@@ -34,6 +46,7 @@ impl Drop for MixerHandle {
     }
 }
 
+/// เริ่ม mixer thread แยกต่างหากและคืน handle สำหรับควบคุม
 pub fn spawn_mixer(
     input: LatestQueue<SourceAudioChunk>,
     output: LatestQueue<MixedAudioChunk>,
@@ -62,11 +75,12 @@ fn run_mixer(
     input: LatestQueue<SourceAudioChunk>,
     output: LatestQueue<MixedAudioChunk>,
 ) {
+    // `next_frame_at` รักษา timeline ของ output ให้ต่อเนื่องข้าม callback ส่วน
+    // timestamp ของ source ใช้ตัดสินว่าข้อมูลแต่ละก้อนอยู่ตำแหน่งใดบน timeline
     let mut sources: HashMap<u32, SourceBuffer> = HashMap::new();
     let mut observed_reset = reset_generation.load(Ordering::Acquire);
     let mut frame_wait_started: Option<Instant> = None;
     let mut next_frame_at: Option<Instant> = None;
-
     while running.load(Ordering::Acquire) {
         let requested_reset = reset_generation.load(Ordering::Acquire);
         if requested_reset != observed_reset {
@@ -133,10 +147,12 @@ fn run_mixer(
             next_frame_at = Some(frame_end);
             frame_wait_started = None;
         }
+
         thread::sleep(Duration::from_millis(10));
     }
 }
 
+/// สร้างหนึ่ง frame ที่ `frame_start` โดยใช้เฉพาะ sample ที่มีเวลาซ้อนกับ frame
 fn mix_frame(
     sources: &mut HashMap<u32, SourceBuffer>,
     frame_start: Instant,
@@ -177,6 +193,7 @@ fn mix_frame(
         return None;
     }
 
+    // การเฉลี่ยรักษา headroom เมื่อหลาย application มีเสียงพร้อมกัน
     let divisor = contributing_sources as f32;
     for sample in &mut mixed {
         *sample = (*sample / divisor).clamp(-1.0, 1.0);
@@ -188,9 +205,13 @@ fn mix_frame(
     })
 }
 
+/// sample ที่พักไว้และ timeline ของ PipeWire node หนึ่งรายการใน session ปัจจุบัน
 struct SourceBuffer {
+    /// sample ที่ยังไม่ถูกนำไปผสม เรียงตามเวลา
     samples: VecDeque<f32>,
+    /// timestamp ของ sample แรกใน `samples`
     started_at: Instant,
+    /// timestamp ล่าสุดที่ได้รับข้อมูลจาก source
     last_seen: Instant,
 }
 

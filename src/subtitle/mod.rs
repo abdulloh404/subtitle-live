@@ -1,21 +1,36 @@
-//! Partial/final transcript reconciliation and subtitle presentation state.
+//! การรวมข้อความถอดเสียงแบบชั่วคราวและยืนยันแล้ว พร้อมสถานะที่ใช้แสดงเป็นคำบรรยาย
 
 use crate::stt::{TranscriptUpdate, normalize_hypothesis_text};
 
+// จำกัดประวัติที่แสดงเพื่อไม่ให้ข้อความสะสมเพิ่มหน่วยความจำอย่างไม่มีขอบเขต
 const DEFAULT_PRESENTATION_WORDS: usize = 64;
+// ความกว้างเป้าหมายต่อบรรทัดเมื่อผู้ใช้อนุญาตให้แสดงหลายบรรทัด
 const CAPTION_LINE_CHARACTERS: usize = 42;
+// โหมดบรรทัดเดียวเก็บข้อความล่าสุดภายในความกว้างของหน้าต่างคำบรรยาย
+const SINGLE_LINE_CHARACTERS: usize = 128;
 
+/// รวมสมมติฐานที่ Whisper แก้ซ้ำให้เป็นข้อความต่อเนื่องโดยปกป้องคำที่นิ่งแล้ว
 #[derive(Debug)]
 pub struct TranscriptReconciler {
+    /// คำจากช่วงที่ยืนยันแล้วก่อนหน้า ซึ่งจะไม่ถูกแก้โดยผลชั่วคราวใหม่
     finalized: Vec<String>,
+    /// คำนำหน้าของช่วงปัจจุบันที่ตรงกันหลายรอบแล้ว
     active_committed: Vec<String>,
+    /// ส่วนท้ายล่าสุดที่ Whisper ยังสามารถแก้ได้
     provisional: Vec<String>,
+    /// สมมติฐานรอบก่อน ใช้หาคำนำหน้าร่วมและช่วงที่เลื่อนซ้อนกัน
     previous_hypothesis: Vec<String>,
+    /// รหัสช่วงผลชั่วคราวที่กำลังประมวลผล
     active_segment_id: Option<u64>,
+    /// รหัสผลยืนยันล่าสุด ใช้ปฏิเสธเหตุการณ์ซ้ำหรือมาช้า
     last_final_segment_id: Option<u64>,
+    /// จำนวนคำจากต้นสมมติฐานที่เคยยืนยันไว้แล้ว
     active_prefix_len: usize,
+    /// จำนวนคำที่นิ่งในช่วงปัจจุบันสำหรับรายงานสถานะ UI
     stable_word_count: usize,
+    /// ข้อความรวมที่ตัวทำงานหลักอ่านได้โดยไม่ต้องประกอบใหม่
     presentation: String,
+    /// จำนวนคำสูงสุดในประวัติที่ใช้แสดง
     max_presentation_words: usize,
 }
 
@@ -26,6 +41,7 @@ impl Default for TranscriptReconciler {
 }
 
 impl TranscriptReconciler {
+    /// สร้างตัวรวมข้อความโดยบังคับให้เก็บได้อย่างน้อยหนึ่งคำ
     pub fn new(max_presentation_words: usize) -> Self {
         Self {
             finalized: Vec::new(),
@@ -41,6 +57,7 @@ impl TranscriptReconciler {
         }
     }
 
+    /// รวมเหตุการณ์หนึ่งรายการและคืนค่า `true` เมื่อข้อความสำหรับแสดงเปลี่ยนจริง
     pub fn apply(&mut self, update: &TranscriptUpdate) -> bool {
         let before = self.presentation.clone();
         match update {
@@ -63,18 +80,22 @@ impl TranscriptReconciler {
         self.presentation != before
     }
 
+    /// คืนข้อความต่อเนื่องล่าสุดสำหรับจัดรูปแบบและแสดงบนหน้าต่างคำบรรยาย
     pub fn presentation_text(&self) -> &str {
         &self.presentation
     }
 
+    /// ชื่อเรียกแบบย่อที่คงไว้ให้ผู้เรียกเดิมใช้ข้อความปัจจุบัน
     pub fn current_text(&self) -> &str {
         self.presentation_text()
     }
 
+    /// คืนจำนวนคำที่ผ่านการยืนยันในช่วงชั่วคราวปัจจุบัน
     pub const fn stable_word_count(&self) -> usize {
         self.stable_word_count
     }
 
+    /// ล้างทุกช่วงข้อความเมื่อหยุดกระบวนการหรือเปลี่ยนแหล่งเสียง
     pub fn clear(&mut self) {
         self.finalized.clear();
         self.active_committed.clear();
@@ -87,6 +108,7 @@ impl TranscriptReconciler {
         self.presentation.clear();
     }
 
+    /// รวมผลชั่วคราวโดยย้ายเฉพาะคำที่มีหลักฐานว่านิ่งแล้วไปยังส่วนที่ยืนยันภายใน
     fn apply_partial(&mut self, segment_id: u64, incoming: Vec<String>) {
         if self
             .last_final_segment_id
@@ -132,6 +154,7 @@ impl TranscriptReconciler {
         self.stable_word_count = self.active_committed.len();
     }
 
+    /// ปิดช่วงปัจจุบันและต่อผลยืนยันโดยหลีกเลี่ยงคำซ้ำบริเวณรอยต่อ
     fn apply_final(&mut self, segment_id: u64, incoming: Vec<String>) {
         if self
             .last_final_segment_id
@@ -165,6 +188,7 @@ impl TranscriptReconciler {
         }
     }
 
+    /// เก็บผลชั่วคราวเดิมเมื่อรหัสช่วงเปลี่ยนก่อนมีผลยืนยัน เพื่อไม่ให้คำหาย
     fn commit_active_without_final(&mut self) {
         if self.active_segment_id.is_none() {
             return;
@@ -177,6 +201,7 @@ impl TranscriptReconciler {
         self.clear_active();
     }
 
+    /// ล้างสถานะเฉพาะช่วงปัจจุบันหลังย้ายคำไปยังประวัติที่ยืนยันแล้ว
     fn clear_active(&mut self) {
         self.active_committed.clear();
         self.provisional.clear();
@@ -186,6 +211,7 @@ impl TranscriptReconciler {
         self.stable_word_count = 0;
     }
 
+    /// ประกอบคำที่ยืนยันแล้ว คำที่นิ่ง และคำที่ยังแก้ได้ใหม่ตามลำดับเวลา
     fn refresh_presentation(&mut self) {
         let mut combined = self.finalized.clone();
         let mut active = self.active_committed.clone();
@@ -196,6 +222,7 @@ impl TranscriptReconciler {
     }
 }
 
+/// ทำความสะอาดเครื่องหมายพิเศษแล้วแยกข้อความเป็นคำสำหรับการรวมผล
 fn words(text: &str) -> Vec<String> {
     normalize_hypothesis_text(text)
         .split_whitespace()
@@ -203,34 +230,46 @@ fn words(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// จัดข้อความล่าสุดเป็นจำนวนบรรทัดที่ผู้ใช้กำหนด
 pub(crate) fn format_live_caption(text: &str, max_lines: u32) -> String {
     let words = words(text);
+    format_caption_words(&words, max_lines)
+}
+
+/// เลือกการจัดแบบบรรทัดเดียวหรือหลายบรรทัดจากรายการคำที่ทำความสะอาดแล้ว
+fn format_caption_words(words: &[String], max_lines: u32) -> String {
     if words.is_empty() {
         return String::new();
     }
 
-    let sentence = latest_sentence(&words);
-    let lines = wrap_caption_words(sentence, CAPTION_LINE_CHARACTERS);
     let keep = max_lines.max(1) as usize;
+    if keep == 1 {
+        return latest_words_that_fit(words, SINGLE_LINE_CHARACTERS);
+    }
+
+    let lines = wrap_caption_words(words, CAPTION_LINE_CHARACTERS);
     lines[lines.len().saturating_sub(keep)..].join("\n")
 }
 
-fn latest_sentence(words: &[String]) -> &[String] {
-    let Some(last_end) = words.iter().rposition(|word| ends_sentence(word)) else {
-        return words;
-    };
+/// เก็บคำจากท้ายประโยคให้มากที่สุดโดยไม่ตัดคำกลางคัน
+fn latest_words_that_fit(words: &[String], maximum_characters: usize) -> String {
+    let mut start = words.len();
+    let mut length = 0;
 
-    let start = if last_end + 1 < words.len() {
-        last_end + 1
-    } else {
-        words[..last_end]
-            .iter()
-            .rposition(|word| ends_sentence(word))
-            .map_or(0, |previous_end| previous_end + 1)
-    };
-    &words[start..]
+    while start > 0 {
+        let word_length = words[start - 1].chars().count();
+        let next_length = word_length + usize::from(start < words.len()) + length;
+        if next_length > maximum_characters && start < words.len() {
+            break;
+        }
+        start -= 1;
+        length = next_length;
+    }
+
+    words[start..].join(" ")
 }
 
+/// ตัดบรรทัดแบบเติมให้เต็มก่อน แล้วเลือกจุดพักภาษาที่เหมาะสมเมื่อบรรทัดเต็ม
 fn wrap_caption_words(words: &[String], maximum_characters: usize) -> Vec<String> {
     let mut lines = Vec::new();
     let mut start = 0;
@@ -263,6 +302,7 @@ fn wrap_caption_words(words: &[String], maximum_characters: usize) -> Vec<String
     lines
 }
 
+/// ให้คะแนนจบประโยค จบวลี และคำเชื่อมเพื่อหลีกเลี่ยงจุดตัดที่อ่านยาก
 fn preferred_break(words: &[String], start: usize, greedy_end: usize) -> usize {
     let word_count = greedy_end - start;
     let earliest = start + word_count.div_ceil(2).max(1);
@@ -272,7 +312,9 @@ fn preferred_break(words: &[String], start: usize, greedy_end: usize) -> usize {
         if break_at >= words.len() {
             break;
         }
-        let score = if ends_clause(&words[break_at - 1]) {
+        let score = if ends_sentence(&words[break_at - 1]) {
+            4
+        } else if ends_clause(&words[break_at - 1]) {
             3
         } else if starts_with_conjunction(&words[break_at]) {
             2
@@ -297,6 +339,7 @@ fn preferred_break(words: &[String], start: usize, greedy_end: usize) -> usize {
     greedy_end
 }
 
+/// ตรวจเครื่องหมายจบประโยคโดยไม่นับจุดของคำนำหน้าชื่อและตัวย่อทั่วไป
 fn ends_sentence(word: &str) -> bool {
     let word = word.trim_end_matches(|character| {
         matches!(character, '"' | '\'' | ')' | ']' | '}' | '’' | '”')
@@ -313,6 +356,7 @@ fn ends_sentence(word: &str) -> bool {
     )
 }
 
+/// ตรวจเครื่องหมายที่เหมาะกับการพักวลีภายในประโยค
 fn ends_clause(word: &str) -> bool {
     let word = word.trim_end_matches(|character| {
         matches!(character, '"' | '\'' | ')' | ']' | '}' | '’' | '”')
@@ -320,6 +364,7 @@ fn ends_clause(word: &str) -> bool {
     word.ends_with(',') || word.ends_with(';') || word.ends_with(':') || word.ends_with('—')
 }
 
+/// ตรวจคำเชื่อมที่ควรเริ่มต้นบรรทัดใหม่เมื่อจำเป็นต้องตัด
 fn starts_with_conjunction(word: &str) -> bool {
     matches!(
         normalized_word(word).as_str(),
@@ -327,6 +372,7 @@ fn starts_with_conjunction(word: &str) -> bool {
     )
 }
 
+/// ป้องกันไม่ให้คำหน้าที่สั้น ๆ แยกจากคำถัดไปโดยไม่จำเป็น
 fn is_linked_pair(left: &str, _right: &str) -> bool {
     matches!(
         normalized_word(left).as_str(),
@@ -371,11 +417,13 @@ fn is_linked_pair(left: &str, _right: &str) -> bool {
     )
 }
 
+/// ต่อคำใหม่โดยลบเฉพาะส่วนที่ซ้อนกับท้ายรายการเดิม
 fn append_without_overlap(base: &mut Vec<String>, incoming: &[String]) {
     let overlap = longest_word_overlap(base, incoming);
     base.extend(incoming[overlap..].iter().cloned());
 }
 
+/// หาจำนวนคำยาวที่สุดที่ท้ายรายการเดิมตรงกับต้นรายการใหม่
 fn longest_word_overlap(base: &[String], incoming: &[String]) -> usize {
     let maximum = base.len().min(incoming.len());
     (1..=maximum)
@@ -389,6 +437,7 @@ fn longest_word_overlap(base: &[String], incoming: &[String]) -> usize {
         .unwrap_or(0)
 }
 
+/// หาจำนวนคำจากต้นที่เหมือนกันโดยไม่สนตัวพิมพ์เล็กใหญ่
 fn common_prefix_len(left: &[String], right: &[String]) -> usize {
     left.iter()
         .zip(right)
@@ -396,6 +445,7 @@ fn common_prefix_len(left: &[String], right: &[String]) -> usize {
         .count()
 }
 
+/// จัดแนวคำท้ายของข้อความเดิมกับสมมติฐานใหม่แม้ Whisper จะแทรกคำระหว่างกลาง
 fn aligned_suffix_tail_start(base: &[String], incoming: &[String]) -> Option<usize> {
     for suffix_start in 0..base.len() {
         let mut incoming_start = 0;
@@ -419,11 +469,13 @@ fn aligned_suffix_tail_start(base: &[String], incoming: &[String]) -> Option<usi
     None
 }
 
+/// ลดรูปคำเพื่อเปรียบเทียบโดยตัดวรรคตอนรอบนอกและไม่สนตัวพิมพ์
 fn normalized_word(word: &str) -> String {
     word.trim_matches(|character: char| !character.is_alphanumeric())
         .to_lowercase()
 }
 
+/// ทิ้งคำเก่าสุดจากด้านหน้าเมื่อประวัติยาวเกินขีดจำกัด
 fn trim_front(words: &mut Vec<String>, maximum: usize) {
     if words.len() > maximum {
         words.drain(..words.len() - maximum);
@@ -432,7 +484,10 @@ fn trim_front(words: &mut Vec<String>, maximum: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{TranscriptReconciler, format_live_caption, words, wrap_caption_words};
+    use super::{
+        TranscriptReconciler, format_live_caption, latest_words_that_fit, words,
+        wrap_caption_words,
+    };
     use crate::stt::TranscriptUpdate;
 
     #[test]
@@ -590,18 +645,36 @@ mod tests {
     }
 
     #[test]
-    fn completed_sentence_rolls_over_when_the_next_one_begins() {
+    fn completed_sentences_fill_available_lines_before_rollover() {
         assert_eq!(
             format_live_caption("Keep this completed sentence.", 2),
             "Keep this completed sentence."
         );
         assert_eq!(
             format_live_caption("Keep this completed sentence. Start", 2),
-            "Start"
+            "Keep this completed sentence. Start"
         );
+        assert_eq!(format_live_caption("One. Two. Three.", 2), "One. Two. Three.");
+        let rolled = format_live_caption(
+            "Keep this completed sentence. Start the next caption with enough words to fill the whole line",
+            2,
+        );
+        assert!(!rolled.contains("Keep this completed sentence."));
+        assert!(rolled.contains("Start the next caption"));
         assert_eq!(
             format_live_caption("First sentence. Keep the latest sentence!", 2),
-            "Keep the latest sentence!"
+            "First sentence. Keep the latest sentence!"
+        );
+    }
+
+    #[test]
+    fn sliding_line_drops_only_the_oldest_words_when_full() {
+        let caption_words =
+            words("alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu");
+
+        assert_eq!(
+            latest_words_that_fit(&caption_words, 64),
+            "beta gamma delta epsilon zeta eta theta iota kappa lambda mu"
         );
     }
 

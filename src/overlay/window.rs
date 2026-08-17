@@ -1,3 +1,5 @@
+//! การแสดงข้อความคำบรรยายและนำค่ารูปลักษณ์ไปใช้บน GTK main thread
+
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -9,20 +11,31 @@ use gtk::{gdk, glib};
 
 use crate::{config::SubtitleConfig, subtitle::format_live_caption};
 
-const FINAL_HOLD_TIME: Duration = Duration::from_secs(3);
+/// ระยะเวลาคงข้อความ final ไว้ก่อนซ่อนเมื่อไม่มีข้อความรุ่นใหม่
+const FINAL_HOLD_TIME: Duration = Duration::from_secs(4);
 
+/// เจ้าของ GTK widget ทั้งหมดของ overlay ซึ่งต้องเรียกจาก GTK main thread
 pub struct OverlayPresenter {
+    /// config ล่าสุดที่นำไปใช้เพื่อหลีกเลี่ยงการสร้าง CSS ซ้ำ
     applied_config: RefCell<Option<SubtitleConfig>>,
+    /// provider ที่ใช้เปลี่ยนสีพื้นหลังและขนาดตัวอักษรแบบ runtime
     css_provider: gtk::CssProvider,
+    /// ป้องกันการแสดงข้อความเมื่อผู้ใช้ปิด overlay
     enabled: Cell<bool>,
+    /// token สำหรับยกเลิก timeout ของ final frame รุ่นเก่า
     generation: Rc<Cell<u64>>,
+    /// label ที่รับเฉพาะ plain text ไม่ตีความ markup
     label: gtk::Label,
+    /// ข้อความต้นทางล่าสุดสำหรับจัดรูปแบบใหม่เมื่อ config เปลี่ยน
     last_text: RefCell<String>,
+    /// กล่องที่กำหนดตำแหน่ง anchor บนหน้าจอ
     surface: gtk::Box,
+    /// หน้าต่างโปร่งใสที่ไม่รับ input
     window: gtk::Window,
 }
 
 impl OverlayPresenter {
+    /// สร้าง overlay และนำ config เริ่มต้นไปใช้โดยยังไม่แสดงข้อความ
     pub fn new(application: &adw::Application, config: &SubtitleConfig) -> Self {
         let css_provider = gtk::CssProvider::new();
         if let Some(display) = gdk::Display::default() {
@@ -35,7 +48,7 @@ impl OverlayPresenter {
 
         let label = gtk::Label::builder()
             .justify(gtk::Justification::Center)
-            .max_width_chars(42)
+            .max_width_chars(128)
             .selectable(false)
             .use_markup(false)
             .wrap(false)
@@ -79,6 +92,7 @@ impl OverlayPresenter {
         window.add_css_class("subtitle-live-overlay");
         window.connect_realize(|window| {
             if let Some(surface) = window.surface() {
+                // พื้นที่ input ว่างทำให้ overlay ไม่ขวางการคลิกหน้าต่างด้านล่าง
                 let empty_region = gtk::cairo::Region::create();
                 surface.set_input_region(Some(&empty_region));
             }
@@ -99,6 +113,7 @@ impl OverlayPresenter {
         presenter
     }
 
+    /// จัดรูปแบบและแสดง transcript frame
     pub fn show_text(&self, text: &str, is_final: bool) {
         if !self.enabled.get() {
             return;
@@ -119,9 +134,8 @@ impl OverlayPresenter {
 
         self.label.set_label(&text);
         self.last_text.replace(source_text.to_owned());
-        // A normal GTK toplevel cannot request permanent always-on-top stacking
-        // on GNOME Wayland. Re-present each update so an obscured overlay gets
-        // another non-focusable raise request without intercepting input.
+        // GTK toplevel ปกติขอ always-on-top แบบถาวรบน GNOME Wayland ไม่ได้
+        // จึง present ใหม่ทุก frame เพื่อขอยกหน้าต่างโดยไม่รับ focus หรือ input
         self.window.present();
 
         let next_generation = self.generation.get().wrapping_add(1);
@@ -139,6 +153,7 @@ impl OverlayPresenter {
         }
     }
 
+    /// ล้างข้อความและซ่อนหน้าต่าง พร้อมยกเลิก final timeout รุ่นก่อนหน้า
     pub fn hide(&self) {
         self.generation
             .set(self.generation.get().wrapping_add(1));
@@ -147,6 +162,7 @@ impl OverlayPresenter {
         self.window.hide();
     }
 
+    /// เปิดหรือปิดการรับ subtitle frame ของ overlay
     pub fn set_enabled(&self, enabled: bool) {
         self.enabled.set(enabled);
         if !enabled {
@@ -154,6 +170,7 @@ impl OverlayPresenter {
         }
     }
 
+    /// นำตำแหน่ง รูปแบบ และขอบเขตบรรทัดใหม่ไปใช้กับข้อความปัจจุบัน
     pub fn apply_config(&self, config: &SubtitleConfig) {
         if self.applied_config.borrow().as_ref() == Some(config) {
             return;
@@ -176,6 +193,7 @@ impl OverlayPresenter {
     }
 }
 
+/// แปลงชื่อ position เป็น GTK alignment ของกล่องข้อความ
 fn apply_position(surface: &gtk::Box, position: &str) {
     let (horizontal, vertical) = match position {
         "top-left" => (gtk::Align::Start, gtk::Align::Start),

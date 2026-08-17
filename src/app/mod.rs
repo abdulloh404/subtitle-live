@@ -1,3 +1,5 @@
+//! สถานะและการประมวลผลคำสั่งที่ GTK และ runtime ใช้ร่วมกัน
+
 mod command;
 mod controller;
 mod event;

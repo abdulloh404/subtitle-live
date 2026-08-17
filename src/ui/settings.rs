@@ -1,3 +1,5 @@
+//! การสร้างหน้า settings และเชื่อม widget event เข้ากับ application controller
+
 use std::{cell::RefCell, path::Path, rc::Rc, time::Duration};
 
 use adw::prelude::*;
@@ -23,12 +25,18 @@ const SUBTITLE_POSITION_LABELS: [&str; 9] = [
     "Bottom right",
 ];
 
+/// widget และ state ที่จำเป็นต่อการอัปเดตหน้าต่างจาก runtime
 #[derive(Clone)]
 pub struct SettingsPresenter {
+    /// หน้าต่างตั้งค่าหลักที่ GTK main thread เป็นเจ้าของ
     window: adw::PreferencesWindow,
+    /// controller ร่วมภายใน GTK main thread เท่านั้น จึงใช้ `Rc<RefCell<_>>`
     controller: Rc<RefCell<ApplicationController>>,
+    /// รายการ application ที่สร้างใหม่เมื่อ PipeWire graph เปลี่ยน
     applications: DynamicApplications,
+    /// switch ที่ต้อง sync เมื่อ runtime เปลี่ยนสถานะ pipeline
     live_switch: gtk::Switch,
+    /// label สถานะและข้อมูล diagnostics ที่ runtime อัปเดตเป็นระยะ
     status_label: gtk::Label,
     error_label: gtk::Label,
     model_path_label: gtk::Label,
@@ -38,6 +46,7 @@ pub struct SettingsPresenter {
 }
 
 impl SettingsPresenter {
+    /// สร้างทุกหน้าและเชื่อม signal handler โดยยังไม่แสดงหน้าต่าง
     pub fn new(
         application: &adw::Application,
         controller: Rc<RefCell<ApplicationController>>,
@@ -126,15 +135,18 @@ impl SettingsPresenter {
         }
     }
 
+    /// แสดงหรือยกหน้าต่างตั้งค่าขึ้นมาด้านหน้า
     pub fn present(&self) {
         self.window.present();
     }
 
+    /// รับ snapshot stream จาก runtime แล้วสร้างรายการเลือกใหม่บน GTK thread
     pub fn update_streams(&self, streams: &[StreamInfo]) {
         self.controller.borrow_mut().set_streams(streams.to_vec());
         self.applications.rebuild();
     }
 
+    /// sync สถานะ pipeline และ error ล่าสุดลงใน widget
     pub fn update_state(&self, state: ApplicationState, error: Option<&str>) {
         self.controller.borrow_mut().set_state(state);
         self.status_label.set_label(state_label(state));
@@ -143,6 +155,7 @@ impl SettingsPresenter {
         self.error_label.set_label(error.unwrap_or("None"));
     }
 
+    /// แสดง snapshot latency ล่าสุดโดยไม่เก็บประวัติซ้ำในชั้น UI
     pub fn update_metrics(&self, metrics: MetricsSnapshot) {
         self.audio_buffer_label.set_label(&format_dropped(
             metrics.source_queue_dropped,
@@ -160,6 +173,7 @@ impl SettingsPresenter {
         ));
     }
 
+    /// แสดง path โมเดลและผลการตรวจว่ามีไฟล์อยู่จริงหรือไม่
     pub fn update_model_status(&self, path: &Path, exists: bool) {
         let status = if exists {
             "Ready"
@@ -171,6 +185,7 @@ impl SettingsPresenter {
     }
 }
 
+/// สร้างและแสดง settings presenter ในขั้นตอนเดียว
 pub fn present_settings(
     application: &adw::Application,
     controller: Rc<RefCell<ApplicationController>>,
@@ -181,6 +196,7 @@ pub fn present_settings(
 }
 
 #[derive(Clone)]
+/// state สำหรับสร้างกลุ่ม application/stream ใหม่เมื่อ graph เปลี่ยน
 struct DynamicApplications {
     group: adw::PreferencesGroup,
     rows: Rc<RefCell<Vec<adw::PreferencesRow>>>,
@@ -189,6 +205,7 @@ struct DynamicApplications {
 }
 
 impl DynamicApplications {
+    /// ลบ row เก่าและสร้าง row จาก snapshot ปัจจุบันทั้งหมดบน GTK thread
     fn rebuild(&self) {
         for row in self.rows.borrow_mut().drain(..) {
             self.group.remove(&row);
@@ -223,6 +240,7 @@ impl DynamicApplications {
         self.configured_label.set_label(&configured.to_string());
     }
 
+    /// สร้าง expander หนึ่งชุดพร้อม switch ระดับ application และราย stream
     fn application_row(&self, group: ApplicationStreams) -> adw::PreferencesRow {
         let app_name = group
             .identity
@@ -297,12 +315,14 @@ impl DynamicApplications {
     }
 }
 
+/// playback stream ที่จัดกลุ่มตาม stable application key สำหรับแสดงใน UI
 struct ApplicationStreams {
     key: ApplicationKey,
     identity: ApplicationIdentity,
     streams: Vec<StreamInfo>,
 }
 
+/// รวม stream ตาม application และเรียงชื่อเพื่อให้ลำดับ UI คงที่
 fn grouped_streams(streams: &[StreamInfo]) -> Vec<ApplicationStreams> {
     let mut groups: Vec<ApplicationStreams> = Vec::new();
     for stream in streams {
@@ -334,6 +354,7 @@ fn grouped_streams(streams: &[StreamInfo]) -> Vec<ApplicationStreams> {
     groups
 }
 
+/// อธิบายชนิด stable key ที่นำมาใช้จับคู่
 fn key_label(key: &ApplicationKey) -> &'static str {
     match key {
         ApplicationKey::ApplicationId(_) => "application ID",
@@ -342,6 +363,7 @@ fn key_label(key: &ApplicationKey) -> &'static str {
     }
 }
 
+/// สร้างหน้า General และเชื่อม switch เข้ากับคำสั่งเริ่ม/หยุด pipeline
 fn general_page(
     snapshot: &UiSnapshot,
     controller: Rc<RefCell<ApplicationController>>,
@@ -388,6 +410,7 @@ fn general_page(
     (page, live_switch)
 }
 
+/// สร้างหน้ารายการแหล่งเสียงที่ค้นพบและกฎที่เลือกไว้
 fn audio_sources_page(
     snapshot: &UiSnapshot,
     configured_label: &gtk::Label,
@@ -405,6 +428,7 @@ fn audio_sources_page(
     page
 }
 
+/// สร้างหน้าข้อมูลโมเดลและช่วงเวลา streaming ซึ่งยังเป็นค่าดูอย่างเดียว
 fn speech_recognition_page(
     snapshot: &UiSnapshot,
     model_path_label: &gtk::Label,
@@ -439,6 +463,7 @@ fn speech_recognition_page(
     page
 }
 
+/// สร้างหน้าปรับ overlay และส่งทุกการเปลี่ยนผ่าน controller
 fn subtitle_page(
     snapshot: &UiSnapshot,
     controller: Rc<RefCell<ApplicationController>>,
@@ -520,6 +545,7 @@ fn subtitle_page(
     page
 }
 
+/// สร้างหน้าสถานะ pipeline และ latency ที่ runtime วัดได้
 fn performance_page(
     snapshot: &UiSnapshot,
     status_label: &gtk::Label,
@@ -551,6 +577,7 @@ fn performance_page(
     page
 }
 
+/// สร้างหน้าข้อมูลรุ่นและขอบเขตความเป็นส่วนตัว
 fn about_page() -> adw::PreferencesPage {
     let page = preferences_page("About", "help-about-symbolic");
     let group = adw::PreferencesGroup::builder()
@@ -566,6 +593,7 @@ fn about_page() -> adw::PreferencesPage {
     page
 }
 
+/// สร้างโครงหน้า preferences ที่ใช้รูปแบบเดียวกันทุกหน้า
 fn preferences_page(title: &str, icon_name: &str) -> adw::PreferencesPage {
     adw::PreferencesPage::builder()
         .icon_name(icon_name)
@@ -573,6 +601,7 @@ fn preferences_page(title: &str, icon_name: &str) -> adw::PreferencesPage {
         .build()
 }
 
+/// สร้าง action row พร้อม switch และคืนทั้งคู่เพื่อเชื่อม signal ภายหลัง
 fn switch_row(
     title: &str,
     subtitle: &str,
@@ -593,10 +622,12 @@ fn switch_row(
     (row, toggle)
 }
 
+/// สร้าง row สำหรับค่าข้อความแบบอ่านอย่างเดียว
 fn value_row(title: &str, value: &str) -> adw::ActionRow {
     value_row_with_label(title, &value_label(value))
 }
 
+/// สร้าง label ค่าที่เลือกและคัดลอกได้
 fn value_label(value: &str) -> gtk::Label {
     let label = gtk::Label::builder()
         .ellipsize(gtk::pango::EllipsizeMode::Middle)
@@ -608,12 +639,14 @@ fn value_label(value: &str) -> gtk::Label {
     label
 }
 
+/// ผูก label ที่มีอยู่เข้ากับ action row
 fn value_row_with_label(title: &str, value_label: &gtk::Label) -> adw::ActionRow {
     let row = adw::ActionRow::builder().title(title).build();
     row.add_suffix(value_label);
     row
 }
 
+/// สร้างตัวเลขปรับค่าได้พร้อมช่วงและหน่วยที่กำหนด
 fn spin_row(
     title: &str,
     value: u32,
@@ -636,6 +669,7 @@ fn spin_row(
     (row, spin)
 }
 
+/// สร้าง row ข้อความที่ไม่ตอบสนองต่อการคลิก
 fn message_row(title: &str, subtitle: &str) -> adw::ActionRow {
     adw::ActionRow::builder()
         .activatable(false)
@@ -644,6 +678,7 @@ fn message_row(title: &str, subtitle: &str) -> adw::ActionRow {
         .build()
 }
 
+/// แสดง millisecond เป็นวินาทีเมื่อหารลงตัวเพื่อให้อ่านง่าย
 fn format_duration(milliseconds: u32) -> String {
     if milliseconds % 1_000 == 0 {
         format!("{} s", milliseconds / 1_000)
@@ -652,6 +687,7 @@ fn format_duration(milliseconds: u32) -> String {
     }
 }
 
+/// จัดรูปแบบ latency ล่าสุด ค่า p50 และ p95 สำหรับหน้า Performance
 fn format_metric(latest: Option<Duration>, p50: Option<Duration>, p95: Option<Duration>) -> String {
     match (latest, p50, p95) {
         (Some(latest), Some(p50), Some(p95)) => format!(
@@ -664,14 +700,17 @@ fn format_metric(latest: Option<Duration>, p50: Option<Duration>, p95: Option<Du
     }
 }
 
+/// สรุปจำนวน audio frame ที่ถูกทิ้งจากคิวแต่ละช่วง
 fn format_dropped(source: u64, mixed: u64) -> String {
     format!("dropped source {source} · mixed {mixed}")
 }
 
+/// แปลง duration เป็นข้อความ millisecond
 fn duration_ms(duration: Duration) -> String {
     format!("{} ms", duration.as_millis())
 }
 
+/// snapshot แบบพร้อมแสดงผลที่แยก GTK widget ออกจาก schema การตั้งค่า
 struct UiSnapshot {
     live_subtitles: bool,
     keep_running_when_closed: bool,
@@ -693,6 +732,7 @@ struct UiSnapshot {
 }
 
 impl UiSnapshot {
+    /// อ่าน controller ครั้งเดียวแล้วแปลงค่าทั้งหมดเป็นข้อมูลสำหรับสร้าง UI
     fn from_controller(controller: &ApplicationController) -> Self {
         let config = controller.config();
         Self {
@@ -717,6 +757,7 @@ impl UiSnapshot {
     }
 }
 
+/// แปลงรหัส capture mode เป็นชื่อสำหรับผู้ใช้
 fn capture_mode_label(config: &AppConfig) -> String {
     match config.audio.capture_mode.as_str() {
         "selected" => "Selected Applications".to_owned(),
@@ -724,6 +765,7 @@ fn capture_mode_label(config: &AppConfig) -> String {
     }
 }
 
+/// แปลงรหัสภาษาเป็นชื่อสำหรับผู้ใช้
 fn language_label(config: &AppConfig) -> String {
     match config.stt.language.as_str() {
         "en" => "English".to_owned(),
@@ -731,6 +773,7 @@ fn language_label(config: &AppConfig) -> String {
     }
 }
 
+/// เปลี่ยน identifier แบบ kebab/snake case ให้เป็นข้อความอ่านง่าย
 fn display_identifier(value: &str) -> String {
     let words = value.replace(['-', '_'], " ");
     let mut characters = words.chars();
@@ -740,6 +783,7 @@ fn display_identifier(value: &str) -> String {
     }
 }
 
+/// แปลง enum สถานะเป็นข้อความสั้นสำหรับ UI
 const fn state_label(state: ApplicationState) -> &'static str {
     match state {
         ApplicationState::Stopped => "Stopped",

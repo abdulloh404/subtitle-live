@@ -1,3 +1,5 @@
+//! ตัวควบคุมสถานะแอปพลิเคชันและกฎการเลือกแหล่งเสียง
+
 use crate::{
     config::{AppConfig, ApplicationRule, SUBTITLE_POSITIONS, StreamRule},
     pipewire::{
@@ -7,13 +9,18 @@ use crate::{
 
 use super::{AppCommand, AppEvent, ApplicationState};
 
+/// แหล่งข้อมูลจริงของ config สถานะ pipeline และกฎเลือก stream ในชั้นแอปพลิเคชัน
 pub struct ApplicationController {
+    /// การตั้งค่าที่ผ่านการปรับค่าให้อยู่ในช่วงที่ UI รองรับ
     config: AppConfig,
+    /// สถานะวงจรชีวิตล่าสุดของ pipeline
     state: ApplicationState,
+    /// snapshot ล่าสุดของ playback stream ที่ PipeWire ค้นพบ
     streams: Vec<StreamInfo>,
 }
 
 impl ApplicationController {
+    /// สร้าง controller และกำหนดสถานะเริ่มต้นจากการตั้งค่าที่โหลดมา
     pub fn new(mut config: AppConfig) -> Self {
         normalize_subtitle_config(&mut config);
         let state = if config.general.live_subtitles {
@@ -29,34 +36,42 @@ impl ApplicationController {
         }
     }
 
+    /// คืนสถานะ pipeline ปัจจุบัน
     pub const fn state(&self) -> ApplicationState {
         self.state
     }
 
+    /// คืนการตั้งค่าปัจจุบันแบบยืมค่า
     pub const fn config(&self) -> &AppConfig {
         &self.config
     }
 
+    /// สร้าง snapshot สำหรับส่งให้ worker บันทึกการตั้งค่า
     pub fn config_snapshot(&self) -> AppConfig {
         self.config.clone()
     }
 
+    /// อัปเดตสถานะที่ runtime รายงานกลับมา
     pub fn set_state(&mut self, state: ApplicationState) {
         self.state = state;
     }
 
+    /// แทนที่รายการ stream ด้วย snapshot จาก PipeWire รอบล่าสุด
     pub fn replace_streams(&mut self, streams: Vec<StreamInfo>) {
         self.streams = streams;
     }
 
+    /// ชื่อเรียกอีกแบบของ [`Self::replace_streams`] สำหรับชั้น UI
     pub fn set_streams(&mut self, streams: Vec<StreamInfo>) {
         self.replace_streams(streams);
     }
 
+    /// คืนรายการ playback stream ล่าสุด
     pub fn streams(&self) -> &[StreamInfo] {
         &self.streams
     }
 
+    /// ตรวจว่า application ถูกเลือกทั้งแอปหรือครบทุก stream ที่ค้นพบหรือไม่
     pub fn application_selected(&self, application: &ApplicationIdentity) -> bool {
         let application_streams: Vec<_> = self
             .streams
@@ -73,6 +88,7 @@ impl ApplicationController {
             .all(|stream| self.stream_selected(stream))
     }
 
+    /// ตรวจว่า stream ตรงกับกฎ application หรือกฎ stream ที่เปิดใช้งานหรือไม่
     pub fn stream_selected(&self, stream: &StreamInfo) -> bool {
         let Some(rule) = self.matching_rule(&stream.application) else {
             return false;
@@ -84,6 +100,7 @@ impl ApplicationController {
                 .any(|candidate| candidate.enabled && stream_rule_matches(candidate, stream))
     }
 
+    /// เลือกหรือยกเลิกทั้ง application โดยบันทึกเฉพาะ stable identity
     pub fn set_application_selected(&mut self, application: &ApplicationIdentity, selected: bool) {
         self.remove_matching_rules(application);
         if selected && application.stable_key().is_some() {
@@ -94,6 +111,7 @@ impl ApplicationController {
         }
     }
 
+    /// เลือกหรือยกเลิก playback stream หนึ่งรายการภายใน application
     pub fn set_stream_selected(&mut self, stream: &StreamInfo, selected: bool) {
         if stream.application.stable_key().is_none()
             || (non_empty(&stream.node_name).is_none() && non_empty(&stream.media_name).is_none())
@@ -161,6 +179,7 @@ impl ApplicationController {
         }
     }
 
+    /// แปลงกฎถาวรเป็นเป้าหมายจับเสียงที่ไม่ผูกกับ node ID ชั่วคราว
     pub fn selected_capture_targets(&self) -> Vec<CaptureTarget> {
         let mut targets = Vec::new();
         for rule in &self.config.audio.rules {
@@ -192,10 +211,12 @@ impl ApplicationController {
         targets
     }
 
+    /// ชื่อเรียกอีกแบบของ [`Self::selected_capture_targets`] สำหรับ runtime
     pub fn selected_targets(&self) -> Vec<CaptureTarget> {
         self.selected_capture_targets()
     }
 
+    /// ค้นหากฎแรกที่ตรงกับ stable identity ของ application
     fn matching_rule(&self, application: &ApplicationIdentity) -> Option<&ApplicationRule> {
         self.config
             .audio
@@ -204,6 +225,7 @@ impl ApplicationController {
             .find(|rule| application_rule_matches(rule, application))
     }
 
+    /// ลบกฎเดิมทั้งหมดก่อนแทนที่ด้วยการเลือกชุดใหม่
     fn remove_matching_rules(&mut self, application: &ApplicationIdentity) {
         self.config
             .audio
@@ -211,8 +233,9 @@ impl ApplicationController {
             .retain(|rule| !application_rule_matches(rule, application));
     }
 
+    /// ตรวจสอบและประมวลผลคำสั่งหนึ่งรายการโดยไม่เรียกบริการภายนอกโดยตรง
     pub fn handle_command(&mut self, command: AppCommand) -> AppEvent {
-        match command {
+        let event = match command {
             AppCommand::StartSubtitles => {
                 self.config.general.live_subtitles = true;
                 self.state = ApplicationState::Starting;
@@ -269,10 +292,12 @@ impl ApplicationController {
             }
             AppCommand::ShowSettings => AppEvent::SettingsRequested,
             AppCommand::Quit => AppEvent::QuitRequested,
-        }
+        };
+        event
     }
 }
 
+/// ปรับค่าคำบรรยายที่โหลดจากไฟล์ให้อยู่ในช่วงที่ UI รองรับ
 fn normalize_subtitle_config(config: &mut AppConfig) {
     if !SUBTITLE_POSITIONS.contains(&config.subtitle.position.as_str()) {
         config.subtitle.position = "bottom-center".to_owned();
@@ -280,6 +305,7 @@ fn normalize_subtitle_config(config: &mut AppConfig) {
     config.subtitle.font_size = config.subtitle.font_size.clamp(16, 72);
 }
 
+/// สร้างกฎ application จาก stable metadata ที่ PipeWire รายงาน
 fn application_rule(application: &ApplicationIdentity, enabled: bool) -> ApplicationRule {
     ApplicationRule {
         enabled,
@@ -290,6 +316,7 @@ fn application_rule(application: &ApplicationIdentity, enabled: bool) -> Applica
     }
 }
 
+/// สร้างกฎ stream โดยไม่บันทึก runtime node ID ซึ่งเปลี่ยนได้ทุกครั้ง
 fn stream_rule(stream: &StreamInfo) -> StreamRule {
     StreamRule {
         enabled: true,
@@ -298,6 +325,7 @@ fn stream_rule(stream: &StreamInfo) -> StreamRule {
     }
 }
 
+/// แปลงกฎที่บันทึกไว้กลับเป็น identity สำหรับใช้จับคู่กับ graph ปัจจุบัน
 fn rule_identity(rule: &ApplicationRule) -> ApplicationIdentity {
     ApplicationIdentity {
         application_id: rule.application_id.clone(),
@@ -306,6 +334,7 @@ fn rule_identity(rule: &ApplicationRule) -> ApplicationIdentity {
     }
 }
 
+/// จับคู่กฎด้วย metadata ที่เสถียรที่สุดตามลำดับความสำคัญ
 fn application_rule_matches(rule: &ApplicationRule, application: &ApplicationIdentity) -> bool {
     if let (Some(expected), Some(actual)) = (
         non_empty(&rule.application_id),
@@ -328,6 +357,7 @@ fn application_rule_matches(rule: &ApplicationRule, application: &ApplicationIde
     false
 }
 
+/// จับคู่ stream ด้วย node name ก่อน แล้วจึงใช้ media name เป็น fallback
 fn stream_rule_matches(rule: &StreamRule, stream: &StreamInfo) -> bool {
     if let Some(expected) = non_empty(&rule.node_name) {
         return non_empty(&stream.node_name) == Some(expected);
@@ -336,6 +366,7 @@ fn stream_rule_matches(rule: &StreamRule, stream: &StreamInfo) -> bool {
         .is_some_and(|expected| non_empty(&stream.media_name) == Some(expected))
 }
 
+/// เปรียบเทียบ application ผ่าน stable key เท่านั้น
 fn same_application(left: &ApplicationIdentity, right: &ApplicationIdentity) -> bool {
     match (left.stable_key(), right.stable_key()) {
         (Some(left), Some(right)) => application_keys_equal(&left, &right),
@@ -343,10 +374,12 @@ fn same_application(left: &ApplicationIdentity, right: &ApplicationIdentity) -> 
     }
 }
 
+/// แยกฟังก์ชันเปรียบเทียบ key เพื่อให้จุดเรียกอ่านความหมายได้ชัดเจน
 fn application_keys_equal(left: &ApplicationKey, right: &ApplicationKey) -> bool {
     left == right
 }
 
+/// คืนข้อความที่ไม่ว่างและตัดค่าที่มีแต่ช่องว่างออก
 fn non_empty(value: &Option<String>) -> Option<&str> {
     value.as_deref().filter(|value| !value.trim().is_empty())
 }

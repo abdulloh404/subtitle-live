@@ -1,10 +1,15 @@
+//! ข้อผิดพลาดที่เกิดขึ้นระหว่างเริ่มบริการหลักของแอปพลิเคชัน
+
 use std::{error::Error, fmt};
 
 use crate::config::ConfigError;
 
 #[derive(Debug)]
+/// ข้อผิดพลาดร้ายแรงที่ทำให้แอปพลิเคชันเริ่มทำงานไม่ได้
 pub enum AppError {
+    /// การค้นหา อ่าน ตรวจสอบ หรือบันทึกการตั้งค่าล้มเหลว
     Config(ConfigError),
+    /// ไม่สามารถติดตั้งตัวรับ tracing ได้
     Logging(String),
 }
 

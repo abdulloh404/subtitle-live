@@ -1,9 +1,10 @@
+# ไม่เก็บผล build และไฟล์ log ที่สร้างระหว่าง runtime
 /target/
 *.log
 
-# Local model assets are installed separately and must not be committed.
+# ติดตั้งโมเดลในเครื่องแยกต่างหากและห้าม commit binary ขนาดใหญ่
 /models/
 
-# Document file
+# เอกสาร requirement ภายใน workspace เป็นบริบทเฉพาะเครื่องและไม่รวมใน source package
 /*.md
 /docs/*.md

@@ -1,3 +1,5 @@
+//! การค้นหา path โหลด ตรวจสอบ และบันทึกไฟล์ตั้งค่าแบบ atomic
+
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -7,20 +9,32 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::schema::{AppConfig, CURRENT_CONFIG_VERSION, ConfigValidationError};
 
+/// counter ภายในโปรเซสที่ช่วยให้ชื่อไฟล์ชั่วคราวไม่ซ้ำกัน
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
+/// ข้อผิดพลาดที่ทำให้โหลดหรือบันทึกการตั้งค่าต่อไม่ได้
 pub enum ConfigError {
+    /// การทำงานกับ filesystem ล้มเหลว พร้อม operation และ path ที่เกี่ยวข้อง
     Io {
+        /// ชื่อ operation ที่ล้มเหลว
         operation: &'static str,
+        /// path เป้าหมายของ operation
         path: PathBuf,
+        /// ข้อผิดพลาด I/O ต้นทาง
         source: io::Error,
     },
+    /// ไม่สามารถแปลงโครงสร้างการตั้งค่าเป็น TOML ได้
     Serialize(toml::ser::Error),
+    /// ค่าบางฟิลด์ไม่ผ่าน validation
     InvalidValues(ConfigValidationError),
+    /// โปรแกรมไม่รองรับเวอร์ชัน schema ที่ร้องขอ
     UnsupportedVersion(u32),
+    /// path เป้าหมายไม่มีชื่อไฟล์
     InvalidPath(PathBuf),
+    /// ไม่พบ environment ที่ใช้คำนวณ config directory
     ConfigDirectoryUnavailable,
+    /// ไม่พบ environment ที่ใช้คำนวณ data directory
     DataDirectoryUnavailable,
 }
 
@@ -57,7 +71,7 @@ impl fmt::Display for ConfigError {
             ),
             Self::DataDirectoryUnavailable => write!(
                 formatter,
-                "cannot determine data directory because XDG_DATA_HOME and HOME are unavailable"
+                "cannot determine model directory because HOME is unavailable"
             ),
         }
     }
@@ -78,9 +92,13 @@ impl Error for ConfigError {
 }
 
 #[derive(Debug)]
+/// คำเตือนที่อนุญาตให้แอปใช้ค่าเริ่มต้นโดยไม่แก้ไฟล์เดิม
 pub enum ConfigLoadWarning {
+    /// เนื้อหา TOML ไม่ถูกต้อง
     InvalidToml(toml::de::Error),
+    /// TOML อ่านได้แต่ค่าภายในไม่ผ่าน validation
     InvalidValues(ConfigValidationError),
+    /// ไฟล์ใช้ schema คนละเวอร์ชันกับโปรแกรม
     UnsupportedVersion(u32),
 }
 
@@ -104,11 +122,15 @@ impl fmt::Display for ConfigLoadWarning {
 }
 
 #[derive(Debug)]
+/// ผลการโหลดที่แยกค่าที่ใช้จริงออกจากคำเตือนของไฟล์เดิม
 pub struct LoadedConfig {
+    /// การตั้งค่าที่ผ่าน validation หรือค่าเริ่มต้นที่ปลอดภัย
     pub config: AppConfig,
+    /// เหตุผลที่ต้อง fallback เป็นค่าเริ่มต้น หากมี
     pub warning: Option<ConfigLoadWarning>,
 }
 
+/// คืน path ไฟล์ตั้งค่ามาตรฐานตาม XDG Base Directory
 pub fn default_path() -> Result<PathBuf, ConfigError> {
     if let Some(base) = absolute_environment_path("XDG_CONFIG_HOME") {
         return Ok(base.join("subtitle-live/config.toml"));
@@ -119,16 +141,14 @@ pub fn default_path() -> Result<PathBuf, ConfigError> {
         .ok_or(ConfigError::ConfigDirectoryUnavailable)
 }
 
+/// คืน path โมเดล `small.en` ภายใต้ home directory ของผู้ใช้
 pub fn default_model_path() -> Result<PathBuf, ConfigError> {
-    if let Some(base) = absolute_environment_path("XDG_DATA_HOME") {
-        return Ok(base.join("subtitle-live/models/ggml-small.en.bin"));
-    }
-
     absolute_environment_path("HOME")
-        .map(|home| home.join(".local/share/subtitle-live/models/ggml-small.en.bin"))
+        .map(|home| home.join(".subtitle-live/models/ggml-small.en.bin"))
         .ok_or(ConfigError::DataDirectoryUnavailable)
 }
 
+/// โหลดการตั้งค่าและรายงาน warning ผ่าน tracing ก่อนคืนค่าที่ใช้ได้
 pub fn load_or_default(path: impl AsRef<Path>) -> Result<AppConfig, ConfigError> {
     let path = path.as_ref();
     let loaded = load_config(path)?;
@@ -136,12 +156,13 @@ pub fn load_or_default(path: impl AsRef<Path>) -> Result<AppConfig, ConfigError>
         tracing::warn!(
             config_path = %path.display(),
             warning = %warning,
-            "Configuration could not be loaded"
+            "โหลดไฟล์การตั้งค่าไม่ได้ จึงใช้ค่าเริ่มต้นที่ปลอดภัย"
         );
     }
     Ok(loaded.config)
 }
 
+/// อ่าน TOML โดยไม่เขียนทับไฟล์ที่เสียหรือมีเวอร์ชันไม่รองรับ
 pub fn load_config(path: impl AsRef<Path>) -> Result<LoadedConfig, ConfigError> {
     let path = path.as_ref();
     let contents = match fs::read_to_string(path) {
@@ -185,6 +206,7 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<LoadedConfig, ConfigError> 
     })
 }
 
+/// ตรวจสอบและบันทึกการตั้งค่าด้วยไฟล์ชั่วคราวก่อนแทนที่ไฟล์จริง
 pub fn save_config(path: impl AsRef<Path>, config: &AppConfig) -> Result<(), ConfigError> {
     if config.config_version != CURRENT_CONFIG_VERSION {
         return Err(ConfigError::UnsupportedVersion(config.config_version));
@@ -220,6 +242,7 @@ pub fn save_config(path: impl AsRef<Path>, config: &AppConfig) -> Result<(), Con
     Ok(())
 }
 
+/// เขียนและ sync เนื้อหาไปยังไฟล์ชั่วคราวที่สร้างใหม่เท่านั้น
 fn write_temporary_file(path: &Path, contents: &[u8]) -> Result<(), ConfigError> {
     let mut file = OpenOptions::new()
         .write(true)
@@ -232,6 +255,7 @@ fn write_temporary_file(path: &Path, contents: &[u8]) -> Result<(), ConfigError>
         .map_err(|source| io_error("sync temporary", path, source))
 }
 
+/// สร้างชื่อไฟล์ชั่วคราวที่ไม่ชนกันสำหรับการแทนที่แบบ atomic
 fn temporary_path(path: &Path) -> Result<PathBuf, ConfigError> {
     let file_name = path
         .file_name()
@@ -246,6 +270,7 @@ fn temporary_path(path: &Path) -> Result<PathBuf, ConfigError> {
     Ok(path.with_file_name(temporary_name))
 }
 
+/// เพิ่มบริบท operation และ path ให้ข้อผิดพลาด I/O
 fn io_error(operation: &'static str, path: &Path, source: io::Error) -> ConfigError {
     ConfigError::Io {
         operation,
@@ -254,6 +279,7 @@ fn io_error(operation: &'static str, path: &Path, source: io::Error) -> ConfigEr
     }
 }
 
+/// อ่าน environment variable เฉพาะเมื่อค่าที่ได้เป็น absolute path
 fn absolute_environment_path(name: &str) -> Option<PathBuf> {
     let path = PathBuf::from(std::env::var_os(name)?);
     path.is_absolute().then_some(path)

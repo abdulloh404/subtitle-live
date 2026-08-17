@@ -1,3 +1,8 @@
+//! service thread สำหรับค้นหา PipeWire playback stream และควบคุม capture
+//!
+//! GTK/application controller ส่งคำสั่งผ่าน channel ส่วน PipeWire main loop
+//! ทำงานใน thread ของตัวเอง แล้วส่ง event ที่ normalize แล้วกลับไปยัง runtime
+
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -17,6 +22,7 @@ use super::{
     capture::{CaptureSession, create_capture},
 };
 
+/// คำสั่งข้าม thread ที่เปลี่ยนสถานะ capture ภายใน PipeWire main loop
 #[derive(Clone)]
 enum Command {
     SetSelected(Vec<CaptureTarget>),
@@ -24,24 +30,28 @@ enum Command {
     Shutdown,
 }
 
+/// ฝั่งส่งคำสั่งที่ clone ได้โดยไม่เปิดเผย PipeWire main loop ให้ UI เข้าถึง
 #[derive(Clone)]
 pub struct PipeWireCommandSender {
     sender: pw::channel::Sender<Command>,
 }
 
 impl PipeWireCommandSender {
+    /// แทนที่กฎการเลือกทั้งหมดและเปิด capture สำหรับ stream ที่ตรงกัน
     pub fn set_selected(&self, targets: Vec<CaptureTarget>) -> Result<(), PipeWireServiceError> {
         self.sender
             .send(Command::SetSelected(targets))
             .map_err(|_| PipeWireServiceError)
     }
 
+    /// ปิด capture ปัจจุบันโดยยังคง service และการค้นหา stream ไว้
     pub fn stop_capture(&self) -> Result<(), PipeWireServiceError> {
         self.sender
             .send(Command::StopCapture)
             .map_err(|_| PipeWireServiceError)
     }
 
+    /// ปิด capture และออกจาก PipeWire main loop
     pub fn shutdown(&self) -> Result<(), PipeWireServiceError> {
         self.sender
             .send(Command::Shutdown)
@@ -49,6 +59,7 @@ impl PipeWireCommandSender {
     }
 }
 
+/// handle ฝั่ง application สำหรับส่งคำสั่งและรับ event แบบไม่บล็อก
 #[derive(Clone)]
 pub struct PipeWireService {
     commands: PipeWireCommandSender,
@@ -56,6 +67,7 @@ pub struct PipeWireService {
 }
 
 impl PipeWireService {
+    /// คืน command sender ที่ส่งต่อให้ component อื่นได้
     pub fn command_sender(&self) -> PipeWireCommandSender {
         self.commands.clone()
     }
@@ -72,7 +84,7 @@ impl PipeWireService {
         self.commands.shutdown()
     }
 
-    /// Drains all currently queued events without waiting for PipeWire.
+    /// ดึง event ที่รออยู่ทั้งหมดโดยไม่รอ PipeWire สร้าง event ใหม่
     pub fn drain_events(&self) -> Vec<PipeWireEvent> {
         let Ok(events) = self.events.try_lock() else {
             return Vec::new();
@@ -81,6 +93,7 @@ impl PipeWireService {
     }
 }
 
+/// ข้อผิดพลาดที่ระบุว่า command channel ใช้งานไม่ได้แล้ว
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PipeWireServiceError;
 
@@ -92,6 +105,7 @@ impl fmt::Display for PipeWireServiceError {
 
 impl std::error::Error for PipeWireServiceError {}
 
+/// เริ่ม PipeWire service thread และคืน handle ทันทีโดยไม่รอการเชื่อมต่อ
 pub fn spawn_service(audio: LatestQueue<SourceAudioChunk>) -> PipeWireService {
     let (command_sender, command_receiver) = pw::channel::channel();
     let (event_sender, event_receiver) = mpsc::channel();
@@ -185,13 +199,21 @@ fn run_service(
     }
 }
 
+/// สถานะทั้งหมดที่ต้องแก้บน PipeWire service thread เท่านั้น
 struct ServiceState {
+    /// main loop ที่ใช้สร้างและควบคุม capture stream
     mainloop: pw::MainLoop,
+    /// channel ส่ง graph/capture event กลับไปยัง application runtime
     events: mpsc::Sender<PipeWireEvent>,
+    /// คิวเสียงร่วมที่ callback ใช้ส่งข้อมูลไป mixer โดยไม่รอ
     audio: LatestQueue<SourceAudioChunk>,
+    /// playback stream ปัจจุบัน indexed ด้วย runtime node ID
     streams: HashMap<u32, StreamInfo>,
+    /// capture session ที่ต่ออยู่ indexed ด้วย runtime node ID
     captures: HashMap<u32, CaptureSession>,
+    /// กฎ application/stream แบบคงทนที่ผู้ใช้เลือก
     selected: Vec<CaptureTarget>,
+    /// ป้องกัน `reconcile` ต่อ capture ใหม่หลังได้รับคำสั่งหยุด
     capture_enabled: bool,
 }
 
@@ -241,6 +263,8 @@ impl ServiceState {
     }
 
     fn reconcile(&mut self) {
+        // คำนวณจาก metadata ทุกครั้งเพื่อให้ application ที่เปิดใหม่และได้ node ID ใหม่
+        // เชื่อมกลับอัตโนมัติ โดยไม่ใช้ runtime ID เป็นตัวตนถาวร
         let desired: HashSet<u32> = if self.capture_enabled {
             self.streams
                 .values()
@@ -296,6 +320,7 @@ impl ServiceState {
     }
 }
 
+/// แปลง PipeWire registry object เฉพาะ playback audio node เป็นชนิดภายในระบบ
 fn normalize_stream(
     object: &pw::registry::GlobalObject<pw::spa::dict::ForeignDict>,
 ) -> Option<StreamInfo> {
@@ -320,6 +345,7 @@ fn normalize_stream(
     })
 }
 
+/// คัดลอก property ที่มีค่าออกจาก dictionary ซึ่งมีอายุผูกกับ PipeWire object
 fn owned_property(properties: &pw::spa::dict::ForeignDict, key: &str) -> Option<String> {
     properties
         .get(key)

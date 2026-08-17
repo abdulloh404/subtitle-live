@@ -1,4 +1,4 @@
-//! GTK4/Libadwaita settings UI boundary.
+//! ขอบเขต UI หน้าต่างตั้งค่าที่สร้างด้วย GTK4 และ Libadwaita
 
 mod settings;
 

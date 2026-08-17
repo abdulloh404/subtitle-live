@@ -1,4 +1,13 @@
-use std::{mem::size_of, time::Instant};
+//! การเชื่อมต่อ capture ของ PipeWire สำหรับ stream ที่ผู้ใช้เลือกไว้เท่านั้น
+//!
+//! PipeWire แปลงรูปแบบต้นทางให้เป็น mono `f32` 16 kHz ตาม format ที่ร้องขอ
+//! จากนั้น callback จะประทับเวลาโดยประมาณและส่งเสียงเข้าคิวแบบไม่รอ เพื่อไม่ให้
+//! งาน STT ที่ช้ากว่าทำให้ real-time callback สะดุด
+
+use std::{
+    mem::size_of,
+    time::Instant,
+};
 
 use libspa_sys as spa_sys;
 use pipewire as pw;
@@ -8,21 +17,27 @@ use crate::audio::{LatestQueue, SAMPLE_RATE_HZ, SourceAudioChunk};
 
 use super::{PipeWireEvent, StreamInfo};
 
+/// สถานะที่ผูกกับ PipeWire callback ของ stream เดียว
 struct CaptureUserData {
+    /// คิวร่วมที่ส่งก้อนเสียงไปยัง mixer
     audio: LatestQueue<SourceAudioChunk>,
+    /// runtime node ID ของ source นี้
     source_id: u32,
 }
 
+/// เจ้าของ PipeWire stream ที่กำลัง capture และตัดการเชื่อมต่อได้อย่างปลอดภัย
 pub(super) struct CaptureSession {
     stream: pw::stream::Stream<CaptureUserData>,
 }
 
 impl CaptureSession {
+    /// ขอให้ PipeWire หยุดส่งบัฟเฟอร์ของ source นี้
     pub(super) fn disconnect(&self) {
         let _ = self.stream.disconnect();
     }
 }
 
+/// สร้าง capture stream ที่เจาะจง node และร้องขอเสียง mono `f32` 16 kHz
 pub(super) fn create_capture(
     mainloop: &pw::MainLoop,
     info: &StreamInfo,
@@ -92,6 +107,7 @@ pub(super) fn create_capture(
             return;
         }
 
+        // อ่านเฉพาะช่วงที่ PipeWire ระบุใน chunk และไม่แตะ padding ของบัฟเฟอร์
         let samples: Vec<_> = bytes[offset..end]
             .chunks_exact(size_of::<f32>())
             .map(|sample| f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]))
@@ -99,6 +115,7 @@ pub(super) fn create_capture(
         let captured_end = Instant::now();
         let sample_duration =
             std::time::Duration::from_secs_f64(samples.len() as f64 / SAMPLE_RATE_HZ as f64);
+        // ห้ามทำ formatting หรือ I/O ของ log ใน callback นี้ เพราะจะรบกวน PipeWire
         user_data.audio.push_latest(SourceAudioChunk {
             source_id: user_data.source_id,
             samples,
@@ -113,6 +130,7 @@ pub(super) fn create_capture(
         )
     })?;
 
+    // การกำหนด format ตรงนี้ให้ PipeWire/session manager ทำ conversion ก่อน callback
     let format = spa::pod::Value::Object(spa::pod::Object {
         type_: spa_sys::SPA_TYPE_OBJECT_Format,
         id: spa_sys::SPA_PARAM_EnumFormat,

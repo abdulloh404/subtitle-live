@@ -1,3 +1,4 @@
+# ข้อมูล package หลักของแอปเดสก์ท็อป Subtitle-live
 [package]
 name = "subtitle-live"
 version = "0.1.0"
@@ -6,6 +7,7 @@ rust-version = "1.92"
 description = "Local Ubuntu live subtitles for selected PipeWire audio streams"
 publish = false
 
+# Dependency สำหรับ UI, PipeWire, config, tracing และ whisper.cpp binding
 [dependencies]
 adw = { package = "libadwaita", version = "0.9.2", features = ["gtk_v4_6", "v1_1"] }
 gtk = { package = "gtk4", version = "0.11.4", features = ["v4_6"] }
@@ -20,12 +22,15 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt", "json"] }
 whisper-rs = { version = "0.16.0", features = ["hipblas", "tracing_backend"] }
 
+# Dependency ที่ใช้เฉพาะตอนสร้าง native bindings
 [build-dependencies]
-# Keep libspa-sys 0.6's bindgen compatible with whisper-rs-sys enabling dynamic clang.
+# ล็อก bindgen ให้เข้ากับ libspa-sys 0.6 และ dynamic clang ที่ whisper-rs-sys เปิดใช้
 bindgen = { version = "=0.64.0", default-features = false, features = ["runtime"] }
 
+# ห้ามใช้ unsafe ใน source ของโปรเจกต์ แม้ native dependency ภายนอกจะใช้ได้
 [lints.rust]
 unsafe_code = "forbid"
 
+# เปิดคำเตือน Clippy กลุ่มมาตรฐานสำหรับโค้ด first-party
 [lints.clippy]
 all = { level = "warn", priority = -1 }

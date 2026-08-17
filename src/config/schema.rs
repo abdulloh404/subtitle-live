@@ -1,8 +1,12 @@
+//! โครงสร้างไฟล์ตั้งค่า ค่าเริ่มต้น และกฎตรวจสอบสำหรับ Phase 1
+
 use std::{error::Error, fmt, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// เวอร์ชัน schema ที่โปรแกรมรุ่นนี้อ่านและเขียนได้
 pub const CURRENT_CONFIG_VERSION: u32 = 1;
+/// ตำแหน่ง anchor ของ overlay ที่ UI และ controller รองรับ
 pub const SUBTITLE_POSITIONS: [&str; 9] = [
     "top-left",
     "top-center",
@@ -16,16 +20,23 @@ pub const SUBTITLE_POSITIONS: [&str; 9] = [
 ];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// การตั้งค่าระดับบนสุดซึ่งแบ่งตามความรับผิดชอบของแต่ละ pipeline stage
 pub struct AppConfig {
+    /// เวอร์ชัน schema สำหรับป้องกันการอ่านรูปแบบที่ไม่รองรับ
     pub config_version: u32,
+    /// พฤติกรรมทั่วไปและสถานะเปิดใช้งาน
     #[serde(default)]
     pub general: GeneralConfig,
+    /// รูปแบบเสียงเป้าหมายและกฎเลือกแหล่งเสียง
     #[serde(default)]
     pub audio: AudioConfig,
+    /// โมเดลและช่วงเวลาการประมวลผล STT
     #[serde(default)]
     pub stt: SttConfig,
+    /// รูปลักษณ์และตำแหน่งคำบรรยาย
     #[serde(default)]
     pub subtitle: SubtitleConfig,
+    /// การแสดงข้อมูลประสิทธิภาพ
     #[serde(default)]
     pub performance: PerformanceConfig,
 }
@@ -44,6 +55,7 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    /// ตรวจสอบ invariant ที่ทุกบริการใน Phase 1 ใช้ร่วมกัน
     pub fn validate(&self) -> Result<(), ConfigValidationError> {
         if self.audio.capture_mode != "selected" {
             return Err(ConfigValidationError::new(
@@ -161,6 +173,7 @@ impl AppConfig {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// รายละเอียดฟิลด์การตั้งค่าที่ไม่ผ่าน validation
 pub struct ConfigValidationError {
     field: &'static str,
     reason: &'static str,
@@ -182,8 +195,11 @@ impl Error for ConfigValidationError {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+/// พฤติกรรมการเริ่มและปิดหน้าต่างหลัก
 pub struct GeneralConfig {
+    /// กำหนดว่าควรเริ่ม pipeline คำบรรยายหรือไม่
     pub live_subtitles: bool,
+    /// ให้โปรเซสทำงานต่อเมื่อผู้ใช้ปิดหน้าต่างตั้งค่า
     pub keep_running_when_closed: bool,
 }
 
@@ -198,10 +214,15 @@ impl Default for GeneralConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+/// รูปแบบเสียงกลางและกฎเลือก application/stream
 pub struct AudioConfig {
+    /// โหมดการจับเสียง ซึ่ง Phase 1 อนุญาตเฉพาะ `selected`
     pub capture_mode: String,
+    /// sample rate ที่ส่งเข้า Whisper
     pub target_sample_rate: u32,
+    /// จำนวน channel หลังแปลงรูปแบบเสียง
     pub target_channels: u16,
+    /// กฎถาวรสำหรับเลือก application และ stream
     pub rules: Vec<ApplicationRule>,
 }
 
@@ -218,31 +239,49 @@ impl Default for AudioConfig {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+/// กฎเลือก application ที่อาศัย metadata เสถียรแทน node ID ชั่วคราว
 pub struct ApplicationRule {
+    /// เลือกทุก playback stream ของ application นี้
     pub enabled: bool,
+    /// application ID ที่ PipeWire รายงาน หากมี
     pub application_id: Option<String>,
+    /// ชื่อ executable ของ process หากมี
     pub process_binary: Option<String>,
+    /// ชื่อ application สำหรับ fallback สุดท้าย
     pub application_name: Option<String>,
+    /// กฎราย stream เมื่อไม่ได้เลือกทั้ง application
     pub streams: Vec<StreamRule>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+/// กฎเลือก playback stream ภายใน application
 pub struct StreamRule {
+    /// ระบุว่ากฎนี้มีผลหรือไม่
     pub enabled: bool,
+    /// ชื่อสื่อสำหรับ fallback เมื่อไม่มี node name
     pub media_name: Option<String>,
+    /// ชื่อ node ที่ใช้จับคู่เป็นลำดับแรก
     pub node_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+/// การตั้งค่าโมเดลและหน้าต่างเสียงสำหรับ speech-to-text
 pub struct SttConfig {
+    /// รหัสภาษาที่ Whisper ใช้ถอดเสียง
     pub language: String,
+    /// ชื่อโมเดลที่แสดงใน UI และใช้ค้นหาไฟล์เริ่มต้น
     pub model: String,
+    /// path โมเดลแบบกำหนดเอง หรือ `None` เพื่อใช้ตำแหน่งมาตรฐาน
     pub model_path: Option<PathBuf>,
+    /// backend ประมวลผลที่ร้องขอ เช่น `auto`
     pub backend: String,
+    /// ระยะห่างระหว่างรอบส่งเสียงเข้า STT
     pub step_ms: u32,
+    /// ความยาวเสียงย้อนหลังสูงสุดที่ใช้เป็น context
     pub window_ms: u32,
+    /// เปิดการตรวจจับช่วงที่มีเสียงพูดก่อนเรียก STT
     pub vad_enabled: bool,
 }
 
@@ -262,11 +301,17 @@ impl Default for SttConfig {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+/// การตั้งค่ารูปลักษณ์และขอบเขตข้อความของ overlay
 pub struct SubtitleConfig {
+    /// แสดงหรือซ่อน overlay
     pub visible: bool,
+    /// anchor บนหน้าจอตามค่าใน [`SUBTITLE_POSITIONS`]
     pub position: String,
+    /// ขนาดตัวอักษรในหน่วยพอยต์
     pub font_size: u32,
+    /// ความทึบพื้นหลังช่วง `0.0..=1.0`
     pub background_opacity: f32,
+    /// จำนวนบรรทัดคำบรรยายสูงสุด
     pub max_lines: u32,
 }
 
@@ -284,7 +329,9 @@ impl Default for SubtitleConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+/// ตัวเลือกการแสดงข้อมูลประสิทธิภาพแก่ผู้ใช้
 pub struct PerformanceConfig {
+    /// แสดง latency และสถานะคิวในหน้าต่างตั้งค่า
     pub show_metrics: bool,
 }
 
@@ -294,6 +341,7 @@ impl Default for PerformanceConfig {
     }
 }
 
+/// ตรวจว่า metadata ทางเลือกมีข้อความที่ใช้งานได้
 fn has_text(value: &Option<String>) -> bool {
     value
         .as_deref()
