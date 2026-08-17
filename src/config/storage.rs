@@ -21,6 +21,7 @@ pub enum ConfigError {
     UnsupportedVersion(u32),
     InvalidPath(PathBuf),
     ConfigDirectoryUnavailable,
+    DataDirectoryUnavailable,
 }
 
 impl fmt::Display for ConfigError {
@@ -54,6 +55,10 @@ impl fmt::Display for ConfigError {
                 formatter,
                 "cannot determine configuration directory because XDG_CONFIG_HOME and HOME are unavailable"
             ),
+            Self::DataDirectoryUnavailable => write!(
+                formatter,
+                "cannot determine data directory because XDG_DATA_HOME and HOME are unavailable"
+            ),
         }
     }
 }
@@ -66,7 +71,8 @@ impl Error for ConfigError {
             Self::InvalidValues(source) => Some(source),
             Self::UnsupportedVersion(_)
             | Self::InvalidPath(_)
-            | Self::ConfigDirectoryUnavailable => None,
+            | Self::ConfigDirectoryUnavailable
+            | Self::DataDirectoryUnavailable => None,
         }
     }
 }
@@ -111,6 +117,16 @@ pub fn default_path() -> Result<PathBuf, ConfigError> {
     absolute_environment_path("HOME")
         .map(|home| home.join(".config/subtitle-live/config.toml"))
         .ok_or(ConfigError::ConfigDirectoryUnavailable)
+}
+
+pub fn default_model_path() -> Result<PathBuf, ConfigError> {
+    if let Some(base) = absolute_environment_path("XDG_DATA_HOME") {
+        return Ok(base.join("subtitle-live/models/ggml-small.en.bin"));
+    }
+
+    absolute_environment_path("HOME")
+        .map(|home| home.join(".local/share/subtitle-live/models/ggml-small.en.bin"))
+        .ok_or(ConfigError::DataDirectoryUnavailable)
 }
 
 pub fn load_or_default(path: impl AsRef<Path>) -> Result<AppConfig, ConfigError> {

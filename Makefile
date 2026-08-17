@@ -1,4 +1,4 @@
-.PHONY: build release run format lint test
+.PHONY: build release run format lint test model
 
 build:
 	cargo build
@@ -18,3 +18,5 @@ lint:
 test:
 	cargo test --all-targets
 
+model:
+	./scripts/download-model.sh

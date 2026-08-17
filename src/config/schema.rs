@@ -1,4 +1,4 @@
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -61,6 +61,17 @@ impl AppConfig {
         if self.stt.model.trim().is_empty() {
             return Err(ConfigValidationError::new("stt.model", "must not be empty"));
         }
+        if self
+            .stt
+            .model_path
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err(ConfigValidationError::new(
+                "stt.model_path",
+                "must not be empty when configured",
+            ));
+        }
         if self.stt.backend.trim().is_empty() {
             return Err(ConfigValidationError::new(
                 "stt.backend",
@@ -77,6 +88,12 @@ impl AppConfig {
             return Err(ConfigValidationError::new(
                 "stt.window_ms",
                 "must be greater than or equal to stt.step_ms",
+            ));
+        }
+        if self.stt.window_ms > 30_000 {
+            return Err(ConfigValidationError::new(
+                "stt.window_ms",
+                "must not exceed 30000",
             ));
         }
         if self.subtitle.position.trim().is_empty() {
@@ -117,14 +134,13 @@ impl AppConfig {
                 ));
             }
 
-            if rule
-                .streams
-                .iter()
-                .any(|stream| !has_text(&stream.media_name))
+            if rule.streams.iter().any(|stream| {
+                !has_text(&stream.media_name) && !has_text(&stream.node_name)
+            })
             {
                 return Err(ConfigValidationError::new(
                     "audio.rules.streams",
-                    "each stream rule must contain a media name",
+                    "each stream rule must contain a media or node name",
                 ));
             }
         }
@@ -204,6 +220,7 @@ pub struct ApplicationRule {
 pub struct StreamRule {
     pub enabled: bool,
     pub media_name: Option<String>,
+    pub node_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,6 +228,7 @@ pub struct StreamRule {
 pub struct SttConfig {
     pub language: String,
     pub model: String,
+    pub model_path: Option<PathBuf>,
     pub backend: String,
     pub step_ms: u32,
     pub window_ms: u32,
@@ -222,10 +240,11 @@ impl Default for SttConfig {
         Self {
             language: "en".to_owned(),
             model: "small.en".to_owned(),
+            model_path: None,
             backend: "auto".to_owned(),
             step_ms: 250,
             window_ms: 3_000,
-            vad_enabled: true,
+            vad_enabled: false,
         }
     }
 }

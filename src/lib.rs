@@ -6,6 +6,7 @@ pub mod logging;
 pub mod metrics;
 pub mod overlay;
 pub mod pipewire;
+pub mod runtime;
 pub mod stt;
 pub mod subtitle;
 pub mod tray;

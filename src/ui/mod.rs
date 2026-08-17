@@ -2,4 +2,4 @@
 
 mod settings;
 
-pub use settings::present_settings;
+pub use settings::{SettingsPresenter, present_settings};

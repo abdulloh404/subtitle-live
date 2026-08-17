@@ -1,1 +1,3 @@
-//! Subtitle overlay presentation boundary.
+mod window;
+
+pub use window::OverlayPresenter;
