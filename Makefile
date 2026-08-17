@@ -29,6 +29,6 @@ test:
 model:
 	./scripts/download-model.sh
 
-# ติดตั้งและเปิด GNOME Shell overlay สำหรับ user ปัจจุบัน
+# ติดตั้ง Extension ที่วางหน้าต่าง subtitle ไว้เหนือหน้าต่างอื่น
 install-extension:
 	./scripts/install-gnome-extension.sh

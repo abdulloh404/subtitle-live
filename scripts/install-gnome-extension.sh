@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# ติดตั้ง GNOME Shell renderer ให้ user ปัจจุบันโดยไม่ใช้ sudo
+# ติดตั้ง GNOME Shell Extension ที่คุม always-on-top ให้ user ปัจจุบันโดยไม่ใช้ sudo
 set -eu
 
 extension_uuid='subtitle-live-overlay@local'
@@ -47,5 +47,5 @@ if [ "$extension_changed" -eq 1 ] || [ "$extension_active" -eq 0 ]; then
     printf '%s\n' 'ติดตั้ง Extension และตั้งค่าให้เปิดอัตโนมัติแล้ว'
     printf '%s\n' 'กรุณาออกจากระบบแล้วเข้าใหม่หนึ่งครั้งเพื่อโหลดโค้ดรุ่นล่าสุด'
 else
-    printf '%s\n' 'Subtitle-live GNOME Shell overlay เปิดใช้งานอยู่แล้ว'
+    printf '%s\n' 'Subtitle-live always-on-top Extension เปิดใช้งานอยู่แล้ว'
 fi

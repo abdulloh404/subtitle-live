@@ -9,7 +9,7 @@ use std::{
 use adw::prelude::*;
 use gtk::glib;
 use subtitle_live::{
-    app::ApplicationController,
+    app::{ApplicationController, ApplicationState},
     config,
     error::AppError,
     logging,
@@ -172,7 +172,12 @@ fn install_runtime_poll(
             desktop.settings.update_metrics(metrics);
             desktop.overlay.apply_config(&subtitle_config);
             if update.hide_overlay {
-                desktop.overlay.hide();
+                if matches!(state, ApplicationState::Stopped | ApplicationState::Error) {
+                    desktop.overlay.unmap();
+                } else {
+                    // ระหว่างเงียบ/เปลี่ยน capture ให้คง toplevel ไว้ เพื่อรักษา stacking
+                    desktop.overlay.hide();
+                }
             }
             if let Some(subtitle) = update.subtitle {
                 desktop
