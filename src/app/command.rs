@@ -21,6 +21,8 @@ pub enum AppCommand {
     SetSubtitlePosition(String),
     /// เปลี่ยนขนาดตัวอักษรคำบรรยายในหน่วยพอยต์
     SetSubtitleFontSize(u32),
+    /// เปลี่ยนความกว้างสูงสุดของกล่องคำบรรยายในหน่วยพิกเซล
+    SetSubtitleWidthPx(u32),
     /// เปลี่ยนความทึบพื้นหลัง overlay ในรูปเปอร์เซ็นต์จำนวนเต็ม
     SetSubtitleBackgroundOpacityPercent(u32),
     /// เปลี่ยนจำนวนบรรทัดคำบรรยายสูงสุดที่มองเห็น

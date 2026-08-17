@@ -131,6 +131,12 @@ impl AppConfig {
                 "must be greater than zero",
             ));
         }
+        if !(320..=3_840).contains(&self.subtitle.width_px) {
+            return Err(ConfigValidationError::new(
+                "subtitle.width_px",
+                "must be between 320 and 3840",
+            ));
+        }
         if !self.subtitle.background_opacity.is_finite()
             || !(0.0..=1.0).contains(&self.subtitle.background_opacity)
         {
@@ -309,6 +315,8 @@ pub struct SubtitleConfig {
     pub position: String,
     /// ขนาดตัวอักษรในหน่วยพอยต์
     pub font_size: u32,
+    /// ความกว้างสูงสุดของกล่องคำบรรยายในหน่วยพิกเซล
+    pub width_px: u32,
     /// ความทึบพื้นหลังช่วง `0.0..=1.0`
     pub background_opacity: f32,
     /// จำนวนบรรทัดคำบรรยายสูงสุด
@@ -321,6 +329,7 @@ impl Default for SubtitleConfig {
             visible: true,
             position: "bottom-center".to_owned(),
             font_size: 28,
+            width_px: 960,
             background_opacity: 0.60,
             max_lines: 2,
         }

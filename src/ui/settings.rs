@@ -553,6 +553,24 @@ fn subtitle_page(
     });
     group.add(&font_size_row);
 
+    let (width_row, width) = spin_row(
+        "Maximum Width",
+        snapshot.subtitle_width_px,
+        320,
+        3_840,
+        20,
+        Some("px"),
+    );
+    let width_controller = Rc::clone(&controller);
+    width.connect_value_changed(move |spin| {
+        let _ = width_controller
+            .borrow_mut()
+            .handle_command(AppCommand::SetSubtitleWidthPx(
+                spin.value_as_int() as u32
+            ));
+    });
+    group.add(&width_row);
+
     let (opacity_row, opacity) = spin_row(
         "Background Opacity",
         snapshot.background_opacity_percent,
@@ -753,6 +771,7 @@ struct UiSnapshot {
     subtitle_visible: bool,
     subtitle_position: String,
     font_size: u32,
+    subtitle_width_px: u32,
     background_opacity_percent: u32,
     maximum_lines: u32,
     show_metrics: bool,
@@ -777,6 +796,7 @@ impl UiSnapshot {
             subtitle_visible: config.subtitle.visible,
             subtitle_position: config.subtitle.position.clone(),
             font_size: config.subtitle.font_size,
+            subtitle_width_px: config.subtitle.width_px,
             background_opacity_percent: (config.subtitle.background_opacity * 100.0).round() as u32,
             maximum_lines: config.subtitle.max_lines,
             show_metrics: config.performance.show_metrics,

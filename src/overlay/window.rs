@@ -9,10 +9,12 @@ use std::{
 use adw::prelude::*;
 use gtk::{gdk, glib};
 
-use crate::{config::SubtitleConfig, subtitle::format_live_caption};
+use crate::{config::SubtitleConfig, subtitle::CaptionLineBuffer};
 
 /// ระยะเวลาคงข้อความ final ไว้ก่อนซ่อนเมื่อไม่มีข้อความรุ่นใหม่
 const FINAL_HOLD_TIME: Duration = Duration::from_secs(4);
+// พื้นหลังเว้นซ้ายและขวาข้างละ 20 พิกเซล จึงต้องหักออกก่อนวัดข้อความ
+const CAPTION_HORIZONTAL_PADDING_PX: u32 = 40;
 
 /// เจ้าของ GTK widget ทั้งหมดของ overlay ซึ่งต้องเรียกจาก GTK main thread
 pub struct OverlayPresenter {
@@ -20,6 +22,8 @@ pub struct OverlayPresenter {
     applied_config: RefCell<Option<SubtitleConfig>>,
     /// provider ที่ใช้เปลี่ยนสีพื้นหลังและขนาดตัวอักษรแบบ runtime
     css_provider: gtk::CssProvider,
+    /// คิวบรรทัดที่ปิดบรรทัดเต็มแล้วและดันบรรทัดเก่าขึ้นตาม limit
+    line_buffer: RefCell<CaptionLineBuffer>,
     /// ป้องกันการแสดงข้อความเมื่อผู้ใช้ปิด overlay
     enabled: Cell<bool>,
     /// token สำหรับยกเลิก timeout ของ final frame รุ่นเก่า
@@ -48,7 +52,6 @@ impl OverlayPresenter {
 
         let label = gtk::Label::builder()
             .justify(gtk::Justification::Center)
-            .max_width_chars(128)
             .selectable(false)
             .use_markup(false)
             .wrap(false)
@@ -102,6 +105,7 @@ impl OverlayPresenter {
         let presenter = Self {
             applied_config: RefCell::new(None),
             css_provider,
+            line_buffer: RefCell::new(CaptionLineBuffer::default()),
             enabled: Cell::new(false),
             generation: Rc::new(Cell::new(0)),
             label,
@@ -122,12 +126,12 @@ impl OverlayPresenter {
         if source_text.is_empty() {
             return;
         }
-        let max_lines = self
+        let config = self
             .applied_config
             .borrow()
-            .as_ref()
-            .map_or(2, |config| config.max_lines);
-        let text = format_live_caption(source_text, max_lines);
+            .clone()
+            .unwrap_or_default();
+        let text = self.format_caption(source_text, &config);
         if text.is_empty() {
             return;
         }
@@ -158,6 +162,7 @@ impl OverlayPresenter {
         self.generation
             .set(self.generation.get().wrapping_add(1));
         self.label.set_label("");
+        self.line_buffer.borrow_mut().clear();
         self.last_text.borrow_mut().clear();
         self.window.hide();
     }
@@ -176,20 +181,50 @@ impl OverlayPresenter {
             return;
         }
 
+        let layout_changed = self.applied_config.borrow().as_ref().is_none_or(|previous| {
+            previous.font_size != config.font_size
+                || previous.width_px != config.width_px
+                || previous.max_lines != config.max_lines
+        });
         self.set_enabled(config.visible);
         apply_position(&self.surface, &config.position);
-        let source_text = self.last_text.borrow();
-        if !source_text.is_empty() {
-            self.label
-                .set_label(&format_live_caption(source_text.as_str(), config.max_lines));
-        }
+        // ปล่อยให้พื้นหลังขยายตามข้อความจริง ส่วน width_px ใช้เป็นเพดานตอนตัดบรรทัด
+        self.surface.set_width_request(-1);
         self.css_provider.load_from_data(&format!(
             ".subtitle-live-overlay, .subtitle-live-overlay-root {{ background: transparent; }}\n\
              .subtitle-live-surface {{ background: rgba(0, 0, 0, {:.3}); border-radius: 12px; padding: 12px 20px; }}\n\
              .subtitle-live-text {{ color: white; font-size: {}pt; font-weight: 600; }}",
             config.background_opacity, config.font_size
         ));
+        if layout_changed {
+            self.line_buffer.borrow_mut().clear();
+            let source_text = self.last_text.borrow();
+            if !source_text.is_empty() {
+                self.label
+                    .set_label(&self.format_caption(source_text.as_str(), config));
+            }
+        }
         self.applied_config.replace(Some(config.clone()));
+    }
+
+    /// วัดข้อความด้วย Pango ตามขนาดฟอนต์จริง แล้วส่งผลให้คิวตัดและดันบรรทัด
+    fn format_caption(&self, text: &str, config: &SubtitleConfig) -> String {
+        let layout = self.label.create_pango_layout(None);
+        let mut font = gtk::pango::FontDescription::new();
+        font.set_size(config.font_size as i32 * gtk::pango::SCALE);
+        font.set_weight(gtk::pango::Weight::Semibold);
+        layout.set_font_description(Some(&font));
+        let available_width = config
+            .width_px
+            .saturating_sub(CAPTION_HORIZONTAL_PADDING_PX)
+            .max(1) as i32;
+
+        self.line_buffer
+            .borrow_mut()
+            .update(text, config.max_lines, |candidate| {
+                layout.set_text(candidate);
+                layout.pixel_size().0 <= available_width
+            })
     }
 }
 

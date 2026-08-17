@@ -1,13 +1,13 @@
 //! การรวมข้อความถอดเสียงแบบชั่วคราวและยืนยันแล้ว พร้อมสถานะที่ใช้แสดงเป็นคำบรรยาย
 
+use std::collections::VecDeque;
+
 use crate::stt::{TranscriptUpdate, normalize_hypothesis_text};
 
 // จำกัดประวัติที่แสดงเพื่อไม่ให้ข้อความสะสมเพิ่มหน่วยความจำอย่างไม่มีขอบเขต
 const DEFAULT_PRESENTATION_WORDS: usize = 64;
-// ความกว้างเป้าหมายต่อบรรทัดเมื่อผู้ใช้อนุญาตให้แสดงหลายบรรทัด
-const CAPTION_LINE_CHARACTERS: usize = 42;
-// โหมดบรรทัดเดียวเก็บข้อความล่าสุดภายในความกว้างของหน้าต่างคำบรรยาย
-const SINGLE_LINE_CHARACTERS: usize = 128;
+// เก็บบรรทัดที่ปิดแล้วมากกว่าค่าสูงสุดของ UI เล็กน้อยเพื่อดันบรรทัดได้ต่อเนื่อง
+const MAX_RETAINED_CAPTION_LINES: usize = 8;
 
 /// รวมสมมติฐานที่ Whisper แก้ซ้ำให้เป็นข้อความต่อเนื่องโดยปกป้องคำที่นิ่งแล้ว
 #[derive(Debug)]
@@ -230,191 +230,108 @@ fn words(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// จัดข้อความล่าสุดเป็นจำนวนบรรทัดที่ผู้ใช้กำหนด
-pub(crate) fn format_live_caption(text: &str, max_lines: u32) -> String {
-    let words = words(text);
-    format_caption_words(&words, max_lines)
+/// คิวบรรทัดคำบรรยายที่ปิดบรรทัดเดิมทันทีเมื่อคำถัดไปเกินความกว้างจริง
+#[derive(Debug, Default)]
+pub(crate) struct CaptionLineBuffer {
+    /// บรรทัดที่เต็มแล้วและจะไม่ถูกผลชั่วคราวของ Whisper แก้ย้อนหลัง
+    committed_lines: VecDeque<Vec<String>>,
+    /// บรรทัดล่าสุดที่ยังรับคำใหม่และแก้ผลชั่วคราวได้
+    active_line: Vec<String>,
+    /// ข้อความต้นทางจากรอบก่อนสำหรับตรวจการเลื่อนหน้าต่างประวัติ
+    previous_words: Vec<String>,
+    /// ตำแหน่งเริ่มบรรทัดล่าสุดภายในข้อความต้นทาง
+    active_start: usize,
 }
 
-/// เลือกการจัดแบบบรรทัดเดียวหรือหลายบรรทัดจากรายการคำที่ทำความสะอาดแล้ว
-fn format_caption_words(words: &[String], max_lines: u32) -> String {
-    if words.is_empty() {
-        return String::new();
-    }
-
-    let keep = max_lines.max(1) as usize;
-    if keep == 1 {
-        return latest_words_that_fit(words, SINGLE_LINE_CHARACTERS);
-    }
-
-    let lines = wrap_caption_words(words, CAPTION_LINE_CHARACTERS);
-    lines[lines.len().saturating_sub(keep)..].join("\n")
-}
-
-/// เก็บคำจากท้ายประโยคให้มากที่สุดโดยไม่ตัดคำกลางคัน
-fn latest_words_that_fit(words: &[String], maximum_characters: usize) -> String {
-    let mut start = words.len();
-    let mut length = 0;
-
-    while start > 0 {
-        let word_length = words[start - 1].chars().count();
-        let next_length = word_length + usize::from(start < words.len()) + length;
-        if next_length > maximum_characters && start < words.len() {
-            break;
+impl CaptionLineBuffer {
+    /// อัปเดตคิวบรรทัด โดยผู้เรียกเป็นผู้วัดว่าข้อความหนึ่งบรรทัดพอดีกับความกว้างหรือไม่
+    pub(crate) fn update<F>(&mut self, text: &str, max_lines: u32, mut fits: F) -> String
+    where
+        F: FnMut(&str) -> bool,
+    {
+        let incoming = words(text);
+        if incoming.is_empty() {
+            return self.presentation(max_lines);
         }
-        start -= 1;
-        length = next_length;
+
+        if !self.previous_words.is_empty() {
+            let common_prefix = common_prefix_len(&self.previous_words, &incoming);
+            if common_prefix == 0 {
+                let shifted_overlap = longest_word_overlap(&self.previous_words, &incoming);
+                if shifted_overlap >= 3 && shifted_overlap < self.previous_words.len() {
+                    let removed_prefix = self.previous_words.len() - shifted_overlap;
+                    self.active_start = self.active_start.saturating_sub(removed_prefix);
+                }
+            }
+        }
+
+        // ผลชั่วคราวที่สั้นถอยข้ามบรรทัดที่ปิดแล้วต้องไม่ดึงบรรทัดเก่ากลับลงมา
+        if incoming.len() < self.active_start
+            || (incoming.len() == self.active_start && !self.active_line.is_empty())
+        {
+            return self.presentation(max_lines);
+        }
+
+        self.active_line = incoming[self.active_start..].to_vec();
+        self.previous_words = incoming;
+        let wrapped = wrap_words_to_width(&self.active_line, &mut fits);
+        if wrapped.len() > 1 {
+            for line in &wrapped[..wrapped.len() - 1] {
+                self.active_start = self.active_start.saturating_add(line.len());
+                self.committed_lines.push_back(line.clone());
+            }
+            self.active_line = wrapped.last().cloned().unwrap_or_default();
+        }
+
+        while self.committed_lines.len() > MAX_RETAINED_CAPTION_LINES {
+            self.committed_lines.pop_front();
+        }
+        self.presentation(max_lines)
     }
 
-    words[start..].join(" ")
+    /// ล้างขอบเขตบรรทัดเมื่อซ่อน overlay หรือเปลี่ยนรูปแบบที่มีผลต่อความกว้าง
+    pub(crate) fn clear(&mut self) {
+        self.committed_lines.clear();
+        self.active_line.clear();
+        self.previous_words.clear();
+        self.active_start = 0;
+    }
+
+    /// คืนบรรทัดล่าสุดตามจำนวนที่กำหนด โดยดันบรรทัดเก่าขึ้นและทิ้งจากหน้าจอ
+    fn presentation(&self, max_lines: u32) -> String {
+        let mut lines = self
+            .committed_lines
+            .iter()
+            .map(|line| line.join(" "))
+            .collect::<Vec<_>>();
+        if !self.active_line.is_empty() {
+            lines.push(self.active_line.join(" "));
+        }
+        let keep = max_lines.max(1) as usize;
+        lines[lines.len().saturating_sub(keep)..].join("\n")
+    }
 }
 
-/// ตัดบรรทัดแบบเติมให้เต็มก่อน แล้วเลือกจุดพักภาษาที่เหมาะสมเมื่อบรรทัดเต็ม
-fn wrap_caption_words(words: &[String], maximum_characters: usize) -> Vec<String> {
+/// เติมคำลงบรรทัดให้มากที่สุดและตัดเฉพาะตรงช่องว่างเมื่อคำถัดไปเกินความกว้าง
+fn wrap_words_to_width<F>(words: &[String], fits: &mut F) -> Vec<Vec<String>>
+where
+    F: FnMut(&str) -> bool,
+{
     let mut lines = Vec::new();
     let mut start = 0;
-
     while start < words.len() {
         let mut end = start;
-        let mut line_length = 0;
         while end < words.len() {
-            let next_length = line_length + usize::from(end > start) + words[end].chars().count();
-            if next_length > maximum_characters && end > start {
+            let candidate = words[start..=end].join(" ");
+            if end > start && !fits(&candidate) {
                 break;
             }
-            line_length = next_length;
             end += 1;
-            if line_length > maximum_characters {
-                break;
-            }
         }
-
-        if end == words.len() {
-            lines.push(words[start..end].join(" "));
-            break;
-        }
-
-        let break_at = preferred_break(words, start, end);
-        lines.push(words[start..break_at].join(" "));
-        start = break_at;
+        lines.push(words[start..end].to_vec());
+        start = end;
     }
-
     lines
-}
-
-/// ให้คะแนนจบประโยค จบวลี และคำเชื่อมเพื่อหลีกเลี่ยงจุดตัดที่อ่านยาก
-fn preferred_break(words: &[String], start: usize, greedy_end: usize) -> usize {
-    let word_count = greedy_end - start;
-    let earliest = start + word_count.div_ceil(2).max(1);
-    let mut best = None;
-
-    for break_at in earliest..=greedy_end {
-        if break_at >= words.len() {
-            break;
-        }
-        let score = if ends_sentence(&words[break_at - 1]) {
-            4
-        } else if ends_clause(&words[break_at - 1]) {
-            3
-        } else if starts_with_conjunction(&words[break_at]) {
-            2
-        } else {
-            0
-        };
-        if score > 0 && best.is_none_or(|(best_score, _)| score >= best_score) {
-            best = Some((score, break_at));
-        }
-    }
-    if let Some((_, break_at)) = best {
-        return break_at;
-    }
-
-    if greedy_end < words.len() && is_linked_pair(&words[greedy_end - 1], &words[greedy_end]) {
-        for break_at in (earliest..greedy_end).rev() {
-            if !is_linked_pair(&words[break_at - 1], &words[break_at]) {
-                return break_at;
-            }
-        }
-    }
-    greedy_end
-}
-
-/// ตรวจเครื่องหมายจบประโยคโดยไม่นับจุดของคำนำหน้าชื่อและตัวย่อทั่วไป
-fn ends_sentence(word: &str) -> bool {
-    let word = word.trim_end_matches(|character| {
-        matches!(character, '"' | '\'' | ')' | ']' | '}' | '’' | '”')
-    });
-    if word.ends_with('?') || word.ends_with('!') {
-        return true;
-    }
-    if !word.ends_with('.') {
-        return false;
-    }
-    !matches!(
-        normalized_word(word).as_str(),
-        "mr" | "mrs" | "ms" | "dr" | "prof" | "sr" | "jr" | "vs" | "eg" | "ie"
-    )
-}
-
-/// ตรวจเครื่องหมายที่เหมาะกับการพักวลีภายในประโยค
-fn ends_clause(word: &str) -> bool {
-    let word = word.trim_end_matches(|character| {
-        matches!(character, '"' | '\'' | ')' | ']' | '}' | '’' | '”')
-    });
-    word.ends_with(',') || word.ends_with(';') || word.ends_with(':') || word.ends_with('—')
-}
-
-/// ตรวจคำเชื่อมที่ควรเริ่มต้นบรรทัดใหม่เมื่อจำเป็นต้องตัด
-fn starts_with_conjunction(word: &str) -> bool {
-    matches!(
-        normalized_word(word).as_str(),
-        "and" | "but" | "or" | "so" | "because" | "although" | "though" | "while" | "yet"
-    )
-}
-
-/// ป้องกันไม่ให้คำหน้าที่สั้น ๆ แยกจากคำถัดไปโดยไม่จำเป็น
-fn is_linked_pair(left: &str, _right: &str) -> bool {
-    matches!(
-        normalized_word(left).as_str(),
-        "a"
-            | "an"
-            | "the"
-            | "to"
-            | "of"
-            | "in"
-            | "on"
-            | "at"
-            | "for"
-            | "from"
-            | "with"
-            | "by"
-            | "i"
-            | "you"
-            | "he"
-            | "she"
-            | "it"
-            | "we"
-            | "they"
-            | "is"
-            | "are"
-            | "was"
-            | "were"
-            | "be"
-            | "been"
-            | "being"
-            | "have"
-            | "has"
-            | "had"
-            | "do"
-            | "does"
-            | "did"
-            | "can"
-            | "could"
-            | "will"
-            | "would"
-            | "should"
-            | "not"
-    )
 }
 
 /// ต่อคำใหม่โดยลบเฉพาะส่วนที่ซ้อนกับท้ายรายการเดิม
@@ -484,10 +401,7 @@ fn trim_front(words: &mut Vec<String>, maximum: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        TranscriptReconciler, format_live_caption, latest_words_that_fit, words,
-        wrap_caption_words,
-    };
+    use super::{CaptionLineBuffer, TranscriptReconciler};
     use crate::stt::TranscriptUpdate;
 
     #[test]
@@ -606,10 +520,6 @@ mod tests {
         partial(&mut reconciler, 1, "I think this works");
 
         assert_eq!(reconciler.presentation_text(), "I think this works");
-        assert_eq!(
-            format_live_caption(reconciler.presentation_text(), 2),
-            "I think this works"
-        );
     }
 
     #[test]
@@ -645,87 +555,62 @@ mod tests {
     }
 
     #[test]
-    fn completed_sentences_fill_available_lines_before_rollover() {
+    fn one_line_replaces_the_whole_line_after_reaching_width() {
+        let mut buffer = CaptionLineBuffer::default();
+
+        assert_eq!(caption(&mut buffer, "one two", 1, 7), "one two");
+        assert_eq!(caption(&mut buffer, "one two three", 1, 7), "three");
+        assert_eq!(caption(&mut buffer, "one two", 1, 7), "three");
+        assert_eq!(caption(&mut buffer, "one two four", 1, 7), "four");
+    }
+
+    #[test]
+    fn two_lines_push_the_older_line_up_when_the_limit_is_full() {
+        let mut buffer = CaptionLineBuffer::default();
+
         assert_eq!(
-            format_live_caption("Keep this completed sentence.", 2),
-            "Keep this completed sentence."
+            caption(&mut buffer, "one two three", 2, 7),
+            "one two\nthree"
         );
         assert_eq!(
-            format_live_caption("Keep this completed sentence. Start", 2),
-            "Keep this completed sentence. Start"
-        );
-        assert_eq!(format_live_caption("One. Two. Three.", 2), "One. Two. Three.");
-        let rolled = format_live_caption(
-            "Keep this completed sentence. Start the next caption with enough words to fill the whole line",
-            2,
-        );
-        assert!(!rolled.contains("Keep this completed sentence."));
-        assert!(rolled.contains("Start the next caption"));
-        assert_eq!(
-            format_live_caption("First sentence. Keep the latest sentence!", 2),
-            "First sentence. Keep the latest sentence!"
+            caption(&mut buffer, "one two three four", 2, 7),
+            "three\nfour"
         );
     }
 
     #[test]
-    fn sliding_line_drops_only_the_oldest_words_when_full() {
-        let caption_words =
-            words("alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu");
+    fn a_closed_line_is_not_rewritten_by_a_later_partial_result() {
+        let mut buffer = CaptionLineBuffer::default();
 
         assert_eq!(
-            latest_words_that_fit(&caption_words, 64),
-            "beta gamma delta epsilon zeta eta theta iota kappa lambda mu"
+            caption(&mut buffer, "one two three", 2, 7),
+            "one two\nthree"
+        );
+        assert_eq!(
+            caption(&mut buffer, "one too three", 2, 7),
+            "one two\nthree"
         );
     }
 
     #[test]
-    fn common_title_abbreviations_do_not_roll_the_sentence_over() {
+    fn punctuation_does_not_cut_a_line_before_the_width_limit() {
+        let mut buffer = CaptionLineBuffer::default();
+
         assert_eq!(
-            format_live_caption("Dr. Smith is ready", 2),
-            "Dr. Smith is ready"
+            caption(&mut buffer, "First. second third", 2, 19),
+            "First. second third"
         );
     }
 
-    #[test]
-    fn wrapping_is_explicit_stable_and_prefers_clause_boundaries() {
-        let caption = format_live_caption(
-            "This is a carefully prepared example, and it keeps moving toward the ending",
-            2,
-        );
-        let lines = caption.lines().collect::<Vec<_>>();
-
-        assert_eq!(lines.len(), 2);
-        assert!(lines[0].ends_with(','));
-        assert!(lines.iter().all(|line| line.chars().count() <= 42));
-        assert_eq!(
-            format_live_caption(
-                "This is a carefully prepared example, and it keeps moving toward the final ending",
-                2,
-            )
-            .lines()
-            .next(),
-            Some(lines[0])
-        );
-    }
-
-    #[test]
-    fn wrapping_keeps_obvious_linked_words_together() {
-        assert_eq!(
-            wrap_caption_words(&words("please see the screen"), 14),
-            vec!["please see".to_owned(), "the screen".to_owned()]
-        );
-    }
-
-    #[test]
-    fn long_unpunctuated_speech_rolls_old_lines_away() {
-        let caption = format_live_caption(
-            "old words should leave the screen as this uninterrupted live sentence continues with enough additional speech to create several caption lines for the viewer right now",
-            2,
-        );
-
-        assert_eq!(caption.lines().count(), 2);
-        assert!(!caption.contains("old words"));
-        assert!(caption.ends_with("right now"));
+    fn caption(
+        buffer: &mut CaptionLineBuffer,
+        text: &str,
+        max_lines: u32,
+        maximum_characters: usize,
+    ) -> String {
+        buffer.update(text, max_lines, |candidate| {
+            candidate.chars().count() <= maximum_characters
+        })
     }
 
     fn partial(reconciler: &mut TranscriptReconciler, segment_id: u64, text: &str) {

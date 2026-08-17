@@ -294,6 +294,15 @@ impl ApplicationController {
                 self.config.subtitle.font_size = font_size;
                 AppEvent::ConfigChanged("subtitle.font_size")
             }
+            AppCommand::SetSubtitleWidthPx(width_px) => {
+                if !(320..=3_840).contains(&width_px) {
+                    return AppEvent::Error(format!(
+                        "Subtitle width must be between 320 and 3840 pixels: {width_px}"
+                    ));
+                }
+                self.config.subtitle.width_px = width_px;
+                AppEvent::ConfigChanged("subtitle.width_px")
+            }
             AppCommand::SetSubtitleBackgroundOpacityPercent(opacity) => {
                 if opacity > 100 {
                     return AppEvent::Error(format!(
