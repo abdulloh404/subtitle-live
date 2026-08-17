@@ -1,0 +1,7 @@
+[env]
+# ROCm's bundled Clang currently selects an incomplete GCC 12 installation on
+# Ubuntu. Point hipcc at the complete GCC 11 toolchain used by this system.
+CMAKE_PREFIX_PATH = { value = "/opt/rocm/core", force = false }
+HIPCC_COMPILE_FLAGS_APPEND = { value = "--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/11", force = false }
+HIPCC_LINK_FLAGS_APPEND = { value = "--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/11", force = false }
+LIBCLANG_PATH = { value = "/opt/rocm/core/llvm/lib", force = false }
