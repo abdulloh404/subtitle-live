@@ -1,0 +1,1 @@
+//! Background status indicator boundary.

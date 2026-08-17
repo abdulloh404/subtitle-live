@@ -1,0 +1,12 @@
+pub mod app;
+pub mod audio;
+pub mod config;
+pub mod error;
+pub mod logging;
+pub mod metrics;
+pub mod overlay;
+pub mod pipewire;
+pub mod stt;
+pub mod subtitle;
+pub mod tray;
+pub mod ui;
