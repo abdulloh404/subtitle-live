@@ -19,6 +19,8 @@ pub enum AppCommand {
     SetSubtitleVisible(bool),
     /// ย้าย overlay ไปยังตำแหน่งหน้าจอที่รองรับ
     SetSubtitlePosition(String),
+    /// เปลี่ยนแนวข้อความภายในกล่องคำบรรยาย
+    SetSubtitleTextAlignment(String),
     /// เปลี่ยนขนาดตัวอักษรคำบรรยายในหน่วยพอยต์
     SetSubtitleFontSize(u32),
     /// เปลี่ยนความกว้างสูงสุดของกล่องคำบรรยายในหน่วยพิกเซล

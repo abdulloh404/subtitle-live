@@ -1,7 +1,9 @@
 //! ตัวควบคุมสถานะแอปพลิเคชันและกฎการเลือกแหล่งเสียง
 
 use crate::{
-    config::{AppConfig, ApplicationRule, SUBTITLE_POSITIONS, StreamRule},
+    config::{
+        AppConfig, ApplicationRule, SUBTITLE_POSITIONS, SUBTITLE_TEXT_ALIGNMENTS, StreamRule,
+    },
     pipewire::{
         ApplicationIdentity, ApplicationKey, CaptureTarget, StreamDiscriminator, StreamInfo,
     },
@@ -285,6 +287,15 @@ impl ApplicationController {
                 self.config.subtitle.position = position;
                 AppEvent::ConfigChanged("subtitle.position")
             }
+            AppCommand::SetSubtitleTextAlignment(alignment) => {
+                if !SUBTITLE_TEXT_ALIGNMENTS.contains(&alignment.as_str()) {
+                    return AppEvent::Error(format!(
+                        "Unsupported subtitle text alignment: {alignment}"
+                    ));
+                }
+                self.config.subtitle.text_alignment = alignment;
+                AppEvent::ConfigChanged("subtitle.text_alignment")
+            }
             AppCommand::SetSubtitleFontSize(font_size) => {
                 if !(16..=72).contains(&font_size) {
                     return AppEvent::Error(format!(
@@ -332,6 +343,9 @@ impl ApplicationController {
 fn normalize_subtitle_config(config: &mut AppConfig) {
     if !SUBTITLE_POSITIONS.contains(&config.subtitle.position.as_str()) {
         config.subtitle.position = "bottom-center".to_owned();
+    }
+    if !SUBTITLE_TEXT_ALIGNMENTS.contains(&config.subtitle.text_alignment.as_str()) {
+        config.subtitle.text_alignment = "left".to_owned();
     }
     config.subtitle.font_size = config.subtitle.font_size.clamp(16, 72);
 }

@@ -51,7 +51,7 @@ impl OverlayPresenter {
         }
 
         let label = gtk::Label::builder()
-            .justify(gtk::Justification::Center)
+            .justify(gtk::Justification::Left)
             .selectable(false)
             .use_markup(false)
             .wrap(false)
@@ -188,6 +188,7 @@ impl OverlayPresenter {
         });
         self.set_enabled(config.visible);
         apply_position(&self.surface, &config.position);
+        apply_text_alignment(&self.label, &config.text_alignment);
         // ปล่อยให้พื้นหลังขยายตามข้อความจริง ส่วน width_px ใช้เป็นเพดานตอนตัดบรรทัด
         self.surface.set_width_request(-1);
         self.css_provider.load_from_data(&format!(
@@ -243,4 +244,15 @@ fn apply_position(surface: &gtk::Box, position: &str) {
     };
     surface.set_halign(horizontal);
     surface.set_valign(vertical);
+}
+
+/// จัดแนวแต่ละบรรทัดและตำแหน่งข้อความภายในพื้นที่ของ label
+fn apply_text_alignment(label: &gtk::Label, alignment: &str) {
+    let (justification, xalign) = match alignment {
+        "center" => (gtk::Justification::Center, 0.5),
+        "right" => (gtk::Justification::Right, 1.0),
+        _ => (gtk::Justification::Left, 0.0),
+    };
+    label.set_justify(justification);
+    label.set_xalign(xalign);
 }

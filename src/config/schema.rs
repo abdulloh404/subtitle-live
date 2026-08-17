@@ -18,6 +18,8 @@ pub const SUBTITLE_POSITIONS: [&str; 9] = [
     "bottom-center",
     "bottom-right",
 ];
+/// แนวข้อความภายในกล่องคำบรรยายที่ UI และ controller รองรับ
+pub const SUBTITLE_TEXT_ALIGNMENTS: [&str; 3] = ["left", "center", "right"];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 /// การตั้งค่าระดับบนสุดซึ่งแบ่งตามความรับผิดชอบของแต่ละ pipeline stage
@@ -122,6 +124,12 @@ impl AppConfig {
         if self.subtitle.position.trim().is_empty() {
             return Err(ConfigValidationError::new(
                 "subtitle.position",
+                "must not be empty",
+            ));
+        }
+        if self.subtitle.text_alignment.trim().is_empty() {
+            return Err(ConfigValidationError::new(
+                "subtitle.text_alignment",
                 "must not be empty",
             ));
         }
@@ -313,6 +321,8 @@ pub struct SubtitleConfig {
     pub visible: bool,
     /// anchor บนหน้าจอตามค่าใน [`SUBTITLE_POSITIONS`]
     pub position: String,
+    /// แนวข้อความภายในกล่องตามค่าใน [`SUBTITLE_TEXT_ALIGNMENTS`]
+    pub text_alignment: String,
     /// ขนาดตัวอักษรในหน่วยพอยต์
     pub font_size: u32,
     /// ความกว้างสูงสุดของกล่องคำบรรยายในหน่วยพิกเซล
@@ -328,6 +338,7 @@ impl Default for SubtitleConfig {
         Self {
             visible: true,
             position: "bottom-center".to_owned(),
+            text_alignment: "left".to_owned(),
             font_size: 28,
             width_px: 960,
             background_opacity: 0.60,

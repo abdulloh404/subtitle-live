@@ -6,7 +6,8 @@ mod writer;
 
 pub use schema::{
     AppConfig, ApplicationRule, AudioConfig, CURRENT_CONFIG_VERSION, ConfigValidationError,
-    GeneralConfig, PerformanceConfig, SUBTITLE_POSITIONS, StreamRule, SttConfig, SubtitleConfig,
+    GeneralConfig, PerformanceConfig, SUBTITLE_POSITIONS, SUBTITLE_TEXT_ALIGNMENTS, StreamRule,
+    SttConfig, SubtitleConfig,
 };
 pub use storage::{
     ConfigError, ConfigLoadWarning, LoadedConfig, default_model_path, default_path, load_config,

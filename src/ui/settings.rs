@@ -7,7 +7,7 @@ use gtk::glib;
 
 use crate::{
     app::{AppCommand, AppEvent, ApplicationController, ApplicationState},
-    config::{AppConfig, SUBTITLE_POSITIONS},
+    config::{AppConfig, SUBTITLE_POSITIONS, SUBTITLE_TEXT_ALIGNMENTS},
     metrics::MetricsSnapshot,
     pipewire::{ApplicationIdentity, ApplicationKey, StreamInfo},
 };
@@ -24,6 +24,7 @@ const SUBTITLE_POSITION_LABELS: [&str; 9] = [
     "Bottom center",
     "Bottom right",
 ];
+const SUBTITLE_TEXT_ALIGNMENT_LABELS: [&str; 3] = ["Left", "Center", "Right"];
 
 /// widget และ state ที่จำเป็นต่อการอัปเดตหน้าต่างจาก runtime
 #[derive(Clone)]
@@ -543,6 +544,31 @@ fn subtitle_page(
     });
     group.add(&position_row);
 
+    let selected_alignment = SUBTITLE_TEXT_ALIGNMENTS
+        .iter()
+        .position(|alignment| *alignment == snapshot.subtitle_text_alignment)
+        .unwrap_or(0) as u32;
+    let alignment_dropdown = gtk::DropDown::from_strings(&SUBTITLE_TEXT_ALIGNMENT_LABELS);
+    alignment_dropdown.set_selected(selected_alignment);
+    alignment_dropdown.set_valign(gtk::Align::Center);
+    let alignment_row = adw::ActionRow::builder()
+        .activatable_widget(&alignment_dropdown)
+        .title("Text Alignment")
+        .build();
+    alignment_row.add_suffix(&alignment_dropdown);
+    let alignment_controller = Rc::clone(&controller);
+    alignment_dropdown.connect_selected_notify(move |dropdown| {
+        let Some(alignment) = SUBTITLE_TEXT_ALIGNMENTS.get(dropdown.selected() as usize) else {
+            return;
+        };
+        let _ = alignment_controller
+            .borrow_mut()
+            .handle_command(AppCommand::SetSubtitleTextAlignment(
+                (*alignment).to_owned(),
+            ));
+    });
+    group.add(&alignment_row);
+
     let (font_size_row, font_size) =
         spin_row("Font Size", snapshot.font_size, 16, 72, 1, Some("pt"));
     let font_size_controller = Rc::clone(&controller);
@@ -770,6 +796,7 @@ struct UiSnapshot {
     vad_enabled: bool,
     subtitle_visible: bool,
     subtitle_position: String,
+    subtitle_text_alignment: String,
     font_size: u32,
     subtitle_width_px: u32,
     background_opacity_percent: u32,
@@ -795,6 +822,7 @@ impl UiSnapshot {
             vad_enabled: config.stt.vad_enabled,
             subtitle_visible: config.subtitle.visible,
             subtitle_position: config.subtitle.position.clone(),
+            subtitle_text_alignment: config.subtitle.text_alignment.clone(),
             font_size: config.subtitle.font_size,
             subtitle_width_px: config.subtitle.width_px,
             background_opacity_percent: (config.subtitle.background_opacity * 100.0).round() as u32,
