@@ -3,6 +3,17 @@ use std::{error::Error, fmt, path::PathBuf};
 use serde::{Deserialize, Serialize};
 
 pub const CURRENT_CONFIG_VERSION: u32 = 1;
+pub const SUBTITLE_POSITIONS: [&str; 9] = [
+    "top-left",
+    "top-center",
+    "top-right",
+    "center-left",
+    "center",
+    "center-right",
+    "bottom-left",
+    "bottom-center",
+    "bottom-right",
+];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -116,10 +127,10 @@ impl AppConfig {
                 "must be between 0 and 1",
             ));
         }
-        if !(1..=2).contains(&self.subtitle.max_lines) {
+        if !(1..=5).contains(&self.subtitle.max_lines) {
             return Err(ConfigValidationError::new(
                 "subtitle.max_lines",
-                "must be 1 or 2",
+                "must be between 1 and 5",
             ));
         }
 

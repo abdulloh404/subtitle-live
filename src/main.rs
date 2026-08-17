@@ -150,9 +150,11 @@ fn install_runtime_poll(
                 runtime.metrics_snapshot(),
             )
         };
+        let subtitle_config = controller.borrow().config().subtitle.clone();
         if let Some(desktop) = desktop.borrow().as_ref() {
             desktop.settings.update_state(state, last_error.as_deref());
             desktop.settings.update_metrics(metrics);
+            desktop.overlay.apply_config(&subtitle_config);
             if update.hide_overlay {
                 desktop.overlay.hide();
             }

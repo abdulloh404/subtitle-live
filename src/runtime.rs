@@ -388,12 +388,15 @@ impl ApplicationRuntime {
                         && !self.capture_transition_pending
                         && self.accepted_audio_generation == Some(audio_generation) =>
                 {
-                    self.transcript.apply(&transcript);
+                    let is_final = matches!(&transcript, TranscriptUpdate::Final { .. });
+                    let presentation_changed = self.transcript.apply(&transcript);
                     self.last_subtitle_update = Some(Instant::now());
-                    update.subtitle = Some(SubtitleFrame {
-                        text: self.transcript.presentation_text().to_owned(),
-                        is_final: matches!(transcript, TranscriptUpdate::Final { .. }),
-                    });
+                    if presentation_changed || is_final {
+                        update.subtitle = Some(SubtitleFrame {
+                            text: self.transcript.presentation_text().to_owned(),
+                            is_final,
+                        });
+                    }
                 }
                 SttEvent::Metrics {
                     audio_generation,

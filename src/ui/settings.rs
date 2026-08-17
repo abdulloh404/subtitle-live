@@ -5,12 +5,23 @@ use gtk::glib;
 
 use crate::{
     app::{AppCommand, AppEvent, ApplicationController, ApplicationState},
-    config::AppConfig,
+    config::{AppConfig, SUBTITLE_POSITIONS},
     metrics::MetricsSnapshot,
     pipewire::{ApplicationIdentity, ApplicationKey, StreamInfo},
 };
 
 const SETTINGS_WINDOW_NAME: &str = "subtitle-live-settings";
+const SUBTITLE_POSITION_LABELS: [&str; 9] = [
+    "Top left",
+    "Top center",
+    "Top right",
+    "Center left",
+    "Center",
+    "Center right",
+    "Bottom left",
+    "Bottom center",
+    "Bottom right",
+];
 
 #[derive(Clone)]
 pub struct SettingsPresenter {
@@ -71,7 +82,7 @@ impl SettingsPresenter {
             &applications_group,
         ));
         window.add(&speech_recognition_page(&snapshot, &model_path_label));
-        window.add(&subtitle_page(&snapshot));
+        window.add(&subtitle_page(&snapshot, Rc::clone(&controller)));
         window.add(&performance_page(
             &snapshot,
             &status_label,
@@ -428,29 +439,83 @@ fn speech_recognition_page(
     page
 }
 
-fn subtitle_page(snapshot: &UiSnapshot) -> adw::PreferencesPage {
+fn subtitle_page(
+    snapshot: &UiSnapshot,
+    controller: Rc<RefCell<ApplicationController>>,
+) -> adw::PreferencesPage {
     let page = preferences_page("Subtitle", "insert-text-symbolic");
     let group = adw::PreferencesGroup::builder().title("Appearance").build();
-    let (visible_row, _) = switch_row(
+    let (visible_row, visible_switch) = switch_row(
         "Show Subtitle",
         "Display recognized English speech",
         snapshot.subtitle_visible,
-        false,
+        true,
     );
+    let visible_controller = Rc::clone(&controller);
+    visible_switch.connect_state_set(move |_, visible| {
+        let _ = visible_controller
+            .borrow_mut()
+            .handle_command(AppCommand::SetSubtitleVisible(visible));
+        glib::Propagation::Proceed
+    });
     group.add(&visible_row);
-    group.add(&value_row("Position", &snapshot.subtitle_position));
-    group.add(&value_row(
-        "Font Size",
-        &format!("{} pt", snapshot.font_size),
-    ));
-    group.add(&value_row(
+
+    let selected_position = SUBTITLE_POSITIONS
+        .iter()
+        .position(|position| *position == snapshot.subtitle_position)
+        .unwrap_or(7) as u32;
+    let position_dropdown = gtk::DropDown::from_strings(&SUBTITLE_POSITION_LABELS);
+    position_dropdown.set_selected(selected_position);
+    position_dropdown.set_valign(gtk::Align::Center);
+    let position_row = adw::ActionRow::builder()
+        .activatable_widget(&position_dropdown)
+        .title("Position")
+        .build();
+    position_row.add_suffix(&position_dropdown);
+    let position_controller = Rc::clone(&controller);
+    position_dropdown.connect_selected_notify(move |dropdown| {
+        let Some(position) = SUBTITLE_POSITIONS.get(dropdown.selected() as usize) else {
+            return;
+        };
+        let _ = position_controller
+            .borrow_mut()
+            .handle_command(AppCommand::SetSubtitlePosition((*position).to_owned()));
+    });
+    group.add(&position_row);
+
+    let (font_size_row, font_size) =
+        spin_row("Font Size", snapshot.font_size, 16, 72, Some("pt"));
+    let font_size_controller = Rc::clone(&controller);
+    font_size.connect_value_changed(move |spin| {
+        let _ = font_size_controller
+            .borrow_mut()
+            .handle_command(AppCommand::SetSubtitleFontSize(spin.value_as_int() as u32));
+    });
+    group.add(&font_size_row);
+
+    let (opacity_row, opacity) = spin_row(
         "Background Opacity",
-        &format!("{}%", snapshot.background_opacity_percent),
-    ));
-    group.add(&value_row(
-        "Maximum Lines",
-        &snapshot.maximum_lines.to_string(),
-    ));
+        snapshot.background_opacity_percent,
+        0,
+        100,
+        Some("%"),
+    );
+    let opacity_controller = Rc::clone(&controller);
+    opacity.connect_value_changed(move |spin| {
+        let _ = opacity_controller.borrow_mut().handle_command(
+            AppCommand::SetSubtitleBackgroundOpacityPercent(spin.value_as_int() as u32),
+        );
+    });
+    group.add(&opacity_row);
+
+    let (max_lines_row, max_lines) =
+        spin_row("Maximum Lines", snapshot.maximum_lines, 1, 5, None);
+    max_lines.connect_value_changed(move |spin| {
+        let _ = controller
+            .borrow_mut()
+            .handle_command(AppCommand::SetSubtitleMaxLines(spin.value_as_int() as u32));
+    });
+    group.add(&max_lines_row);
     page.add(&group);
     page
 }
@@ -549,6 +614,28 @@ fn value_row_with_label(title: &str, value_label: &gtk::Label) -> adw::ActionRow
     row
 }
 
+fn spin_row(
+    title: &str,
+    value: u32,
+    minimum: u32,
+    maximum: u32,
+    unit: Option<&str>,
+) -> (adw::ActionRow, gtk::SpinButton) {
+    let spin = gtk::SpinButton::with_range(minimum as f64, maximum as f64, 1.0);
+    spin.set_value(value as f64);
+    spin.set_valign(gtk::Align::Center);
+    spin.set_width_chars(3);
+    let row = adw::ActionRow::builder()
+        .activatable_widget(&spin)
+        .title(title)
+        .build();
+    row.add_suffix(&spin);
+    if let Some(unit) = unit {
+        row.add_suffix(&gtk::Label::new(Some(unit)));
+    }
+    (row, spin)
+}
+
 fn message_row(title: &str, subtitle: &str) -> adw::ActionRow {
     adw::ActionRow::builder()
         .activatable(false)
@@ -620,7 +707,7 @@ impl UiSnapshot {
             context_window_ms: config.stt.window_ms,
             vad_enabled: config.stt.vad_enabled,
             subtitle_visible: config.subtitle.visible,
-            subtitle_position: display_identifier(&config.subtitle.position),
+            subtitle_position: config.subtitle.position.clone(),
             font_size: config.subtitle.font_size,
             background_opacity_percent: (config.subtitle.background_opacity * 100.0).round() as u32,
             maximum_lines: config.subtitle.max_lines,

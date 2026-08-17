@@ -455,5 +455,58 @@ fn collect_hypothesis(state: &WhisperState) -> Result<String, String> {
             .map_err(|error| format!("Failed to read Whisper transcript: {error}"))?;
         text.push_str(&segment);
     }
-    Ok(text.split_whitespace().collect::<Vec<_>>().join(" "))
+    Ok(normalize_hypothesis_text(&text))
+}
+
+pub(crate) fn normalize_hypothesis_text(text: &str) -> String {
+    const BLANK_AUDIO_MARKER: &[u8] = b"[BLANK_AUDIO]";
+
+    let mut without_marker = String::with_capacity(text.len());
+    let mut index = 0;
+    while index < text.len() {
+        let remaining = &text.as_bytes()[index..];
+        if remaining.len() >= BLANK_AUDIO_MARKER.len()
+            && remaining[..BLANK_AUDIO_MARKER.len()].eq_ignore_ascii_case(BLANK_AUDIO_MARKER)
+        {
+            index += BLANK_AUDIO_MARKER.len();
+            while index < text.len() {
+                let character = text[index..].chars().next().expect("valid character boundary");
+                if matches!(character, ',' | '.' | '!' | '?' | ';' | ':') {
+                    index += character.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            without_marker.push(' ');
+            continue;
+        }
+
+        let character = text[index..].chars().next().expect("valid character boundary");
+        without_marker.push(character);
+        index += character.len_utf8();
+    }
+
+    without_marker
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_hypothesis_text;
+
+    #[test]
+    fn blank_audio_marker_is_removed_before_reconciliation() {
+        assert_eq!(normalize_hypothesis_text(" [BLANK_AUDIO] "), "");
+        assert_eq!(
+            normalize_hypothesis_text("keep [blank_audio] repeated repeated words"),
+            "keep repeated repeated words"
+        );
+        assert_eq!(normalize_hypothesis_text("[BLANK_AUDIO],"), "");
+        assert_eq!(
+            normalize_hypothesis_text("hello[BlAnK_aUdIo]there"),
+            "hello there"
+        );
+    }
 }

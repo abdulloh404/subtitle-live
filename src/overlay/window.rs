@@ -5,33 +5,40 @@ use std::{
 };
 
 use adw::prelude::*;
-use gtk::{gdk, glib, pango};
+use gtk::{gdk, glib};
 
-use crate::config::SubtitleConfig;
+use crate::{config::SubtitleConfig, subtitle::format_live_caption};
 
 const FINAL_HOLD_TIME: Duration = Duration::from_secs(3);
 
 pub struct OverlayPresenter {
+    applied_config: RefCell<Option<SubtitleConfig>>,
+    css_provider: gtk::CssProvider,
     enabled: Cell<bool>,
     generation: Rc<Cell<u64>>,
     label: gtk::Label,
     last_text: RefCell<String>,
+    surface: gtk::Box,
     window: gtk::Window,
 }
 
 impl OverlayPresenter {
     pub fn new(application: &adw::Application, config: &SubtitleConfig) -> Self {
-        install_styles(config);
+        let css_provider = gtk::CssProvider::new();
+        if let Some(display) = gdk::Display::default() {
+            gtk::style_context_add_provider_for_display(
+                &display,
+                &css_provider,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        }
 
         let label = gtk::Label::builder()
-            .ellipsize(pango::EllipsizeMode::End)
             .justify(gtk::Justification::Center)
-            .lines(config.max_lines as i32)
-            .max_width_chars(72)
+            .max_width_chars(42)
             .selectable(false)
             .use_markup(false)
-            .wrap(true)
-            .wrap_mode(pango::WrapMode::WordChar)
+            .wrap(false)
             .build();
         label.add_css_class("subtitle-live-text");
 
@@ -40,51 +47,82 @@ impl OverlayPresenter {
             .valign(gtk::Align::End)
             .build();
         surface.add_css_class("subtitle-live-surface");
+        surface.set_margin_bottom(32);
+        surface.set_margin_end(32);
+        surface.set_margin_start(32);
+        surface.set_margin_top(32);
         surface.append(&label);
 
-        let root = gtk::Box::builder()
+        let root = gtk::Overlay::builder()
             .halign(gtk::Align::Fill)
             .valign(gtk::Align::Fill)
             .build();
         root.add_css_class("subtitle-live-overlay-root");
-        root.append(&surface);
+        let canvas = gtk::Box::builder()
+            .hexpand(true)
+            .vexpand(true)
+            .build();
+        root.set_child(Some(&canvas));
+        root.add_overlay(&surface);
 
         let window = gtk::Window::builder()
             .application(application)
             .child(&root)
             .decorated(false)
-            .default_height(120)
-            .default_width(900)
+            .default_height(600)
+            .default_width(1000)
             .focusable(false)
             .hide_on_close(true)
-            .resizable(false)
+            .resizable(true)
             .title("Subtitle-live Overlay")
             .build();
         window.add_css_class("subtitle-live-overlay");
+        window.connect_realize(|window| {
+            if let Some(surface) = window.surface() {
+                let empty_region = gtk::cairo::Region::create();
+                surface.set_input_region(Some(&empty_region));
+            }
+        });
+        window.maximize();
 
-        Self {
-            enabled: Cell::new(config.visible),
+        let presenter = Self {
+            applied_config: RefCell::new(None),
+            css_provider,
+            enabled: Cell::new(false),
             generation: Rc::new(Cell::new(0)),
             label,
             last_text: RefCell::new(String::new()),
+            surface,
             window,
-        }
+        };
+        presenter.apply_config(config);
+        presenter
     }
 
     pub fn show_text(&self, text: &str, is_final: bool) {
-        let text = text.trim();
-        if !self.enabled.get() || text.is_empty() {
-            if text.is_empty() {
-                self.hide();
-            }
+        if !self.enabled.get() {
+            return;
+        }
+        let source_text = text.trim();
+        if source_text.is_empty() {
+            return;
+        }
+        let max_lines = self
+            .applied_config
+            .borrow()
+            .as_ref()
+            .map_or(2, |config| config.max_lines);
+        let text = format_live_caption(source_text, max_lines);
+        if text.is_empty() {
             return;
         }
 
-        self.label.set_label(text);
-        self.last_text.replace(text.to_owned());
-        if !self.window.is_visible() {
-            self.window.present();
-        }
+        self.label.set_label(&text);
+        self.last_text.replace(source_text.to_owned());
+        // A normal GTK toplevel cannot request permanent always-on-top stacking
+        // on GNOME Wayland. Re-present each update so an obscured overlay gets
+        // another non-focusable raise request without intercepting input.
+        self.window.present();
 
         let next_generation = self.generation.get().wrapping_add(1);
         self.generation.set(next_generation);
@@ -115,23 +153,41 @@ impl OverlayPresenter {
             self.hide();
         }
     }
+
+    pub fn apply_config(&self, config: &SubtitleConfig) {
+        if self.applied_config.borrow().as_ref() == Some(config) {
+            return;
+        }
+
+        self.set_enabled(config.visible);
+        apply_position(&self.surface, &config.position);
+        let source_text = self.last_text.borrow();
+        if !source_text.is_empty() {
+            self.label
+                .set_label(&format_live_caption(source_text.as_str(), config.max_lines));
+        }
+        self.css_provider.load_from_data(&format!(
+            ".subtitle-live-overlay, .subtitle-live-overlay-root {{ background: transparent; }}\n\
+             .subtitle-live-surface {{ background: rgba(0, 0, 0, {:.3}); border-radius: 12px; padding: 12px 20px; }}\n\
+             .subtitle-live-text {{ color: white; font-size: {}pt; font-weight: 600; }}",
+            config.background_opacity, config.font_size
+        ));
+        self.applied_config.replace(Some(config.clone()));
+    }
 }
 
-fn install_styles(config: &SubtitleConfig) {
-    let Some(display) = gdk::Display::default() else {
-        return;
+fn apply_position(surface: &gtk::Box, position: &str) {
+    let (horizontal, vertical) = match position {
+        "top-left" => (gtk::Align::Start, gtk::Align::Start),
+        "top-center" => (gtk::Align::Center, gtk::Align::Start),
+        "top-right" => (gtk::Align::End, gtk::Align::Start),
+        "center-left" => (gtk::Align::Start, gtk::Align::Center),
+        "center" => (gtk::Align::Center, gtk::Align::Center),
+        "center-right" => (gtk::Align::End, gtk::Align::Center),
+        "bottom-left" => (gtk::Align::Start, gtk::Align::End),
+        "bottom-right" => (gtk::Align::End, gtk::Align::End),
+        _ => (gtk::Align::Center, gtk::Align::End),
     };
-    let provider = gtk::CssProvider::new();
-    provider.load_from_data(&format!(
-        ".subtitle-live-overlay, .subtitle-live-overlay-root {{ background: transparent; }}\n\
-         .subtitle-live-overlay-root {{ padding: 20px; }}\n\
-         .subtitle-live-surface {{ background: rgba(0, 0, 0, {:.3}); border-radius: 12px; padding: 12px 20px; }}\n\
-         .subtitle-live-text {{ color: white; font-size: {}px; font-weight: 600; }}",
-        config.background_opacity, config.font_size
-    ));
-    gtk::style_context_add_provider_for_display(
-        &display,
-        &provider,
-        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-    );
+    surface.set_halign(horizontal);
+    surface.set_valign(vertical);
 }

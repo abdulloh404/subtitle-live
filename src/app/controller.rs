@@ -1,5 +1,5 @@
 use crate::{
-    config::{AppConfig, ApplicationRule, StreamRule},
+    config::{AppConfig, ApplicationRule, SUBTITLE_POSITIONS, StreamRule},
     pipewire::{
         ApplicationIdentity, ApplicationKey, CaptureTarget, StreamDiscriminator, StreamInfo,
     },
@@ -14,7 +14,8 @@ pub struct ApplicationController {
 }
 
 impl ApplicationController {
-    pub fn new(config: AppConfig) -> Self {
+    pub fn new(mut config: AppConfig) -> Self {
+        normalize_subtitle_config(&mut config);
         let state = if config.general.live_subtitles {
             ApplicationState::Starting
         } else {
@@ -226,10 +227,57 @@ impl ApplicationController {
                 self.config.general.keep_running_when_closed = enabled;
                 AppEvent::ConfigChanged("general.keep_running_when_closed")
             }
+            AppCommand::SetSubtitleVisible(visible) => {
+                self.config.subtitle.visible = visible;
+                AppEvent::ConfigChanged("subtitle.visible")
+            }
+            AppCommand::SetSubtitlePosition(position) => {
+                if !SUBTITLE_POSITIONS.contains(&position.as_str()) {
+                    return AppEvent::Error(format!(
+                        "Unsupported subtitle position: {position}"
+                    ));
+                }
+                self.config.subtitle.position = position;
+                AppEvent::ConfigChanged("subtitle.position")
+            }
+            AppCommand::SetSubtitleFontSize(font_size) => {
+                if !(16..=72).contains(&font_size) {
+                    return AppEvent::Error(format!(
+                        "Subtitle font size must be between 16 and 72: {font_size}"
+                    ));
+                }
+                self.config.subtitle.font_size = font_size;
+                AppEvent::ConfigChanged("subtitle.font_size")
+            }
+            AppCommand::SetSubtitleBackgroundOpacityPercent(opacity) => {
+                if opacity > 100 {
+                    return AppEvent::Error(format!(
+                        "Subtitle background opacity must be between 0 and 100: {opacity}"
+                    ));
+                }
+                self.config.subtitle.background_opacity = opacity as f32 / 100.0;
+                AppEvent::ConfigChanged("subtitle.background_opacity")
+            }
+            AppCommand::SetSubtitleMaxLines(max_lines) => {
+                if !(1..=5).contains(&max_lines) {
+                    return AppEvent::Error(format!(
+                        "Subtitle maximum lines must be between 1 and 5: {max_lines}"
+                    ));
+                }
+                self.config.subtitle.max_lines = max_lines;
+                AppEvent::ConfigChanged("subtitle.max_lines")
+            }
             AppCommand::ShowSettings => AppEvent::SettingsRequested,
             AppCommand::Quit => AppEvent::QuitRequested,
         }
     }
+}
+
+fn normalize_subtitle_config(config: &mut AppConfig) {
+    if !SUBTITLE_POSITIONS.contains(&config.subtitle.position.as_str()) {
+        config.subtitle.position = "bottom-center".to_owned();
+    }
+    config.subtitle.font_size = config.subtitle.font_size.clamp(16, 72);
 }
 
 fn application_rule(application: &ApplicationIdentity, enabled: bool) -> ApplicationRule {
