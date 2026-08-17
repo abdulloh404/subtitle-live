@@ -156,7 +156,7 @@ pub(super) fn create_capture(
     stream
         .connect(
             spa::Direction::Input,
-            None,
+            Some(info.runtime_id),
             pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
             &mut params,
         )
