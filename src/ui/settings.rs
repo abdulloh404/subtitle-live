@@ -90,7 +90,11 @@ impl SettingsPresenter {
             &configured_label,
             &applications_group,
         ));
-        window.add(&speech_recognition_page(&snapshot, &model_path_label));
+        window.add(&speech_recognition_page(
+            &snapshot,
+            &model_path_label,
+            Rc::clone(&controller),
+        ));
         window.add(&subtitle_page(&snapshot, Rc::clone(&controller)));
         window.add(&performance_page(
             &snapshot,
@@ -428,10 +432,11 @@ fn audio_sources_page(
     page
 }
 
-/// สร้างหน้าข้อมูลโมเดลและช่วงเวลา streaming ซึ่งยังเป็นค่าดูอย่างเดียว
+/// สร้างหน้าข้อมูลโมเดลและตัวควบคุมการส่งเสียงแบบ streaming
 fn speech_recognition_page(
     snapshot: &UiSnapshot,
     model_path_label: &gtk::Label,
+    controller: Rc<RefCell<ApplicationController>>,
 ) -> adw::PreferencesPage {
     let page = preferences_page("Speech Recognition", "audio-input-microphone-symbolic");
     let recognition_group = adw::PreferencesGroup::builder()
@@ -444,20 +449,50 @@ fn speech_recognition_page(
     page.add(&recognition_group);
 
     let streaming_group = adw::PreferencesGroup::builder().title("Streaming").build();
-    streaming_group.add(&value_row(
+    let (step_row, step) = spin_row(
         "Audio Step",
-        &format!("{} ms", snapshot.audio_step_ms),
-    ));
-    streaming_group.add(&value_row(
-        "Context Window",
-        &format_duration(snapshot.context_window_ms),
-    ));
-    let (vad_row, _) = switch_row(
-        "Voice Activity Detection",
-        "Detect speech before recognition",
-        snapshot.vad_enabled,
-        false,
+        snapshot.audio_step_ms,
+        50,
+        1_000,
+        25,
+        Some("ms"),
     );
+    let step_controller = Rc::clone(&controller);
+    step.connect_value_changed(move |spin| {
+        let _ = step_controller
+            .borrow_mut()
+            .handle_command(AppCommand::SetSttStepMs(spin.value_as_int() as u32));
+    });
+    streaming_group.add(&step_row);
+
+    let (window_row, window) = spin_row(
+        "Context Window",
+        snapshot.context_window_ms,
+        1_000,
+        30_000,
+        250,
+        Some("ms"),
+    );
+    let window_controller = Rc::clone(&controller);
+    window.connect_value_changed(move |spin| {
+        let _ = window_controller
+            .borrow_mut()
+            .handle_command(AppCommand::SetSttWindowMs(spin.value_as_int() as u32));
+    });
+    streaming_group.add(&window_row);
+
+    let (vad_row, vad_switch) = switch_row(
+        "Voice Activity Detection",
+        "Use a stronger energy gate before recognition",
+        snapshot.vad_enabled,
+        true,
+    );
+    vad_switch.connect_state_set(move |_, enabled| {
+        let _ = controller
+            .borrow_mut()
+            .handle_command(AppCommand::SetVadEnabled(enabled));
+        glib::Propagation::Proceed
+    });
     streaming_group.add(&vad_row);
     page.add(&streaming_group);
     page
@@ -509,7 +544,7 @@ fn subtitle_page(
     group.add(&position_row);
 
     let (font_size_row, font_size) =
-        spin_row("Font Size", snapshot.font_size, 16, 72, Some("pt"));
+        spin_row("Font Size", snapshot.font_size, 16, 72, 1, Some("pt"));
     let font_size_controller = Rc::clone(&controller);
     font_size.connect_value_changed(move |spin| {
         let _ = font_size_controller
@@ -523,6 +558,7 @@ fn subtitle_page(
         snapshot.background_opacity_percent,
         0,
         100,
+        1,
         Some("%"),
     );
     let opacity_controller = Rc::clone(&controller);
@@ -534,7 +570,7 @@ fn subtitle_page(
     group.add(&opacity_row);
 
     let (max_lines_row, max_lines) =
-        spin_row("Maximum Lines", snapshot.maximum_lines, 1, 5, None);
+        spin_row("Maximum Lines", snapshot.maximum_lines, 1, 5, 1, None);
     max_lines.connect_value_changed(move |spin| {
         let _ = controller
             .borrow_mut()
@@ -652,12 +688,13 @@ fn spin_row(
     value: u32,
     minimum: u32,
     maximum: u32,
+    increment: u32,
     unit: Option<&str>,
 ) -> (adw::ActionRow, gtk::SpinButton) {
-    let spin = gtk::SpinButton::with_range(minimum as f64, maximum as f64, 1.0);
+    let spin = gtk::SpinButton::with_range(minimum as f64, maximum as f64, increment as f64);
     spin.set_value(value as f64);
     spin.set_valign(gtk::Align::Center);
-    spin.set_width_chars(3);
+    spin.set_width_chars(maximum.to_string().len() as i32);
     let row = adw::ActionRow::builder()
         .activatable_widget(&spin)
         .title(title)
@@ -676,15 +713,6 @@ fn message_row(title: &str, subtitle: &str) -> adw::ActionRow {
         .subtitle(subtitle)
         .title(title)
         .build()
-}
-
-/// แสดง millisecond เป็นวินาทีเมื่อหารลงตัวเพื่อให้อ่านง่าย
-fn format_duration(milliseconds: u32) -> String {
-    if milliseconds % 1_000 == 0 {
-        format!("{} s", milliseconds / 1_000)
-    } else {
-        format!("{milliseconds} ms")
-    }
 }
 
 /// จัดรูปแบบ latency ล่าสุด ค่า p50 และ p95 สำหรับหน้า Performance

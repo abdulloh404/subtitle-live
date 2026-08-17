@@ -250,6 +250,28 @@ impl ApplicationController {
                 self.config.general.keep_running_when_closed = enabled;
                 AppEvent::ConfigChanged("general.keep_running_when_closed")
             }
+            AppCommand::SetSttStepMs(step_ms) => {
+                if !(50..=1_000).contains(&step_ms) {
+                    return AppEvent::Error(format!(
+                        "STT audio step must be between 50 and 1000 ms: {step_ms}"
+                    ));
+                }
+                self.config.stt.step_ms = step_ms;
+                AppEvent::ConfigChanged("stt.step_ms")
+            }
+            AppCommand::SetSttWindowMs(window_ms) => {
+                if !(1_000..=30_000).contains(&window_ms) {
+                    return AppEvent::Error(format!(
+                        "STT context window must be between 1000 and 30000 ms: {window_ms}"
+                    ));
+                }
+                self.config.stt.window_ms = window_ms;
+                AppEvent::ConfigChanged("stt.window_ms")
+            }
+            AppCommand::SetVadEnabled(enabled) => {
+                self.config.stt.vad_enabled = enabled;
+                AppEvent::ConfigChanged("stt.vad_enabled")
+            }
             AppCommand::SetSubtitleVisible(visible) => {
                 self.config.subtitle.visible = visible;
                 AppEvent::ConfigChanged("subtitle.visible")

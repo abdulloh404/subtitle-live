@@ -292,9 +292,9 @@ impl Default for SttConfig {
             model: "small.en".to_owned(),
             model_path: None,
             backend: "auto".to_owned(),
-            step_ms: 250,
+            step_ms: 150,
             window_ms: 3_000,
-            vad_enabled: false,
+            vad_enabled: true,
         }
     }
 }

@@ -17,7 +17,10 @@ use crate::{
     config::{AppConfig, ConfigWriter},
     metrics::{LatencyTracker, MetricsSnapshot},
     pipewire::{CaptureTarget, PipeWireEvent, PipeWireService, spawn_service as spawn_pipewire},
-    stt::{SttEvent, SttService, SttStartConfig, TranscriptUpdate, spawn_service as spawn_stt},
+    stt::{
+        SttEvent, SttService, SttStartConfig, SttStreamingConfig, TranscriptUpdate,
+        spawn_service as spawn_stt,
+    },
     subtitle::TranscriptReconciler,
     tray::{TrayCommand, TrayIndicator, TrayState},
 };
@@ -92,6 +95,8 @@ pub struct ApplicationRuntime {
     pipewire_error: Option<String>,
     startup_warning: Option<String>,
     last_tray_state: Option<TrayState>,
+    // ค่า streaming ล่าสุดที่ส่งให้ STT ใช้ตรวจว่าต้องอัปเดต worker หรือไม่
+    applied_stt_streaming: Option<SttStreamingConfig>,
     shutdown_requested: bool,
 }
 
@@ -158,6 +163,7 @@ impl ApplicationRuntime {
             pipewire_error: None,
             startup_warning,
             last_tray_state: None,
+            applied_stt_streaming: None,
             shutdown_requested: false,
         }
     }
@@ -171,6 +177,7 @@ impl ApplicationRuntime {
 
         self.handle_tray_commands(&mut update);
         self.sync_live_intent(&mut update);
+        self.sync_stt_streaming_settings(&mut update);
         self.sync_capture_targets(&mut update);
         self.handle_pipewire_events(&mut update);
         self.sync_capture_targets(&mut update);
@@ -297,6 +304,11 @@ impl ApplicationRuntime {
     /// ล้าง state จากรอบก่อน แล้วสั่ง Whisper โหลด model ด้วยค่าปัจจุบัน
     fn start_pipeline(&mut self) {
         let config = self.controller.borrow().config_snapshot();
+        let streaming = SttStreamingConfig {
+            step_ms: config.stt.step_ms,
+            window_ms: config.stt.window_ms,
+            vad_enabled: config.stt.vad_enabled,
+        };
         self.pipeline_error = None;
         self.stt_ready = false;
         self.desired_capture_ids.clear();
@@ -311,6 +323,7 @@ impl ApplicationRuntime {
         self.mixer.reset();
         self.transcript.clear();
         self.last_subtitle_update = None;
+        self.applied_stt_streaming = Some(streaming);
         let _ = self.pipewire.stop_capture();
         self.stt.start(SttStartConfig {
             model_path: config
@@ -318,8 +331,9 @@ impl ApplicationRuntime {
                 .model_path
                 .unwrap_or_else(|| self.default_model_path.clone()),
             language: config.stt.language,
-            step_ms: config.stt.step_ms,
-            window_ms: config.stt.window_ms,
+            step_ms: streaming.step_ms,
+            window_ms: streaming.window_ms,
+            vad_enabled: streaming.vad_enabled,
         });
         self.set_state(if self.pipewire_error.is_some() {
             ApplicationState::Error
@@ -345,12 +359,43 @@ impl ApplicationRuntime {
         self.mixer.reset();
         self.transcript.clear();
         self.last_subtitle_update = None;
+        self.applied_stt_streaming = None;
         self.pipeline_error = None;
         self.set_state(if self.pipewire_error.is_some() {
             ApplicationState::Error
         } else {
             ApplicationState::Stopped
         });
+    }
+
+    /// ส่งค่าหน้าต่างเสียงใหม่ไปยัง STT สด ๆ โดยคงโมเดลที่โหลดไว้
+    fn sync_stt_streaming_settings(&mut self, update: &mut RuntimeUpdate) {
+        if !self.running_requested {
+            return;
+        }
+        let config = self.controller.borrow().config_snapshot();
+        let desired = SttStreamingConfig {
+            step_ms: config.stt.step_ms,
+            window_ms: config.stt.window_ms,
+            vad_enabled: config.stt.vad_enabled,
+        };
+        if self.applied_stt_streaming == Some(desired) {
+            return;
+        }
+
+        self.stt.pause_audio();
+        self.source_audio.clear();
+        self.mixed_audio.clear();
+        self.mixer.reset();
+        self.transcript.clear();
+        self.last_subtitle_update = None;
+        self.capture_transition_pending = true;
+        self.accepted_audio_generation = None;
+        self.stt_resume_generation = None;
+        self.stt.update_streaming(desired);
+        self.stt_resume_generation = Some(self.stt.resume_audio());
+        self.applied_stt_streaming = Some(desired);
+        update.hide_overlay = true;
     }
 
     /// รับเหตุการณ์ graph/capture จาก PipeWire แล้วสะท้อนกลับไปยัง controller

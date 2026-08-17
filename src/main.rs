@@ -130,7 +130,7 @@ fn main() -> Result<(), AppError> {
     Ok(())
 }
 
-/// Poll ช่องทาง background ทุก 50 ms แล้วนำเฉพาะ diff ไปใช้กับ GTK widgets
+/// Poll ช่องทาง background ทุก 20 ms แล้วนำเฉพาะ diff ไปใช้กับ GTK widgets
 fn install_runtime_poll(
     application: &adw::Application,
     controller: Rc<RefCell<ApplicationController>>,
@@ -138,7 +138,7 @@ fn install_runtime_poll(
     desktop: Rc<RefCell<Option<DesktopUi>>>,
 ) {
     let application = application.clone();
-    glib::timeout_add_local(Duration::from_millis(50), move || {
+    glib::timeout_add_local(Duration::from_millis(20), move || {
         let update = {
             let mut runtime = runtime.borrow_mut();
             let Some(runtime) = runtime.as_mut() else {

@@ -27,6 +27,19 @@ const STABLE_PASSES_TO_FINAL: u8 = 2;
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 // ระดับ RMS ต่ำกว่านี้ถือเป็นความเงียบและไม่ส่งเข้าโมเดล Whisper
 const SILENCE_RMS_THRESHOLD: f32 = 0.001;
+// เมื่อเปิด VAD จะใช้เกณฑ์สูงขึ้นเพื่อกันเสียงพื้นหลังเบาก่อนถึง Whisper
+const VAD_RMS_THRESHOLD: f32 = 0.003;
+
+/// ค่าที่เปลี่ยนระหว่างทำงานได้โดยไม่ต้องโหลดโมเดล Whisper ใหม่
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SttStreamingConfig {
+    /// ช่วงเสียงใหม่ขั้นต่ำระหว่างการอนุมานแต่ละรอบ
+    pub step_ms: u32,
+    /// ความยาวเสียงย้อนหลังสูงสุดที่ส่งเข้า Whisper
+    pub window_ms: u32,
+    /// ใช้ตัวกรองพลังงานเสียงพูดที่เข้มกว่าตัวกรองความเงียบพื้นฐาน
+    pub vad_enabled: bool,
+}
 
 /// ค่าคงที่ที่ใช้สร้างเซสชันอนุมาน Whisper ภายในเครื่องหนึ่งเซสชัน
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -39,6 +52,8 @@ pub struct SttStartConfig {
     pub step_ms: u32,
     /// ความยาวเสียงย้อนหลังสูงสุดที่ส่งเข้า Whisper
     pub window_ms: u32,
+    /// ใช้ตัวกรองพลังงานเสียงพูดที่เข้มกว่าตัวกรองความเงียบพื้นฐาน
+    pub vad_enabled: bool,
 }
 
 /// สมมติฐานของช่วงปัจจุบัน หรือช่วงที่นิ่งแล้วและจะไม่ถูกแก้อีก
@@ -118,6 +133,11 @@ impl SttService {
         let _ = self.commands.send(WorkerCommand::Stop);
     }
 
+    /// เปลี่ยนจังหวะ streaming และ VAD โดยใช้โมเดลเดิมที่โหลดอยู่
+    pub fn update_streaming(&self, config: SttStreamingConfig) {
+        let _ = self.commands.send(WorkerCommand::UpdateStreaming(config));
+    }
+
     /// หยุดรับเสียงชั่วคราวโดยเก็บโมเดลที่โหลดแล้วไว้
     pub fn pause_audio(&self) {
         let _ = self.commands.send(WorkerCommand::PauseAudio);
@@ -184,6 +204,8 @@ enum WorkerCommand {
     Start(SttStartConfig),
     /// ปลดเซสชันโมเดลและหยุด STT
     Stop,
+    /// ใช้ค่าการส่งเสียงชุดใหม่โดยไม่โหลดโมเดลซ้ำ
+    UpdateStreaming(SttStreamingConfig),
     /// คงโมเดลไว้แต่หยุดรับเสียงชั่วคราว
     PauseAudio,
     /// รับเสียงต่อด้วยหมายเลขรุ่นใหม่
@@ -228,6 +250,14 @@ fn run_worker(
                 current_audio_generation = 0;
                 input.clear();
                 events.push_latest_reliable(SttEvent::Stopped);
+            }
+            CommandState::Command(WorkerCommand::UpdateStreaming(config)) => {
+                input.clear();
+                if let Some(stt) = active.as_mut()
+                    && let Err(error) = stt.update_streaming(config)
+                {
+                    events.push_latest_reliable(SttEvent::Error(error));
+                }
             }
             CommandState::Command(WorkerCommand::PauseAudio) => {
                 audio_paused = true;
@@ -396,6 +426,18 @@ impl ActiveStt {
         })
     }
 
+    /// ใช้ค่า streaming ใหม่และเริ่ม segment ใหม่เพื่อไม่ให้บริบทคนละค่าปะปนกัน
+    fn update_streaming(&mut self, config: SttStreamingConfig) -> Result<(), String> {
+        validate_streaming_config(config)?;
+        self.config.step_ms = config.step_ms;
+        self.config.window_ms = config.window_ms;
+        self.config.vad_enabled = config.vad_enabled;
+        self.step_samples = milliseconds_to_samples(config.step_ms);
+        self.window_samples = milliseconds_to_samples(config.window_ms);
+        self.reset_discontinuity();
+        Ok(())
+    }
+
     /// รวมชิ้นเสียงล่าสุดเข้าหน้าต่างแบบเลื่อน และอนุมานเมื่อมีเสียงใหม่ครบหนึ่งระยะก้าว
     fn consume_latest(
         &mut self,
@@ -433,7 +475,12 @@ impl ActiveStt {
 
         let audio = self.rolling_audio.make_contiguous();
         let pending_start = audio.len().saturating_sub(pending_samples);
-        let input_is_silent = !has_audible_signal(&audio[pending_start..]);
+        let minimum_rms = if self.config.vad_enabled {
+            VAD_RMS_THRESHOLD
+        } else {
+            SILENCE_RMS_THRESHOLD
+        };
+        let input_is_silent = !has_audible_signal(&audio[pending_start..], minimum_rms);
         if input_is_silent {
             if self.silence_active {
                 self.reset_audio();
@@ -561,6 +608,15 @@ fn validate_config(config: &SttStartConfig) -> Result<(), String> {
             config.language
         ));
     }
+    validate_streaming_config(SttStreamingConfig {
+        step_ms: config.step_ms,
+        window_ms: config.window_ms,
+        vad_enabled: config.vad_enabled,
+    })
+}
+
+/// ตรวจค่าที่แก้สดได้ก่อนเปลี่ยนขนาดหน้าต่างเสียงของเซสชันปัจจุบัน
+fn validate_streaming_config(config: SttStreamingConfig) -> Result<(), String> {
     if config.step_ms == 0 {
         return Err("STT step_ms must be greater than zero".to_owned());
     }
@@ -579,7 +635,7 @@ fn milliseconds_to_samples(milliseconds: u32) -> usize {
 }
 
 /// ตรวจว่าช่วง sample ใหม่มีพลังงานพอที่จะคุ้มกับการเรียก Whisper หรือไม่
-fn has_audible_signal(samples: &[f32]) -> bool {
+fn has_audible_signal(samples: &[f32], minimum_rms: f32) -> bool {
     if samples.is_empty() {
         return false;
     }
@@ -589,7 +645,7 @@ fn has_audible_signal(samples: &[f32]) -> bool {
         .map(|sample| f64::from(*sample) * f64::from(*sample))
         .sum::<f64>()
         / samples.len() as f64;
-    mean_square.sqrt() >= f64::from(SILENCE_RMS_THRESHOLD)
+    mean_square.sqrt() >= f64::from(minimum_rms)
 }
 
 /// รวมทุกช่วงข้อความดิบของ Whisper เพื่อให้ผู้เรียกกรองและบันทึกเทียบกันได้
