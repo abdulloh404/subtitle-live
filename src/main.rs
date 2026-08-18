@@ -10,7 +10,8 @@ use subtitle_live::{
     error::AppError,
     logging,
     overlay::{
-        DesktopSession, OverlayClient, OverlayEvent, OverlayRuntimeBackend, run_overlay_helper,
+        DesktopBackendInfo, DesktopSession, DisplayBackend, OverlayClient, OverlayEvent,
+        OverlayRuntimeBackend, run_overlay_helper,
     },
     runtime::ApplicationRuntime,
     ui::SettingsPresenter,
@@ -141,14 +142,19 @@ fn main() -> Result<(), AppError> {
         }
         OverlayRuntimeBackend::Unavailable => None,
     }));
+    let effective_overlay_backend = if overlay_client.borrow().is_some() {
+        overlay_backend
+    } else {
+        OverlayRuntimeBackend::Unavailable
+    };
 
     tracing::info!(
         state = ?controller.borrow().state(),
         config_path = %config_path.display(),
         desktop_session = desktop_session.as_str(),
         settings_backend = desktop_session.as_str(),
-        overlay_backend = overlay_backend.as_str(),
-        xwayland_available = overlay_backend == OverlayRuntimeBackend::XWayland,
+        overlay_backend = effective_overlay_backend.as_str(),
+        xwayland_available = effective_overlay_backend == OverlayRuntimeBackend::XWayland,
         "Subtitle-live initialized"
     );
 
@@ -181,7 +187,15 @@ fn main() -> Result<(), AppError> {
     application.connect_activate(move |application| {
         // Presenter เป็น GTK object จึงต้องสร้างและใช้งานบน main thread เท่านั้น
         if activate_desktop.borrow().is_none() {
-            let settings = SettingsPresenter::new(application, Rc::clone(&activate_controller));
+            let settings = SettingsPresenter::new_with_backend_info(
+                application,
+                Rc::clone(&activate_controller),
+                DesktopBackendInfo::new(
+                    desktop_session,
+                    DisplayBackend::detect(),
+                    effective_overlay_backend,
+                ),
+            );
             let overlay = match overlay_backend {
                 OverlayRuntimeBackend::XWayland | OverlayRuntimeBackend::X11 => {
                     activate_overlay_client
@@ -257,7 +271,7 @@ fn install_runtime_poll(
             }
         }
 
-        let (state, last_error, metrics) = {
+        let (state, last_error, metrics, pipewire_status) = {
             let runtime = runtime.borrow();
             let runtime = runtime
                 .as_ref()
@@ -266,6 +280,7 @@ fn install_runtime_poll(
                 runtime.state(),
                 runtime.last_error().map(str::to_owned),
                 runtime.metrics_snapshot(),
+                runtime.pipewire_status(),
             )
         };
         let subtitle_config = controller.borrow().config().subtitle.clone();
@@ -273,6 +288,7 @@ fn install_runtime_poll(
             // งานส่วนนี้มีเฉพาะการอัปเดต widget; model load และ inference อยู่บน worker ทั้งหมด
             desktop.settings.update_state(state, last_error.as_deref());
             desktop.settings.update_metrics(metrics);
+            desktop.settings.update_pipewire_status(pipewire_status);
             desktop.overlay.poll_events();
             desktop.overlay.apply_config(&subtitle_config);
             if update.hide_overlay {

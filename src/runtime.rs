@@ -92,6 +92,8 @@ pub struct ApplicationRuntime {
     running_requested: bool,
     stt_ready: bool,
     pipeline_error: Option<String>,
+    // เป็น true หลัง registry ส่ง snapshot ครั้งแรก จึงไม่รายงาน Connected ก่อนเชื่อมจริง
+    pipewire_connected: bool,
     pipewire_error: Option<String>,
     startup_warning: Option<String>,
     last_tray_state: Option<TrayState>,
@@ -160,6 +162,7 @@ impl ApplicationRuntime {
             running_requested: false,
             stt_ready: false,
             pipeline_error: None,
+            pipewire_connected: false,
             pipewire_error: None,
             startup_warning,
             last_tray_state: None,
@@ -202,6 +205,17 @@ impl ApplicationRuntime {
             .or_else(|| self.capture_errors.values().next().map(String::as_str))
             .or(self.pipewire_error.as_deref())
             .or(self.startup_warning.as_deref())
+    }
+
+    /// คืนสถานะการเชื่อมต่อ PipeWire สำหรับหน้า About
+    pub fn pipewire_status(&self) -> &'static str {
+        if self.pipewire_error.is_some() {
+            "Error"
+        } else if self.pipewire_connected {
+            "Connected"
+        } else {
+            "Starting"
+        }
     }
 
     /// สร้าง snapshot latency พร้อมจำนวนข้อมูลที่ bounded queues จำเป็นต้องทิ้ง
@@ -403,6 +417,8 @@ impl ApplicationRuntime {
         for event in self.pipewire.drain_events() {
             match event {
                 PipeWireEvent::StreamsChanged(streams) => {
+                    self.pipewire_connected = true;
+                    self.pipewire_error = None;
                     self.controller.borrow_mut().set_streams(streams);
                     update.streams_changed = true;
                 }
@@ -434,6 +450,7 @@ impl ApplicationRuntime {
                     }
                 }
                 PipeWireEvent::Error(error) => {
+                    self.pipewire_connected = false;
                     self.pipewire_error = Some(error);
                     self.set_state(ApplicationState::Error);
                     update.hide_overlay = true;

@@ -9,6 +9,7 @@ use crate::{
     app::{AppCommand, AppEvent, ApplicationController, ApplicationState},
     config::{AppConfig, SUBTITLE_POSITIONS, SUBTITLE_TEXT_ALIGNMENTS},
     metrics::MetricsSnapshot,
+    overlay::{DesktopBackendInfo, DesktopSession, DisplayBackend, OverlayRuntimeBackend},
     pipewire::{ApplicationIdentity, ApplicationKey, StreamInfo},
 };
 
@@ -41,6 +42,8 @@ pub struct SettingsPresenter {
     status_label: gtk::Label,
     error_label: gtk::Label,
     model_path_label: gtk::Label,
+    /// สถานะการเชื่อมต่อ PipeWire ที่แสดงในหน้า About
+    pipewire_status_label: gtk::Label,
     audio_buffer_label: gtk::Label,
     inference_label: gtk::Label,
     total_label: gtk::Label,
@@ -52,6 +55,24 @@ impl SettingsPresenter {
         application: &adw::Application,
         controller: Rc<RefCell<ApplicationController>>,
     ) -> Self {
+        let session = DesktopSession::detect();
+        Self::new_with_backend_info(
+            application,
+            controller,
+            DesktopBackendInfo::new(
+                session,
+                DisplayBackend::detect(),
+                OverlayRuntimeBackend::detect(session),
+            ),
+        )
+    }
+
+    /// สร้างหน้าต่างด้วยข้อมูล backend ที่ main process ยืนยันจากผลเปิด helper แล้ว
+    pub fn new_with_backend_info(
+        application: &adw::Application,
+        controller: Rc<RefCell<ApplicationController>>,
+        backend_info: DesktopBackendInfo,
+    ) -> Self {
         let snapshot = UiSnapshot::from_controller(&controller.borrow());
         let status_label = value_label(&snapshot.status);
         let error_label = value_label("None");
@@ -59,6 +80,7 @@ impl SettingsPresenter {
         let audio_buffer_label = value_label("Not available");
         let inference_label = value_label("Not available");
         let total_label = value_label("Not available");
+        let pipewire_status_label = value_label("Starting");
         let configured_label = value_label(&snapshot.configured_applications.to_string());
         let applications_group = adw::PreferencesGroup::builder()
             .title("Applications")
@@ -105,7 +127,7 @@ impl SettingsPresenter {
             &inference_label,
             &total_label,
         ));
-        window.add(&about_page());
+        window.add(&about_page(&snapshot, backend_info, &pipewire_status_label));
 
         let close_controller = Rc::clone(&controller);
         window.connect_close_request(move |window| {
@@ -134,6 +156,7 @@ impl SettingsPresenter {
             status_label,
             error_label,
             model_path_label,
+            pipewire_status_label,
             audio_buffer_label,
             inference_label,
             total_label,
@@ -187,6 +210,11 @@ impl SettingsPresenter {
         };
         self.model_path_label
             .set_label(&format!("{} ({status})", path.display()));
+    }
+
+    /// แสดงสถานะ PipeWire ล่าสุดในหน้า About
+    pub fn update_pipewire_status(&self, status: &str) {
+        self.pipewire_status_label.set_label(status);
     }
 }
 
@@ -658,18 +686,51 @@ fn performance_page(
 }
 
 /// สร้างหน้าข้อมูลรุ่นและขอบเขตความเป็นส่วนตัว
-fn about_page() -> adw::PreferencesPage {
+fn about_page(
+    snapshot: &UiSnapshot,
+    backend_info: DesktopBackendInfo,
+    pipewire_status_label: &gtk::Label,
+) -> adw::PreferencesPage {
     let page = preferences_page("About", "help-about-symbolic");
-    let group = adw::PreferencesGroup::builder()
+    let application_group = adw::PreferencesGroup::builder()
         .title("Subtitle-live")
         .build();
-    group.add(&message_row(
+    application_group.add(&message_row(
         "Local English Live Subtitles",
         "Captures selected application audio and processes it locally.",
     ));
-    group.add(&value_row("Version", env!("CARGO_PKG_VERSION")));
-    group.add(&value_row("Privacy", "Local-first"));
-    page.add(&group);
+    application_group.add(&value_row("Version", env!("CARGO_PKG_VERSION")));
+    application_group.add(&value_row("Privacy", "Local-first"));
+    page.add(&application_group);
+
+    let desktop_group = adw::PreferencesGroup::builder().title("Desktop").build();
+    desktop_group.add(&value_row("Session", backend_info.session.display_name()));
+    desktop_group.add(&value_row(
+        "Settings Backend",
+        backend_info.settings_backend.display_name(),
+    ));
+    desktop_group.add(&value_row(
+        "Subtitle Backend",
+        backend_info.overlay_backend.display_name(),
+    ));
+    let xwayland_available = match backend_info.session {
+        DesktopSession::Wayland if backend_info.xwayland_available() => "Yes",
+        DesktopSession::Wayland => "No",
+        DesktopSession::X11 | DesktopSession::Unknown => "Not applicable",
+    };
+    desktop_group.add(&value_row("XWayland Available", xwayland_available));
+    page.add(&desktop_group);
+
+    let recognition_group = adw::PreferencesGroup::builder()
+        .title("Speech Recognition")
+        .build();
+    recognition_group.add(&value_row("Model", &snapshot.model));
+    recognition_group.add(&value_row("Compute Backend", &snapshot.backend));
+    page.add(&recognition_group);
+
+    let audio_group = adw::PreferencesGroup::builder().title("Audio").build();
+    audio_group.add(&value_row_with_label("PipeWire", pipewire_status_label));
+    page.add(&audio_group);
     page
 }
 

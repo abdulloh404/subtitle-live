@@ -2,6 +2,51 @@
 
 use std::env;
 
+use gtk::gdk::{self, prelude::DisplayExtManual};
+
+/// Backend ที่ GTK Settings ใช้งานจริงหลัง GDK เปิด display แล้ว
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplayBackend {
+    /// Native Wayland display
+    Wayland,
+    /// Native X11 display
+    X11,
+    /// Backend อื่นหรือยังไม่มี display
+    Unknown,
+}
+
+impl DisplayBackend {
+    /// ตรวจ backend จาก GDK display ที่ GTK main process เปิดใช้งานจริง
+    pub fn detect() -> Self {
+        let Some(display) = gdk::Display::default() else {
+            return Self::Unknown;
+        };
+        match display.backend() {
+            gdk::Backend::Wayland => Self::Wayland,
+            gdk::Backend::X11 => Self::X11,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// คืนชื่อสำหรับหน้า About และ structured log
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Wayland => "Wayland",
+            Self::X11 => "X11",
+            Self::Unknown => "Unknown",
+        }
+    }
+
+    /// คืนชื่อที่อ่านง่ายสำหรับหน้า About
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Wayland => "Wayland",
+            Self::X11 => "X11",
+            Self::Unknown => "Unknown",
+        }
+    }
+}
+
 /// ชนิดของ desktop session ที่ main application กำลังทำงานอยู่
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DesktopSession {
@@ -25,6 +70,15 @@ impl DesktopSession {
             Self::Wayland => "wayland",
             Self::X11 => "x11",
             Self::Unknown => "unknown",
+        }
+    }
+
+    /// คืนชื่อที่อ่านง่ายสำหรับหน้า About
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Wayland => "Wayland",
+            Self::X11 => "X11",
+            Self::Unknown => "Unknown",
         }
     }
 
@@ -67,6 +121,15 @@ impl OverlayRuntimeBackend {
         }
     }
 
+    /// คืนชื่อที่อ่านง่ายสำหรับหน้า About
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::XWayland => "XWayland",
+            Self::X11 => "X11",
+            Self::Unavailable => "Unavailable",
+        }
+    }
+
     /// เลือก backend เฉพาะเมื่อ session ชัดเจนและมี X11 display
     const fn from_display(session: DesktopSession, display_available: bool) -> Self {
         match (session, display_available) {
@@ -74,6 +137,37 @@ impl OverlayRuntimeBackend {
             (DesktopSession::X11, true) => Self::X11,
             _ => Self::Unavailable,
         }
+    }
+}
+
+/// Snapshot เดียวสำหรับแสดงและวินิจฉัย desktop/overlay backend
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DesktopBackendInfo {
+    /// Session จาก desktop environment
+    pub session: DesktopSession,
+    /// Backend ที่ Settings เปิดจริง
+    pub settings_backend: DisplayBackend,
+    /// Backend ของ helper ที่ spawn สำเร็จ
+    pub overlay_backend: OverlayRuntimeBackend,
+}
+
+impl DesktopBackendInfo {
+    /// สร้าง snapshot หลัง GTK เปิด display และ main ทราบผล spawn helper แล้ว
+    pub const fn new(
+        session: DesktopSession,
+        settings_backend: DisplayBackend,
+        overlay_backend: OverlayRuntimeBackend,
+    ) -> Self {
+        Self {
+            session,
+            settings_backend,
+            overlay_backend,
+        }
+    }
+
+    /// ระบุว่า XWayland พร้อมและ helper ถูกเลือกใช้งานสำเร็จ
+    pub fn xwayland_available(self) -> bool {
+        self.overlay_backend == OverlayRuntimeBackend::XWayland
     }
 }
 

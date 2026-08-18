@@ -12,5 +12,5 @@ pub use process::run_overlay_helper;
 pub use protocol::{
     OverlayCommand, OverlayEvent, OverlayProtocolError, read_message, write_message,
 };
-pub use session::{DesktopSession, OverlayRuntimeBackend};
+pub use session::{DesktopBackendInfo, DesktopSession, DisplayBackend, OverlayRuntimeBackend};
 pub use window::OverlayPresenter;
