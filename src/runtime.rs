@@ -93,6 +93,8 @@ pub struct ApplicationRuntime {
     metrics: LatencyTracker,
     running_requested: bool,
     stt_ready: bool,
+    // เลขคำขอ retry ที่ runtime ประมวลผลแล้ว ป้องกันการเริ่มซ้ำในแต่ละรอบ poll
+    observed_retry_generation: u64,
     // ใช้ข้าม Stopped ที่เกิดจากคำสั่งหยุดโดยตั้งใจก่อนเริ่ม retry เท่านั้น
     retry_stop_pending: bool,
     pipeline_error: Option<String>,
@@ -117,6 +119,7 @@ impl ApplicationRuntime {
         mut startup_warning: Option<String>,
     ) -> Self {
         let last_persisted_config = controller.borrow().config_snapshot();
+        let observed_retry_generation = controller.borrow().retry_generation();
         let source_audio = LatestQueue::new(SOURCE_QUEUE_CAPACITY);
         let mixed_audio = LatestQueue::new(mixed_queue_capacity(
             last_persisted_config.stt.window_ms,
@@ -166,6 +169,7 @@ impl ApplicationRuntime {
             metrics: LatencyTracker::default(),
             running_requested: false,
             stt_ready: false,
+            observed_retry_generation,
             retry_stop_pending: false,
             pipeline_error: None,
             pipewire_connected: false,
@@ -185,6 +189,7 @@ impl ApplicationRuntime {
         }
 
         self.handle_tray_commands(&mut update);
+        self.sync_retry_intent(&mut update);
         self.sync_live_intent(&mut update);
         self.sync_stt_streaming_settings(&mut update);
         self.sync_capture_targets(&mut update);
@@ -301,12 +306,21 @@ impl ApplicationRuntime {
                         .controller
                         .borrow_mut()
                         .handle_command(AppCommand::RetryPipeline);
-                    self.retry_pipeline(update);
                 }
                 TrayCommand::ShowSettings => update.show_settings = true,
                 TrayCommand::Quit => update.quit_requested = true,
             }
         }
+    }
+
+    /// ประมวลผลคำขอ retry จาก controller เพียงครั้งเดียวไม่ว่าจะมาจาก UI หรือ tray
+    fn sync_retry_intent(&mut self, update: &mut RuntimeUpdate) {
+        let requested_generation = self.controller.borrow().retry_generation();
+        if requested_generation == self.observed_retry_generation {
+            return;
+        }
+        self.observed_retry_generation = requested_generation;
+        self.retry_pipeline(update);
     }
 
     /// ทำให้ lifecycle จริงตรงกับค่าปุ่ม Live Subtitles ใน config
@@ -373,8 +387,14 @@ impl ApplicationRuntime {
 
     /// ทิ้ง session ที่เสีย เริ่ม generation ใหม่ แล้วเข้าทางเริ่ม pipeline ปกติอีกครั้ง
     fn retry_pipeline(&mut self, update: &mut RuntimeUpdate) {
-        // ทิ้ง event เก่าก่อนส่ง Stop เพื่อไม่ลบ Stopped ที่ใช้ยืนยันคำสั่ง retry รอบนี้
-        let _ = self.pipewire.drain_events();
+        // ถ้า service หลักเสีย ให้เปลี่ยน handle ก่อนเริ่มใหม่แทนการส่งกลับไปยัง channel ที่ตายแล้ว
+        if self.pipewire_error.is_some() {
+            let replacement = spawn_pipewire(self.source_audio.clone());
+            let previous = std::mem::replace(&mut self.pipewire, replacement);
+            let _ = previous.shutdown();
+            self.pipewire_connected = false;
+        }
+        // ทิ้งผล STT เก่าก่อนส่ง Stop เพื่อไม่ลบ Stopped ที่ใช้ยืนยันคำสั่ง retry รอบนี้
         let _ = self.stt.drain_events();
         let _ = self.pipewire.stop_capture();
         self.stt.stop();

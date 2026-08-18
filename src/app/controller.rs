@@ -19,6 +19,8 @@ pub struct ApplicationController {
     state: ApplicationState,
     /// snapshot ล่าสุดของ playback stream ที่ PipeWire ค้นพบ
     streams: Vec<StreamInfo>,
+    /// เลขลำดับคำขอ retry เพื่อให้ runtime เห็นคำสั่งจากผู้เรียกทุกช่องทาง
+    retry_generation: u64,
 }
 
 impl ApplicationController {
@@ -35,12 +37,18 @@ impl ApplicationController {
             config,
             state,
             streams: Vec::new(),
+            retry_generation: 0,
         }
     }
 
     /// คืนสถานะ pipeline ปัจจุบัน
     pub const fn state(&self) -> ApplicationState {
         self.state
+    }
+
+    /// คืนเลขลำดับคำขอ retry ล่าสุดสำหรับให้ runtime ตรวจจับแบบไม่บล็อก
+    pub const fn retry_generation(&self) -> u64 {
+        self.retry_generation
     }
 
     /// คืนการตั้งค่าปัจจุบันแบบยืมค่า
@@ -251,6 +259,7 @@ impl ApplicationController {
             AppCommand::RetryPipeline => {
                 self.config.general.live_subtitles = true;
                 self.state = ApplicationState::Starting;
+                self.retry_generation = self.retry_generation.saturating_add(1);
                 AppEvent::StateChanged(self.state)
             }
             AppCommand::SetKeepRunningWhenClosed(enabled) => {
@@ -454,6 +463,7 @@ mod tests {
         let expected_rules = config.audio.rules.clone();
         let mut controller = ApplicationController::new(config);
         controller.set_state(ApplicationState::Error);
+        let generation_before_retry = controller.retry_generation();
 
         let event = controller.handle_command(AppCommand::RetryPipeline);
 
@@ -463,5 +473,9 @@ mod tests {
         );
         assert!(controller.config().general.live_subtitles);
         assert_eq!(controller.config().audio.rules, expected_rules);
+        assert_eq!(
+            controller.retry_generation(),
+            generation_before_retry + 1
+        );
     }
 }
