@@ -13,7 +13,7 @@ use libspa_sys as spa_sys;
 use pipewire as pw;
 use pw::{prelude::*, spa};
 
-use crate::audio::{LatestQueue, SAMPLE_RATE_HZ, SourceAudioChunk};
+use crate::audio::{AudioBufferPool, LatestQueue, SAMPLE_RATE_HZ, SourceAudioChunk};
 
 use super::{PipeWireEvent, StreamInfo};
 
@@ -25,7 +25,14 @@ struct CaptureUserData {
     source_id: u32,
     /// รุ่น pipeline ที่ runtime กำหนดให้ capture session นี้
     generation: u64,
+    /// บัฟเฟอร์ที่จอง heap ล่วงหน้าเพื่อไม่ให้ callback ต้อง allocate
+    buffers: AudioBufferPool,
 }
+
+/// จำนวนก้อนสูงสุดที่ callback ของ stream เดียวถือค้างรอ mixer ได้
+const CAPTURE_BUFFER_COUNT: usize = 8;
+/// ความจุต่อก้อนหนึ่งวินาที รองรับ PipeWire quantum ปกติโดยไม่ขยาย heap
+const CAPTURE_BUFFER_MAX_SAMPLES: usize = SAMPLE_RATE_HZ as usize;
 
 /// เจ้าของ PipeWire stream ที่กำลัง capture และตัดการเชื่อมต่อได้อย่างปลอดภัย
 pub(super) struct CaptureSession {
@@ -79,6 +86,10 @@ pub(super) fn create_capture(
             audio,
             source_id: info.runtime_id,
             generation,
+            buffers: AudioBufferPool::new(
+                CAPTURE_BUFFER_COUNT,
+                CAPTURE_BUFFER_MAX_SAMPLES,
+            ),
         },
     )
     .state_changed({
@@ -122,11 +133,18 @@ pub(super) fn create_capture(
             return;
         }
 
+        let sample_bytes = &bytes[offset..end];
+        let sample_count = sample_bytes.len() / size_of::<f32>();
+        // pool ว่างหรือ quantum ใหญ่กว่าที่เตรียมไว้ให้ทิ้งรอบนี้แทนการ allocate/block
+        let Some(mut samples) = user_data.buffers.try_acquire(sample_count) else {
+            return;
+        };
         // อ่านเฉพาะช่วงที่ PipeWire ระบุใน chunk และไม่แตะ padding ของบัฟเฟอร์
-        let samples: Vec<_> = bytes[offset..end]
-            .chunks_exact(size_of::<f32>())
-            .map(|sample| f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]))
-            .collect();
+        for sample in sample_bytes.chunks_exact(size_of::<f32>()) {
+            samples.push(f32::from_le_bytes([
+                sample[0], sample[1], sample[2], sample[3],
+            ]));
+        }
         let captured_end = Instant::now();
         let sample_duration =
             std::time::Duration::from_secs_f64(samples.len() as f64 / SAMPLE_RATE_HZ as f64);

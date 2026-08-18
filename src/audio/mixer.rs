@@ -115,7 +115,7 @@ fn run_mixer(
             sources
                 .entry(chunk.source_id)
                 .or_insert_with(|| SourceBuffer::new(chunk.captured_at))
-                .append(chunk.samples, chunk.captured_at);
+                .append(chunk.samples.as_slice(), chunk.captured_at);
         }
 
         let now = Instant::now();
@@ -247,7 +247,7 @@ impl SourceBuffer {
         }
     }
 
-    fn append(&mut self, samples: Vec<f32>, captured_at: Instant) {
+    fn append(&mut self, samples: &[f32], captured_at: Instant) {
         if self.samples.is_empty() {
             self.started_at = captured_at;
         } else {
