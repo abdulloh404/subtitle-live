@@ -14,6 +14,7 @@ use crate::{
         OverlayRuntimeBackend,
     },
     pipewire::{ApplicationIdentity, ApplicationKey, StreamInfo},
+    stt::compiled_compute_backend,
 };
 
 const SETTINGS_WINDOW_NAME: &str = "subtitle-live-settings";
@@ -958,7 +959,8 @@ impl UiSnapshot {
             configured_applications: config.audio.rules.len(),
             language: language_label(config),
             model: config.stt.model.clone(),
-            backend: display_identifier(&config.stt.backend),
+            // แสดง backend ที่ไบนารีใช้จริง ไม่ใช่ค่าความต้องการ `auto` ใน config
+            backend: compiled_compute_backend().display_name().to_owned(),
             audio_step_ms: config.stt.step_ms,
             context_window_ms: config.stt.window_ms,
             vad_enabled: config.stt.vad_enabled,

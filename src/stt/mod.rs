@@ -1,5 +1,9 @@
 //! เวิร์กเกอร์ whisper.cpp ภายในเครื่องและเหตุการณ์ STT สำหรับชั้นแอปพลิเคชัน
 
+mod backend;
+
+pub use backend::{ComputeBackend, compiled_compute_backend};
+
 use std::{
     collections::VecDeque,
     fs::File,
