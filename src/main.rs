@@ -10,8 +10,7 @@ use subtitle_live::{
     error::AppError,
     logging,
     overlay::{
-        DesktopSession, OverlayClient, OverlayEvent, OverlayPresenter, OverlayRuntimeBackend,
-        run_overlay_helper,
+        DesktopSession, OverlayClient, OverlayEvent, OverlayRuntimeBackend, run_overlay_helper,
     },
     runtime::ApplicationRuntime,
     ui::SettingsPresenter,
@@ -27,10 +26,8 @@ struct DesktopUi {
 
 /// Renderer ที่ main process เลือกตาม desktop session โดยไม่เปลี่ยน backend ของ Settings
 enum DesktopOverlay {
-    /// Wayland main process ส่งข้อความให้ XWayland helper
+    /// Main process ส่งข้อความให้ X11/XWayland helper
     Helper(OverlayClient),
-    /// X11 main process ยังใช้ presenter เดิมจนกว่าจะย้ายไป helper ในขั้นถัดไป
-    Local(OverlayPresenter),
     /// ไม่มี X11 display; pipeline อื่นยังทำงานต่อได้
     Unavailable,
 }
@@ -40,7 +37,6 @@ impl DesktopOverlay {
     fn apply_config(&self, config: &config::SubtitleConfig) {
         match self {
             Self::Helper(client) => client.apply_config(config),
-            Self::Local(presenter) => presenter.apply_config(config),
             Self::Unavailable => {}
         }
     }
@@ -51,7 +47,6 @@ impl DesktopOverlay {
             Self::Helper(client) => {
                 client.show_text(text, is_final);
             }
-            Self::Local(presenter) => presenter.show_text(text, is_final),
             Self::Unavailable => {}
         }
     }
@@ -60,7 +55,6 @@ impl DesktopOverlay {
     fn hide(&self) {
         match self {
             Self::Helper(client) => client.hide(),
-            Self::Local(presenter) => presenter.hide(),
             Self::Unavailable => {}
         }
     }
@@ -90,7 +84,6 @@ impl DesktopOverlay {
     fn request_shutdown(&self) {
         match self {
             Self::Helper(client) => client.shutdown(),
-            Self::Local(presenter) => presenter.hide(),
             Self::Unavailable => {}
         }
     }
@@ -133,7 +126,7 @@ fn main() -> Result<(), AppError> {
     let overlay_backend = OverlayRuntimeBackend::detect(desktop_session);
     let initial_subtitle_config = controller.borrow().config().subtitle.clone();
     let overlay_client = Rc::new(RefCell::new(match overlay_backend {
-        OverlayRuntimeBackend::XWayland => {
+        OverlayRuntimeBackend::XWayland | OverlayRuntimeBackend::X11 => {
             match OverlayClient::spawn(overlay_backend, &initial_subtitle_config) {
                 Ok(client) => Some(client),
                 Err(error) => {
@@ -146,7 +139,7 @@ fn main() -> Result<(), AppError> {
                 }
             }
         }
-        OverlayRuntimeBackend::X11 | OverlayRuntimeBackend::Unavailable => None,
+        OverlayRuntimeBackend::Unavailable => None,
     }));
 
     tracing::info!(
@@ -189,14 +182,12 @@ fn main() -> Result<(), AppError> {
         // Presenter เป็น GTK object จึงต้องสร้างและใช้งานบน main thread เท่านั้น
         if activate_desktop.borrow().is_none() {
             let settings = SettingsPresenter::new(application, Rc::clone(&activate_controller));
-            let subtitle_config = activate_controller.borrow().config().subtitle.clone();
             let overlay = match overlay_backend {
-                OverlayRuntimeBackend::XWayland => activate_overlay_client
-                    .borrow_mut()
-                    .take()
-                    .map_or(DesktopOverlay::Unavailable, DesktopOverlay::Helper),
-                OverlayRuntimeBackend::X11 => {
-                    DesktopOverlay::Local(OverlayPresenter::new(application, &subtitle_config))
+                OverlayRuntimeBackend::XWayland | OverlayRuntimeBackend::X11 => {
+                    activate_overlay_client
+                        .borrow_mut()
+                        .take()
+                        .map_or(DesktopOverlay::Unavailable, DesktopOverlay::Helper)
                 }
                 OverlayRuntimeBackend::Unavailable => DesktopOverlay::Unavailable,
             };
