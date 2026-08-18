@@ -151,9 +151,7 @@ impl SttService {
 
     /// เริ่มรุ่นเสียงใหม่เพื่อให้ชั้นแอปปฏิเสธเหตุการณ์เก่าจากแหล่งก่อนหน้าได้
     pub fn resume_audio(&self, generation: u64) -> u64 {
-        let _ = self
-            .commands
-            .send(WorkerCommand::ResumeAudio(generation));
+        let _ = self.commands.send(WorkerCommand::ResumeAudio(generation));
         generation
     }
 
@@ -700,7 +698,10 @@ pub(crate) fn normalize_hypothesis_text(text: &str) -> String {
         {
             index += BLANK_AUDIO_MARKER.len();
             while index < text.len() {
-                let character = text[index..].chars().next().expect("valid character boundary");
+                let character = text[index..]
+                    .chars()
+                    .next()
+                    .expect("valid character boundary");
                 if matches!(character, ',' | '.' | '!' | '?' | ';' | ':') {
                     index += character.len_utf8();
                 } else {
@@ -711,7 +712,10 @@ pub(crate) fn normalize_hypothesis_text(text: &str) -> String {
             continue;
         }
 
-        let character = text[index..].chars().next().expect("valid character boundary");
+        let character = text[index..]
+            .chars()
+            .next()
+            .expect("valid character boundary");
         without_marker.push(character);
         index += character.len_utf8();
     }

@@ -1,6 +1,10 @@
 //! จุดเริ่มต้นของแอป GTK และสะพานส่ง event จาก runtime ไปยังหน้าต่าง Settings/Overlay
 
-use std::{cell::RefCell, rc::Rc, time::{Duration, Instant}};
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 use adw::prelude::*;
 use gtk::glib;
@@ -28,7 +32,7 @@ struct DesktopUi {
 /// Renderer ที่ main process เลือกตาม desktop session โดยไม่เปลี่ยน backend ของ Settings
 enum DesktopOverlay {
     /// Main process ส่งข้อความให้ X11/XWayland helper
-    Helper(OverlayClient),
+    Helper(Box<OverlayClient>),
     /// ไม่มี X11 display; pipeline อื่นยังทำงานต่อได้
     Unavailable,
 }
@@ -59,16 +63,14 @@ impl DesktopOverlay {
             Self::Helper(client) => {
                 let now = Instant::now();
                 let submitted_at_micros = glib::monotonic_time();
-                let audio_age_micros = i64::try_from(
-                    now.saturating_duration_since(audio_origin_at).as_micros(),
-                )
-                .unwrap_or(i64::MAX);
+                let audio_age_micros =
+                    i64::try_from(now.saturating_duration_since(audio_origin_at).as_micros())
+                        .unwrap_or(i64::MAX);
                 client
                     .show_text(text, is_final)
                     .map(|frame_id| OverlayFrameSubmission {
                         frame_id,
-                        audio_origin_micros: submitted_at_micros
-                            .saturating_sub(audio_age_micros),
+                        audio_origin_micros: submitted_at_micros.saturating_sub(audio_age_micros),
                     })
             }
             Self::Unavailable => None,
@@ -252,7 +254,9 @@ fn main() -> Result<(), AppError> {
                     activate_overlay_client
                         .borrow_mut()
                         .take()
-                        .map_or(DesktopOverlay::Unavailable, DesktopOverlay::Helper)
+                        .map_or(DesktopOverlay::Unavailable, |client| {
+                            DesktopOverlay::Helper(Box::new(client))
+                        })
                 }
                 OverlayRuntimeBackend::Unavailable => DesktopOverlay::Unavailable,
             };
@@ -380,21 +384,15 @@ fn install_runtime_poll(
                     runtime.clear_pending_overlay_frames();
                 }
             }
-            if let Some(subtitle) = update.subtitle {
-                if let Some(submission) = desktop
-                    .overlay
-                    .show_text(
-                        &subtitle.text,
-                        subtitle.is_final,
-                        subtitle.audio_origin_at,
-                    )
-                    && let Some(runtime) = runtime.borrow_mut().as_mut()
-                {
-                    runtime.track_overlay_frame(
-                        submission.frame_id,
-                        submission.audio_origin_micros,
-                    );
-                }
+            if let Some(subtitle) = update.subtitle
+                && let Some(submission) = desktop.overlay.show_text(
+                    &subtitle.text,
+                    subtitle.is_final,
+                    subtitle.audio_origin_at,
+                )
+                && let Some(runtime) = runtime.borrow_mut().as_mut()
+            {
+                runtime.track_overlay_frame(submission.frame_id, submission.audio_origin_micros);
             }
             if update.show_settings {
                 desktop.settings.present();

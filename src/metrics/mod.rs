@@ -148,10 +148,7 @@ mod tests {
             stt_snapshot.audio_buffer_latest,
             Some(Duration::from_millis(120))
         );
-        assert_eq!(
-            stt_snapshot.whisper_latest,
-            Some(Duration::from_millis(45))
-        );
+        assert_eq!(stt_snapshot.whisper_latest, Some(Duration::from_millis(45)));
         assert_eq!(stt_snapshot.end_to_end_latest, None);
 
         tracker.record_end_to_end(Duration::from_millis(210));
@@ -160,8 +157,14 @@ mod tests {
             complete_snapshot.end_to_end_latest,
             Some(Duration::from_millis(210))
         );
-        assert_eq!(complete_snapshot.audio_buffer_p50, Some(Duration::from_millis(120)));
-        assert_eq!(complete_snapshot.whisper_p50, Some(Duration::from_millis(45)));
+        assert_eq!(
+            complete_snapshot.audio_buffer_p50,
+            Some(Duration::from_millis(120))
+        );
+        assert_eq!(
+            complete_snapshot.whisper_p50,
+            Some(Duration::from_millis(45))
+        );
         assert_eq!(complete_snapshot.source_queue_dropped, 2);
         assert_eq!(complete_snapshot.mixed_queue_dropped, 3);
     }

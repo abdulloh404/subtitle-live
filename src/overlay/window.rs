@@ -194,8 +194,7 @@ impl OverlayPresenter {
     where
         F: FnOnce() + 'static,
     {
-        self.pending_after_paint
-            .replace(Some(Box::new(callback)));
+        self.pending_after_paint.replace(Some(Box::new(callback)));
         self.window.queue_draw();
         if self.after_paint_scheduled.replace(true) {
             return;

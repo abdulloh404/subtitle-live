@@ -675,11 +675,12 @@ fn subtitle_page(
         let Some(alignment) = SUBTITLE_TEXT_ALIGNMENTS.get(dropdown.selected() as usize) else {
             return;
         };
-        let _ = alignment_controller
-            .borrow_mut()
-            .handle_command(AppCommand::SetSubtitleTextAlignment(
-                (*alignment).to_owned(),
-            ));
+        let _ =
+            alignment_controller
+                .borrow_mut()
+                .handle_command(AppCommand::SetSubtitleTextAlignment(
+                    (*alignment).to_owned(),
+                ));
     });
     group.add(&alignment_row);
 
@@ -705,9 +706,7 @@ fn subtitle_page(
     width.connect_value_changed(move |spin| {
         let _ = width_controller
             .borrow_mut()
-            .handle_command(AppCommand::SetSubtitleWidthPx(
-                spin.value_as_int() as u32
-            ));
+            .handle_command(AppCommand::SetSubtitleWidthPx(spin.value_as_int() as u32));
     });
     group.add(&width_row);
 

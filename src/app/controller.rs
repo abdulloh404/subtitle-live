@@ -245,7 +245,7 @@ impl ApplicationController {
 
     /// ตรวจสอบและประมวลผลคำสั่งหนึ่งรายการโดยไม่เรียกบริการภายนอกโดยตรง
     pub fn handle_command(&mut self, command: AppCommand) -> AppEvent {
-        let event = match command {
+        match command {
             AppCommand::StartSubtitles => {
                 self.config.general.live_subtitles = true;
                 self.state = ApplicationState::Starting;
@@ -294,9 +294,7 @@ impl ApplicationController {
             }
             AppCommand::SetSubtitlePosition(position) => {
                 if !SUBTITLE_POSITIONS.contains(&position.as_str()) {
-                    return AppEvent::Error(format!(
-                        "Unsupported subtitle position: {position}"
-                    ));
+                    return AppEvent::Error(format!("Unsupported subtitle position: {position}"));
                 }
                 self.config.subtitle.position = position;
                 AppEvent::ConfigChanged("subtitle.position")
@@ -348,8 +346,7 @@ impl ApplicationController {
             }
             AppCommand::ShowSettings => AppEvent::SettingsRequested,
             AppCommand::Quit => AppEvent::QuitRequested,
-        };
-        event
+        }
     }
 }
 
@@ -467,15 +464,9 @@ mod tests {
 
         let event = controller.handle_command(AppCommand::RetryPipeline);
 
-        assert_eq!(
-            event,
-            AppEvent::StateChanged(ApplicationState::Starting)
-        );
+        assert_eq!(event, AppEvent::StateChanged(ApplicationState::Starting));
         assert!(controller.config().general.live_subtitles);
         assert_eq!(controller.config().audio.rules, expected_rules);
-        assert_eq!(
-            controller.retry_generation(),
-            generation_before_retry + 1
-        );
+        assert_eq!(controller.retry_generation(), generation_before_retry + 1);
     }
 }

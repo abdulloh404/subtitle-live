@@ -204,8 +204,7 @@ fn mix_frame(
         }
 
         let leading_samples = if source.started_at > frame_start {
-            duration_samples(source.started_at.duration_since(frame_start))
-                .min(MIX_FRAME_SAMPLES)
+            duration_samples(source.started_at.duration_since(frame_start)).min(MIX_FRAME_SAMPLES)
         } else {
             0
         };
@@ -215,11 +214,7 @@ fn mix_frame(
             continue;
         }
         contributing_sources += 1;
-        for mixed_sample in mixed
-            .iter_mut()
-            .skip(leading_samples)
-            .take(samples_to_mix)
-        {
+        for mixed_sample in mixed.iter_mut().skip(leading_samples).take(samples_to_mix) {
             *mixed_sample += source.samples.pop_front().unwrap_or_default();
         }
         source.advance_timestamp(samples_to_mix);
@@ -283,8 +278,8 @@ impl SourceBuffer {
         if self.started_at >= frame_start {
             return;
         }
-        let samples_to_discard = duration_samples(frame_start.duration_since(self.started_at))
-            .min(self.samples.len());
+        let samples_to_discard =
+            duration_samples(frame_start.duration_since(self.started_at)).min(self.samples.len());
         self.samples.drain(..samples_to_discard);
         self.advance_timestamp(samples_to_discard);
     }

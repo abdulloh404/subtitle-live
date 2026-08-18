@@ -128,11 +128,7 @@ impl CaptureTarget {
             .node_name
             .clone()
             .map(StreamDiscriminator::NodeName)
-            .or_else(|| {
-                info.media_name
-                    .clone()
-                    .map(StreamDiscriminator::MediaName)
-            })
+            .or_else(|| info.media_name.clone().map(StreamDiscriminator::MediaName))
             .or_else(|| {
                 info.object_serial
                     .clone()
@@ -155,10 +151,8 @@ impl CaptureTarget {
             return false;
         }
 
-        let application_matches = strongest_common_identity_matches(
-            &self.application,
-            &stream.application,
-        );
+        let application_matches =
+            strongest_common_identity_matches(&self.application, &stream.application);
         if !application_matches {
             return false;
         }

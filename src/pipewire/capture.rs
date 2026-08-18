@@ -4,10 +4,7 @@
 //! จากนั้น callback จะประทับเวลาโดยประมาณและส่งเสียงเข้าคิวแบบไม่รอ เพื่อไม่ให้
 //! งาน STT ที่ช้ากว่าทำให้ real-time callback สะดุด
 
-use std::{
-    mem::size_of,
-    time::Instant,
-};
+use std::{mem::size_of, time::Instant};
 
 use libspa_sys as spa_sys;
 use pipewire as pw;
@@ -86,10 +83,7 @@ pub(super) fn create_capture(
             audio,
             source_id: info.runtime_id,
             generation,
-            buffers: AudioBufferPool::new(
-                CAPTURE_BUFFER_COUNT,
-                CAPTURE_BUFFER_MAX_SAMPLES,
-            ),
+            buffers: AudioBufferPool::new(CAPTURE_BUFFER_COUNT, CAPTURE_BUFFER_MAX_SAMPLES),
         },
     )
     .state_changed({
@@ -107,9 +101,7 @@ pub(super) fn create_capture(
                 let _ = state_events.send(PipeWireEvent::CaptureError {
                     runtime_id: source_id,
                     audio_generation,
-                    message: format!(
-                        "PipeWire capture failed for stream {source_id}: {message}"
-                    ),
+                    message: format!("PipeWire capture failed for stream {source_id}: {message}"),
                 });
             }
             _ => {}
@@ -153,7 +145,9 @@ pub(super) fn create_capture(
             generation: user_data.generation,
             source_id: user_data.source_id,
             samples,
-            captured_at: captured_end.checked_sub(sample_duration).unwrap_or(captured_end),
+            captured_at: captured_end
+                .checked_sub(sample_duration)
+                .unwrap_or(captured_end),
         });
     })
     .create()
@@ -196,13 +190,11 @@ pub(super) fn create_capture(
             },
         ],
     });
-    let values = spa::pod::serialize::PodSerializer::serialize(
-        std::io::Cursor::new(Vec::new()),
-        &format,
-    )
-    .map_err(|error| format!("failed to serialize capture format: {error}"))?
-    .0
-    .into_inner();
+    let values =
+        spa::pod::serialize::PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &format)
+            .map_err(|error| format!("failed to serialize capture format: {error}"))?
+            .0
+            .into_inner();
     let mut params = [values.as_ptr().cast()];
 
     stream

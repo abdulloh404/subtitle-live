@@ -14,8 +14,8 @@ use gtk::gio::prelude::{FileExt, InputStreamExt};
 use gtk::{gio, glib};
 
 use super::{
-    OverlayCommand, OverlayEvent, OverlayPresenter, read_message,
-    protocol::MAX_MESSAGE_BYTES, write_message,
+    OverlayCommand, OverlayEvent, OverlayPresenter, protocol::MAX_MESSAGE_BYTES, read_message,
+    write_message,
 };
 use crate::config::SubtitleConfig;
 
@@ -241,12 +241,11 @@ fn install_command_poll(
                     if presenter.show_text(&text, is_final) {
                         let event_sender = event_sender.clone();
                         presenter.after_next_paint(move || {
-                            let _ = event_sender.send(WriterMessage::Event(
-                                OverlayEvent::Rendered {
+                            let _ =
+                                event_sender.send(WriterMessage::Event(OverlayEvent::Rendered {
                                     frame_id,
                                     rendered_at_micros: glib::monotonic_time(),
-                                },
-                            ));
+                                }));
                         });
                     }
                 }

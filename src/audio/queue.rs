@@ -122,11 +122,7 @@ impl<T> Clone for LatestQueue<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        sync::mpsc,
-        thread,
-        time::Duration,
-    };
+    use std::{sync::mpsc, thread, time::Duration};
 
     use super::LatestQueue;
 

@@ -171,9 +171,10 @@ impl AppConfig {
                 ));
             }
 
-            if rule.streams.iter().any(|stream| {
-                !has_text(&stream.media_name) && !has_text(&stream.node_name)
-            })
+            if rule
+                .streams
+                .iter()
+                .any(|stream| !has_text(&stream.media_name) && !has_text(&stream.node_name))
             {
                 return Err(ConfigValidationError::new(
                     "audio.rules.streams",

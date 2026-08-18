@@ -11,9 +11,7 @@ use std::{
 
 use crate::{
     app::{AppCommand, ApplicationController, ApplicationState},
-    audio::{
-        LatestQueue, MixedAudioChunk, MixerHandle, SourceAudioChunk, spawn_mixer,
-    },
+    audio::{LatestQueue, MixedAudioChunk, MixerHandle, SourceAudioChunk, spawn_mixer},
     config::{AppConfig, ConfigWriter},
     metrics::{LatencyTracker, MetricsSnapshot},
     pipewire::{CaptureTarget, PipeWireEvent, PipeWireService, spawn_service as spawn_pipewire},
@@ -129,9 +127,8 @@ impl ApplicationRuntime {
         let last_persisted_config = controller.borrow().config_snapshot();
         let observed_retry_generation = controller.borrow().retry_generation();
         let source_audio = LatestQueue::new(SOURCE_QUEUE_CAPACITY);
-        let mixed_audio = LatestQueue::new(mixed_queue_capacity(
-            last_persisted_config.stt.window_ms,
-        ));
+        let mixed_audio =
+            LatestQueue::new(mixed_queue_capacity(last_persisted_config.stt.window_ms));
         let mixer = spawn_mixer(source_audio.clone(), mixed_audio.clone());
         let pipewire = spawn_pipewire(source_audio.clone());
         let stt = spawn_stt(mixed_audio.clone());
@@ -257,10 +254,8 @@ impl ApplicationRuntime {
 
     /// สร้าง snapshot latency พร้อมจำนวนข้อมูลที่ bounded queues จำเป็นต้องทิ้ง
     pub fn metrics_snapshot(&self) -> MetricsSnapshot {
-        self.metrics.snapshot(
-            self.source_audio.dropped(),
-            self.mixed_audio.dropped(),
-        )
+        self.metrics
+            .snapshot(self.source_audio.dropped(), self.mixed_audio.dropped())
     }
 
     /// ผูก frame ที่ส่งเข้า overlay IPC กับเวลาเริ่ม audio step ต้นทาง
@@ -403,12 +398,7 @@ impl ApplicationRuntime {
 
     /// ทำให้ lifecycle จริงตรงกับค่าปุ่ม Live Subtitles ใน config
     fn sync_live_intent(&mut self, update: &mut RuntimeUpdate) {
-        let requested = self
-            .controller
-            .borrow()
-            .config()
-            .general
-            .live_subtitles;
+        let requested = self.controller.borrow().config().general.live_subtitles;
         if requested == self.running_requested {
             return;
         }
@@ -480,10 +470,7 @@ impl ApplicationRuntime {
         self.retry_stop_pending = true;
         self.source_audio.clear_reliable();
         self.mixed_audio.clear_reliable();
-        self.pipeline_audio_generation = self
-            .pipeline_audio_generation
-            .saturating_add(1)
-            .max(1);
+        self.pipeline_audio_generation = self.pipeline_audio_generation.saturating_add(1).max(1);
         self.mixer.reset(self.pipeline_audio_generation);
         self.running_requested = true;
         self.pipewire_error = None;
@@ -535,10 +522,9 @@ impl ApplicationRuntime {
         self.begin_capture_transition(update);
         self.stt.update_streaming(desired);
         if !self.applied_targets.is_empty()
-            && let Err(error) = self.pipewire.set_selected(
-                self.applied_targets.clone(),
-                self.pipeline_audio_generation,
-            )
+            && let Err(error) = self
+                .pipewire
+                .set_selected(self.applied_targets.clone(), self.pipeline_audio_generation)
         {
             self.pipeline_error = Some(error.to_string());
         }
@@ -558,19 +544,17 @@ impl ApplicationRuntime {
                 PipeWireEvent::CaptureStarted {
                     runtime_id,
                     audio_generation,
-                }
-                    if self.running_requested
-                        && self.stt_ready
-                        && audio_generation == self.pipeline_audio_generation
-                        && self.current_runtime_is_selected(runtime_id) =>
+                } if self.running_requested
+                    && self.stt_ready
+                    && audio_generation == self.pipeline_audio_generation
+                    && self.current_runtime_is_selected(runtime_id) =>
                 {
                     if self.capture_transition_pending && self.stt_resume_generation.is_none() {
                         self.source_audio.clear_reliable();
                         self.mixed_audio.clear_reliable();
                         self.mixer.reset(self.pipeline_audio_generation);
-                        self.stt_resume_generation = Some(
-                            self.stt.resume_audio(self.pipeline_audio_generation),
-                        );
+                        self.stt_resume_generation =
+                            Some(self.stt.resume_audio(self.pipeline_audio_generation));
                     }
                     self.active_captures.insert(runtime_id);
                     self.capture_errors.remove(&runtime_id);
@@ -626,11 +610,10 @@ impl ApplicationRuntime {
                     audio_generation,
                     audio_origin_at,
                     update: transcript,
-                }
-                    if self.running_requested
-                        && self.stt_ready
-                        && !self.capture_transition_pending
-                        && self.accepted_audio_generation == Some(audio_generation) =>
+                } if self.running_requested
+                    && self.stt_ready
+                    && !self.capture_transition_pending
+                    && self.accepted_audio_generation == Some(audio_generation) =>
                 {
                     let is_final = matches!(&transcript, TranscriptUpdate::Final { .. });
                     let presentation_changed = self.transcript.apply(&transcript);
@@ -673,7 +656,8 @@ impl ApplicationRuntime {
                     self.capture_transition_pending = false;
                     self.stt_resume_generation = None;
                     self.accepted_audio_generation = None;
-                    self.pipeline_error = Some("Speech recognition stopped unexpectedly".to_owned());
+                    self.pipeline_error =
+                        Some("Speech recognition stopped unexpectedly".to_owned());
                     self.set_state(ApplicationState::Error);
                     update.hide_overlay = true;
                 }
@@ -715,8 +699,8 @@ impl ApplicationRuntime {
             return;
         }
 
-        let selection_changed = targets != self.applied_targets
-            || desired_capture_ids != self.desired_capture_ids;
+        let selection_changed =
+            targets != self.applied_targets || desired_capture_ids != self.desired_capture_ids;
         if selection_changed {
             self.begin_capture_transition(update);
             self.applied_targets = targets.clone();
@@ -741,10 +725,7 @@ impl ApplicationRuntime {
         self.stt.pause_audio();
         self.source_audio.clear_reliable();
         self.mixed_audio.clear_reliable();
-        self.pipeline_audio_generation = self
-            .pipeline_audio_generation
-            .saturating_add(1)
-            .max(1);
+        self.pipeline_audio_generation = self.pipeline_audio_generation.saturating_add(1).max(1);
         self.mixer.reset(self.pipeline_audio_generation);
         self.transcript.clear();
         self.last_subtitle_update = None;
@@ -763,13 +744,11 @@ impl ApplicationRuntime {
             || !self.capture_errors.is_empty()
         {
             ApplicationState::Error
-        } else if !self.running_requested || !self.stt_ready {
-            ApplicationState::Starting
-        } else if self.desired_capture_ids.is_empty()
+        } else if !self.running_requested
+            || !self.stt_ready
+            || self.desired_capture_ids.is_empty()
             || self.capture_transition_pending
-            || !self
-                .desired_capture_ids
-                .is_subset(&self.active_captures)
+            || !self.desired_capture_ids.is_subset(&self.active_captures)
         {
             ApplicationState::Starting
         } else {
@@ -823,10 +802,9 @@ impl ApplicationRuntime {
         }
         self.begin_capture_transition(update);
         if !self.applied_targets.is_empty()
-            && let Err(error) = self.pipewire.set_selected(
-                self.applied_targets.clone(),
-                self.pipeline_audio_generation,
-            )
+            && let Err(error) = self
+                .pipewire
+                .set_selected(self.applied_targets.clone(), self.pipeline_audio_generation)
         {
             self.pipeline_error = Some(error.to_string());
         }
@@ -837,9 +815,9 @@ impl ApplicationRuntime {
         let state = match self.state() {
             ApplicationState::Running => TrayState::Active,
             ApplicationState::Error => TrayState::Error,
-            ApplicationState::Stopped
-            | ApplicationState::Starting
-            | ApplicationState::Stopping => TrayState::Paused,
+            ApplicationState::Stopped | ApplicationState::Starting | ApplicationState::Stopping => {
+                TrayState::Paused
+            }
         };
         if self.last_tray_state == Some(state) {
             return;
