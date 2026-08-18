@@ -88,6 +88,9 @@ impl OverlayClient {
         let mut command = helper_command()?;
         command
             .env("GDK_BACKEND", "x11")
+            // helper เป็น passive overlay จึงห้ามรับ activation token ของหน้าต่าง Settings
+            .env_remove("DESKTOP_STARTUP_ID")
+            .env_remove("XDG_ACTIVATION_TOKEN")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());

@@ -50,6 +50,7 @@ pub(super) fn configure_overlay_window(window: &gtk::Window, mapped: bool) -> Re
     let atoms = Atoms::load(&connection)?;
 
     set_input_focus_disabled(&connection, xid)?;
+    set_focus_activation_disabled(&connection, xid, &atoms)?;
     connection
         .change_property32(
             PropMode::REPLACE,
@@ -266,6 +267,37 @@ fn set_input_focus_disabled<C: Connection>(connection: &C, window: Window) -> Re
         .map_err(|error| format!("ตั้ง WM_HINTS ไม่รับ focus ไม่สำเร็จ: {error}"))
 }
 
+/// ป้องกัน window manager มองการ map overlay ว่าเป็น user action แล้วแย่ง active window
+fn set_focus_activation_disabled<C: Connection>(
+    connection: &C,
+    window: Window,
+    atoms: &Atoms,
+) -> Result<(), String> {
+    // บังคับให้ Mutter อ่านเวลาจาก toplevel นี้แทน GDK user-time window ที่อาจมีค่าเก่า
+    connection
+        .delete_property(window, atoms.net_wm_user_time_window)
+        .map_err(|error| format!("ส่งคำขอล้าง X11 user-time window ไม่สำเร็จ: {error}"))?
+        .check()
+        .map_err(|error| format!("ล้าง X11 user-time window ไม่สำเร็จ: {error}"))?;
+    connection
+        .delete_property(window, atoms.net_startup_id)
+        .map_err(|error| format!("ส่งคำขอล้าง X11 startup id ไม่สำเร็จ: {error}"))?
+        .check()
+        .map_err(|error| format!("ล้าง X11 startup id ไม่สำเร็จ: {error}"))?;
+    // EWMH กำหนดค่า 0 เพื่อขอไม่ให้หน้าต่างใหม่รับ focus ตอน map
+    connection
+        .change_property32(
+            PropMode::REPLACE,
+            window,
+            atoms.net_wm_user_time,
+            AtomEnum::CARDINAL,
+            &[0],
+        )
+        .map_err(|error| format!("ส่ง X11 user time แบบไม่รับ focus ไม่สำเร็จ: {error}"))?
+        .check()
+        .map_err(|error| format!("ตั้ง X11 user time แบบไม่รับ focus ไม่สำเร็จ: {error}"))
+}
+
 /// ส่ง `_NET_WM_STATE_ADD` ครั้งละสอง state ตามรูปแบบ EWMH
 fn add_window_states<C: Connection>(
     connection: &C,
@@ -304,6 +336,9 @@ fn add_window_states<C: Connection>(
 struct Atoms {
     net_current_desktop: Atom,
     net_moveresize_window: Atom,
+    net_startup_id: Atom,
+    net_wm_user_time: Atom,
+    net_wm_user_time_window: Atom,
     net_wm_window_type: Atom,
     net_wm_window_type_notification: Atom,
     net_wm_state: Atom,
@@ -319,6 +354,9 @@ impl Atoms {
         Ok(Self {
             net_current_desktop: intern_atom(connection, b"_NET_CURRENT_DESKTOP")?,
             net_moveresize_window: intern_atom(connection, b"_NET_MOVERESIZE_WINDOW")?,
+            net_startup_id: intern_atom(connection, b"_NET_STARTUP_ID")?,
+            net_wm_user_time: intern_atom(connection, b"_NET_WM_USER_TIME")?,
+            net_wm_user_time_window: intern_atom(connection, b"_NET_WM_USER_TIME_WINDOW")?,
             net_wm_window_type: intern_atom(connection, b"_NET_WM_WINDOW_TYPE")?,
             net_wm_window_type_notification: intern_atom(
                 connection,
