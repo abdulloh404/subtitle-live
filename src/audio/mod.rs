@@ -20,6 +20,8 @@ pub const MIX_FRAME_SAMPLES: usize = 320;
 /// ก้อนเสียงมาตรฐานที่มาจาก PipeWire stream ที่เลือกหนึ่งรายการ
 #[derive(Debug)]
 pub struct SourceAudioChunk {
+    /// รุ่น pipeline ที่ runtime กำหนด ใช้ปฏิเสธเสียงจาก capture รอบเก่า
+    pub generation: u64,
     /// PipeWire node ID ของ session ปัจจุบัน ใช้แยก input ของ mixer เท่านั้น
     pub source_id: u32,
     /// sample mono `f32` ที่ normalize แล้วและห้ามเขียนค่าจริงลง log
@@ -31,6 +33,8 @@ pub struct SourceAudioChunk {
 /// frame ขนาดคงที่ที่รวมเสียงจาก source ที่ active ทั้งหมดแล้ว
 #[derive(Debug)]
 pub struct MixedAudioChunk {
+    /// รุ่น pipeline เดียวกับ source ที่นำมาผสม
+    pub generation: u64,
     /// sample mono ที่พร้อมส่งเข้า rolling buffer ของ STT
     pub samples: Vec<f32>,
     /// timestamp ของเสียงที่ส่งต่อมาจากจุดเริ่มต้นของ mix frame

@@ -118,8 +118,6 @@ pub struct SttService {
     events: LatestQueue<SttEvent>,
     /// รุ่นเสียงที่เวิร์กเกอร์ยอมรับและเผยแพร่แล้ว
     audio_generation: Arc<AtomicU64>,
-    /// รุ่นเสียงล่าสุดที่ชั้นแอปร้องขอ ใช้สร้างหมายเลขถัดไปโดยไม่ซ้ำ
-    requested_audio_generation: AtomicU64,
 }
 
 impl SttService {
@@ -144,11 +142,7 @@ impl SttService {
     }
 
     /// เริ่มรุ่นเสียงใหม่เพื่อให้ชั้นแอปปฏิเสธเหตุการณ์เก่าจากแหล่งก่อนหน้าได้
-    pub fn resume_audio(&self) -> u64 {
-        let generation = self
-            .requested_audio_generation
-            .fetch_add(1, Ordering::AcqRel)
-            .wrapping_add(1);
+    pub fn resume_audio(&self, generation: u64) -> u64 {
         let _ = self
             .commands
             .send(WorkerCommand::ResumeAudio(generation));
@@ -194,7 +188,6 @@ pub fn spawn_service(input: LatestQueue<MixedAudioChunk>) -> SttService {
         commands,
         events,
         audio_generation,
-        requested_audio_generation: AtomicU64::new(0),
     }
 }
 
@@ -222,15 +215,14 @@ fn run_worker(
     audio_generation: Arc<AtomicU64>,
 ) {
     let mut active: Option<ActiveStt> = None;
-    let mut audio_paused = false;
+    let mut audio_paused = true;
     let mut current_audio_generation = 0;
 
     loop {
         match next_command(&commands, active.is_some()) {
             CommandState::Command(WorkerCommand::Start(config)) => {
                 active = None;
-                audio_paused = false;
-                current_audio_generation = 0;
+                audio_paused = true;
                 input.clear_reliable();
                 events.push_latest_reliable(SttEvent::Loading);
                 match ActiveStt::load(config, input.dropped()) {
@@ -246,8 +238,7 @@ fn run_worker(
             }
             CommandState::Command(WorkerCommand::Stop) => {
                 active = None;
-                audio_paused = false;
-                current_audio_generation = 0;
+                audio_paused = true;
                 input.clear_reliable();
                 events.push_latest_reliable(SttEvent::Stopped);
             }
@@ -267,6 +258,9 @@ fn run_worker(
                 }
             }
             CommandState::Command(WorkerCommand::ResumeAudio(generation)) => {
+                if generation < current_audio_generation {
+                    continue;
+                }
                 input.clear_reliable();
                 if let Some(stt) = active.as_mut() {
                     stt.reset_discontinuity();
@@ -289,7 +283,7 @@ fn run_worker(
             continue;
         }
 
-        match stt.consume_latest(&input) {
+        match stt.consume_latest(&input, current_audio_generation) {
             Ok(Some(result)) => {
                 if let Some(update) = result.update {
                     events.push_latest(SttEvent::Transcript {
@@ -445,6 +439,7 @@ impl ActiveStt {
     fn consume_latest(
         &mut self,
         input: &LatestQueue<MixedAudioChunk>,
+        current_audio_generation: u64,
     ) -> Result<Option<InferenceResult>, String> {
         let dropped = input.dropped();
         if dropped != self.observed_dropped {
@@ -452,7 +447,11 @@ impl ActiveStt {
             self.observed_dropped = dropped;
         }
 
-        let chunks = input.drain();
+        let chunks: Vec<_> = input
+            .drain()
+            .into_iter()
+            .filter(|chunk| chunk.generation == current_audio_generation)
+            .collect();
         if chunks.is_empty() {
             return Ok(None);
         }

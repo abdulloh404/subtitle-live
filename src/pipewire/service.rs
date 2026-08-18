@@ -25,7 +25,10 @@ use super::{
 /// คำสั่งข้าม thread ที่เปลี่ยนสถานะ capture ภายใน PipeWire main loop
 #[derive(Clone)]
 enum Command {
-    SetSelected(Vec<CaptureTarget>),
+    SetSelected {
+        targets: Vec<CaptureTarget>,
+        audio_generation: u64,
+    },
     StopCapture,
     Shutdown,
 }
@@ -38,9 +41,16 @@ pub struct PipeWireCommandSender {
 
 impl PipeWireCommandSender {
     /// แทนที่กฎการเลือกทั้งหมดและเปิด capture สำหรับ stream ที่ตรงกัน
-    pub fn set_selected(&self, targets: Vec<CaptureTarget>) -> Result<(), PipeWireServiceError> {
+    pub fn set_selected(
+        &self,
+        targets: Vec<CaptureTarget>,
+        audio_generation: u64,
+    ) -> Result<(), PipeWireServiceError> {
         self.sender
-            .send(Command::SetSelected(targets))
+            .send(Command::SetSelected {
+                targets,
+                audio_generation,
+            })
             .map_err(|_| PipeWireServiceError)
     }
 
@@ -72,8 +82,12 @@ impl PipeWireService {
         self.commands.clone()
     }
 
-    pub fn set_selected(&self, targets: Vec<CaptureTarget>) -> Result<(), PipeWireServiceError> {
-        self.commands.set_selected(targets)
+    pub fn set_selected(
+        &self,
+        targets: Vec<CaptureTarget>,
+        audio_generation: u64,
+    ) -> Result<(), PipeWireServiceError> {
+        self.commands.set_selected(targets, audio_generation)
     }
 
     pub fn stop_capture(&self) -> Result<(), PipeWireServiceError> {
@@ -178,7 +192,10 @@ fn run_service(
         let _commands = command_receiver.attach(&mainloop, move |command| {
             let mut state = command_state.borrow_mut();
             match command {
-                Command::SetSelected(targets) => state.set_selected(targets),
+                Command::SetSelected {
+                    targets,
+                    audio_generation,
+                } => state.set_selected(targets, audio_generation),
                 Command::StopCapture => state.stop_capture(),
                 Command::Shutdown => {
                     state.stop_capture();
@@ -215,6 +232,8 @@ struct ServiceState {
     selected: Vec<CaptureTarget>,
     /// ป้องกัน `reconcile` ต่อ capture ใหม่หลังได้รับคำสั่งหยุด
     capture_enabled: bool,
+    /// รุ่น pipeline ล่าสุด ป้องกัน command เก่ากลับมาเปิด capture ซ้ำ
+    audio_generation: u64,
 }
 
 impl ServiceState {
@@ -231,6 +250,7 @@ impl ServiceState {
             captures: HashMap::new(),
             selected: Vec::new(),
             capture_enabled: true,
+            audio_generation: 0,
         }
     }
 
@@ -248,7 +268,17 @@ impl ServiceState {
         self.emit_snapshot();
     }
 
-    fn set_selected(&mut self, targets: Vec<CaptureTarget>) {
+    fn set_selected(&mut self, targets: Vec<CaptureTarget>, audio_generation: u64) {
+        if audio_generation < self.audio_generation {
+            return;
+        }
+        if audio_generation > self.audio_generation {
+            let runtime_ids: Vec<_> = self.captures.keys().copied().collect();
+            for runtime_id in runtime_ids {
+                self.detach(runtime_id);
+            }
+        }
+        self.audio_generation = audio_generation;
         self.selected = targets;
         self.capture_enabled = true;
         self.reconcile();
@@ -291,13 +321,20 @@ impl ServiceState {
             .filter_map(|runtime_id| self.streams.get(&runtime_id).cloned())
             .collect();
         for stream in missing {
-            match create_capture(&self.mainloop, &stream, self.audio.clone(), self.events.clone()) {
+            match create_capture(
+                &self.mainloop,
+                &stream,
+                self.audio_generation,
+                self.audio.clone(),
+                self.events.clone(),
+            ) {
                 Ok(capture) => {
                     self.captures.insert(stream.runtime_id, capture);
                 }
                 Err(message) => {
                     let _ = self.events.send(PipeWireEvent::CaptureError {
                         runtime_id: stream.runtime_id,
+                        audio_generation: self.audio_generation,
                         message,
                     });
                 }
@@ -309,8 +346,12 @@ impl ServiceState {
         let Some(capture) = self.captures.remove(&runtime_id) else {
             return;
         };
+        let audio_generation = capture.generation();
         capture.disconnect();
-        let _ = self.events.send(PipeWireEvent::CaptureStopped(runtime_id));
+        let _ = self.events.send(PipeWireEvent::CaptureStopped {
+            runtime_id,
+            audio_generation,
+        });
     }
 
     fn emit_snapshot(&self) {

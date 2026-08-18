@@ -83,6 +83,8 @@ pub struct ApplicationRuntime {
     capture_errors: HashMap<u32, String>,
     // ระหว่างเปลี่ยน capture จะหยุดรับ transcript จน STT ยืนยัน audio generation ใหม่
     capture_transition_pending: bool,
+    // รุ่นเดียวที่ส่งผ่าน PipeWire, mixer และ STT เพื่อกันเสียงจาก transition เก่า
+    pipeline_audio_generation: u64,
     stt_resume_generation: Option<u64>,
     accepted_audio_generation: Option<u64>,
     // Reconciler ป้องกัน partial/final ซ้ำและรักษาคำที่ commit แล้ว
@@ -154,6 +156,7 @@ impl ApplicationRuntime {
             active_captures: HashSet::new(),
             capture_errors: HashMap::new(),
             capture_transition_pending: false,
+            pipeline_audio_generation: 0,
             stt_resume_generation: None,
             accepted_audio_generation: None,
             transcript: TranscriptReconciler::default(),
@@ -336,7 +339,7 @@ impl ApplicationRuntime {
         self.applied_targets.clear();
         self.source_audio.clear_reliable();
         self.mixed_audio.clear_reliable();
-        self.mixer.reset();
+        self.mixer.reset(self.pipeline_audio_generation);
         self.transcript.clear();
         self.last_subtitle_update = None;
         self.applied_stt_streaming = Some(streaming);
@@ -372,7 +375,7 @@ impl ApplicationRuntime {
         self.applied_targets.clear();
         self.source_audio.clear_reliable();
         self.mixed_audio.clear_reliable();
-        self.mixer.reset();
+        self.mixer.reset(self.pipeline_audio_generation);
         self.transcript.clear();
         self.last_subtitle_update = None;
         self.applied_stt_streaming = None;
@@ -399,19 +402,17 @@ impl ApplicationRuntime {
             return;
         }
 
-        self.stt.pause_audio();
-        self.source_audio.clear_reliable();
-        self.mixed_audio.clear_reliable();
-        self.mixer.reset();
-        self.transcript.clear();
-        self.last_subtitle_update = None;
-        self.capture_transition_pending = true;
-        self.accepted_audio_generation = None;
-        self.stt_resume_generation = None;
+        self.begin_capture_transition(update);
         self.stt.update_streaming(desired);
-        self.stt_resume_generation = Some(self.stt.resume_audio());
+        if !self.applied_targets.is_empty()
+            && let Err(error) = self.pipewire.set_selected(
+                self.applied_targets.clone(),
+                self.pipeline_audio_generation,
+            )
+        {
+            self.pipeline_error = Some(error.to_string());
+        }
         self.applied_stt_streaming = Some(desired);
-        update.hide_overlay = true;
     }
 
     /// รับเหตุการณ์ graph/capture จาก PipeWire แล้วสะท้อนกลับไปยัง controller
@@ -424,28 +425,41 @@ impl ApplicationRuntime {
                     self.controller.borrow_mut().set_streams(streams);
                     update.streams_changed = true;
                 }
-                PipeWireEvent::CaptureStarted(runtime_id)
+                PipeWireEvent::CaptureStarted {
+                    runtime_id,
+                    audio_generation,
+                }
                     if self.running_requested
                         && self.stt_ready
+                        && audio_generation == self.pipeline_audio_generation
                         && self.current_runtime_is_selected(runtime_id) =>
                 {
                     if self.capture_transition_pending && self.stt_resume_generation.is_none() {
                         self.source_audio.clear_reliable();
                         self.mixed_audio.clear_reliable();
-                        self.mixer.reset();
-                        self.stt_resume_generation = Some(self.stt.resume_audio());
+                        self.mixer.reset(self.pipeline_audio_generation);
+                        self.stt_resume_generation = Some(
+                            self.stt.resume_audio(self.pipeline_audio_generation),
+                        );
                     }
                     self.active_captures.insert(runtime_id);
                     self.capture_errors.remove(&runtime_id);
                 }
-                PipeWireEvent::CaptureStopped(runtime_id) => {
+                PipeWireEvent::CaptureStopped {
+                    runtime_id,
+                    audio_generation,
+                } if audio_generation == self.pipeline_audio_generation => {
                     self.active_captures.remove(&runtime_id);
                     self.capture_errors.remove(&runtime_id);
                 }
                 PipeWireEvent::CaptureError {
                     runtime_id,
+                    audio_generation,
                     message,
                 } => {
+                    if audio_generation != self.pipeline_audio_generation {
+                        continue;
+                    }
                     self.active_captures.remove(&runtime_id);
                     if self.current_runtime_is_selected(runtime_id) {
                         self.capture_errors.insert(runtime_id, message);
@@ -457,7 +471,7 @@ impl ApplicationRuntime {
                     self.set_state(ApplicationState::Error);
                     update.hide_overlay = true;
                 }
-                PipeWireEvent::CaptureStarted(_) => {}
+                PipeWireEvent::CaptureStarted { .. } | PipeWireEvent::CaptureStopped { .. } => {}
             }
         }
     }
@@ -572,7 +586,10 @@ impl ApplicationRuntime {
             self.applied_targets = targets.clone();
             self.desired_capture_ids = desired_capture_ids;
             self.pipeline_error = None;
-            if let Err(error) = self.pipewire.set_selected(targets) {
+            if let Err(error) = self
+                .pipewire
+                .set_selected(targets, self.pipeline_audio_generation)
+            {
                 self.pipeline_error = Some(error.to_string());
             }
         } else {
@@ -588,7 +605,11 @@ impl ApplicationRuntime {
         self.stt.pause_audio();
         self.source_audio.clear_reliable();
         self.mixed_audio.clear_reliable();
-        self.mixer.reset();
+        self.pipeline_audio_generation = self
+            .pipeline_audio_generation
+            .saturating_add(1)
+            .max(1);
+        self.mixer.reset(self.pipeline_audio_generation);
         self.transcript.clear();
         self.last_subtitle_update = None;
         self.active_captures.clear();
@@ -664,16 +685,15 @@ impl ApplicationRuntime {
         if last_update.elapsed() < SUBTITLE_IDLE_TIMEOUT {
             return;
         }
-        self.last_subtitle_update = None;
-        self.transcript.clear();
-        self.stt.pause_audio();
-        self.source_audio.clear_reliable();
-        self.mixed_audio.clear_reliable();
-        self.mixer.reset();
-        self.capture_transition_pending = true;
-        self.accepted_audio_generation = None;
-        self.stt_resume_generation = Some(self.stt.resume_audio());
-        update.hide_overlay = true;
+        self.begin_capture_transition(update);
+        if !self.applied_targets.is_empty()
+            && let Err(error) = self.pipewire.set_selected(
+                self.applied_targets.clone(),
+                self.pipeline_audio_generation,
+            )
+        {
+            self.pipeline_error = Some(error.to_string());
+        }
     }
 
     /// ส่งสถานะไป tray เมื่อค่าที่แสดงต้องเปลี่ยนเท่านั้น

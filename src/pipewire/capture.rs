@@ -23,11 +23,14 @@ struct CaptureUserData {
     audio: LatestQueue<SourceAudioChunk>,
     /// runtime node ID ของ source นี้
     source_id: u32,
+    /// รุ่น pipeline ที่ runtime กำหนดให้ capture session นี้
+    generation: u64,
 }
 
 /// เจ้าของ PipeWire stream ที่กำลัง capture และตัดการเชื่อมต่อได้อย่างปลอดภัย
 pub(super) struct CaptureSession {
     stream: pw::stream::Stream<CaptureUserData>,
+    generation: u64,
 }
 
 impl CaptureSession {
@@ -35,12 +38,18 @@ impl CaptureSession {
     pub(super) fn disconnect(&self) {
         let _ = self.stream.disconnect();
     }
+
+    /// คืนรุ่น pipeline ของ session เพื่อผูก event หยุดกับรอบที่ถูกต้อง
+    pub(super) const fn generation(&self) -> u64 {
+        self.generation
+    }
 }
 
 /// สร้าง capture stream ที่เจาะจง node และร้องขอเสียง mono `f32` 16 kHz
 pub(super) fn create_capture(
     mainloop: &pw::MainLoop,
     info: &StreamInfo,
+    generation: u64,
     audio: LatestQueue<SourceAudioChunk>,
     events: std::sync::mpsc::Sender<PipeWireEvent>,
 ) -> Result<CaptureSession, String> {
@@ -69,18 +78,24 @@ pub(super) fn create_capture(
         CaptureUserData {
             audio,
             source_id: info.runtime_id,
+            generation,
         },
     )
     .state_changed({
         let state_events = events.clone();
         let source_id = info.runtime_id;
+        let audio_generation = generation;
         move |_, state| match state {
             pw::stream::StreamState::Streaming => {
-                let _ = state_events.send(PipeWireEvent::CaptureStarted(source_id));
+                let _ = state_events.send(PipeWireEvent::CaptureStarted {
+                    runtime_id: source_id,
+                    audio_generation,
+                });
             }
             pw::stream::StreamState::Error(message) => {
                 let _ = state_events.send(PipeWireEvent::CaptureError {
                     runtime_id: source_id,
+                    audio_generation,
                     message: format!(
                         "PipeWire capture failed for stream {source_id}: {message}"
                     ),
@@ -117,6 +132,7 @@ pub(super) fn create_capture(
             std::time::Duration::from_secs_f64(samples.len() as f64 / SAMPLE_RATE_HZ as f64);
         // ห้ามทำ formatting หรือ I/O ของ log ใน callback นี้ เพราะจะรบกวน PipeWire
         user_data.audio.push_latest(SourceAudioChunk {
+            generation: user_data.generation,
             source_id: user_data.source_id,
             samples,
             captured_at: captured_end.checked_sub(sample_duration).unwrap_or(captured_end),
@@ -185,5 +201,5 @@ pub(super) fn create_capture(
             )
         })?;
 
-    Ok(CaptureSession { stream })
+    Ok(CaptureSession { stream, generation })
 }

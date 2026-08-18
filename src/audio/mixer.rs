@@ -24,6 +24,8 @@ const MIX_SYNC_GRACE: Duration = Duration::from_millis(30);
 pub struct MixerHandle {
     /// generation ที่เพิ่มขึ้นทุกครั้งเมื่อ caller ขอ reset
     reset_generation: Arc<AtomicU64>,
+    /// รุ่นเสียงปัจจุบันที่ mixer อนุญาตให้ผ่านไปยัง STT
+    audio_generation: Arc<AtomicU64>,
     /// flag สำหรับขอให้ worker ออกจาก loop
     running: Arc<AtomicBool>,
 }
@@ -35,7 +37,11 @@ impl MixerHandle {
     }
 
     /// ล้าง source buffer หลังเปลี่ยนรายการ capture หรือเริ่ม pipeline ใหม่
-    pub fn reset(&self) {
+    pub fn reset(&self, generation: u64) {
+        if generation < self.audio_generation.load(Ordering::Acquire) {
+            return;
+        }
+        self.audio_generation.store(generation, Ordering::Release);
         self.reset_generation.fetch_add(1, Ordering::AcqRel);
     }
 }
@@ -55,16 +61,25 @@ pub fn spawn_mixer(
     let worker_running = Arc::clone(&running);
     let reset_generation = Arc::new(AtomicU64::new(0));
     let worker_reset_generation = Arc::clone(&reset_generation);
+    let audio_generation = Arc::new(AtomicU64::new(0));
+    let worker_audio_generation = Arc::clone(&audio_generation);
 
     thread::Builder::new()
         .name("audio-mixer".to_owned())
         .spawn(move || {
-            run_mixer(worker_running, worker_reset_generation, input, output);
+            run_mixer(
+                worker_running,
+                worker_reset_generation,
+                worker_audio_generation,
+                input,
+                output,
+            );
         })
         .expect("failed to spawn audio mixer worker");
 
     MixerHandle {
         reset_generation,
+        audio_generation,
         running,
     }
 }
@@ -72,6 +87,7 @@ pub fn spawn_mixer(
 fn run_mixer(
     running: Arc<AtomicBool>,
     reset_generation: Arc<AtomicU64>,
+    audio_generation: Arc<AtomicU64>,
     input: LatestQueue<SourceAudioChunk>,
     output: LatestQueue<MixedAudioChunk>,
 ) {
@@ -79,6 +95,7 @@ fn run_mixer(
     // timestamp ของ source ใช้ตัดสินว่าข้อมูลแต่ละก้อนอยู่ตำแหน่งใดบน timeline
     let mut sources: HashMap<u32, SourceBuffer> = HashMap::new();
     let mut observed_reset = reset_generation.load(Ordering::Acquire);
+    let mut current_generation = audio_generation.load(Ordering::Acquire);
     let mut frame_wait_started: Option<Instant> = None;
     let mut next_frame_at: Option<Instant> = None;
     while running.load(Ordering::Acquire) {
@@ -88,9 +105,13 @@ fn run_mixer(
             frame_wait_started = None;
             next_frame_at = None;
             observed_reset = requested_reset;
+            current_generation = audio_generation.load(Ordering::Acquire);
         }
 
         for chunk in input.drain() {
+            if !generation_is_current(chunk.generation, current_generation) {
+                continue;
+            }
             sources
                 .entry(chunk.source_id)
                 .or_insert_with(|| SourceBuffer::new(chunk.captured_at))
@@ -141,7 +162,7 @@ fn run_mixer(
                     break;
                 }
             }
-            if let Some(chunk) = mix_frame(&mut sources, frame_start) {
+            if let Some(chunk) = mix_frame(&mut sources, frame_start, current_generation) {
                 output.push_latest(chunk);
             }
             next_frame_at = Some(frame_end);
@@ -156,6 +177,7 @@ fn run_mixer(
 fn mix_frame(
     sources: &mut HashMap<u32, SourceBuffer>,
     frame_start: Instant,
+    generation: u64,
 ) -> Option<MixedAudioChunk> {
     let mut mixed = vec![0.0_f32; MIX_FRAME_SAMPLES];
     let mut contributing_sources = 0_u32;
@@ -200,6 +222,7 @@ fn mix_frame(
     }
 
     Some(MixedAudioChunk {
+        generation,
         samples: mixed,
         captured_at: frame_start,
     })
@@ -263,4 +286,20 @@ fn samples_duration(samples: usize) -> Duration {
 
 fn duration_samples(duration: Duration) -> usize {
     (duration.as_secs_f64() * super::SAMPLE_RATE_HZ as f64).round() as usize
+}
+
+/// รับเฉพาะเสียงของรุ่นที่ runtime เปิดใช้งานอยู่เท่านั้น
+const fn generation_is_current(generation: u64, current_generation: u64) -> bool {
+    generation == current_generation
+}
+
+#[cfg(test)]
+mod tests {
+    use super::generation_is_current;
+
+    #[test]
+    fn accepts_current_generation_and_discards_stale_generation() {
+        assert!(generation_is_current(4, 4));
+        assert!(!generation_is_current(3, 4));
+    }
 }
