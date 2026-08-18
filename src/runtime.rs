@@ -29,7 +29,7 @@ const MIX_FRAME_DURATION_MS: usize = 20;
 // เผื่อพื้นที่เพิ่มเพื่อให้ STT มีช่วงรับความผันผวนโดยไม่ทำให้คิวโตแบบไม่จำกัด
 const INFERENCE_HEADROOM_MS: usize = 2_000;
 // เมื่อไม่มีผลถอดเสียงใหม่เกินช่วงนี้ ให้ล้างบริบทเก่าและซ่อน overlay
-const SUBTITLE_IDLE_TIMEOUT: Duration = Duration::from_secs(4);
+const SUBTITLE_IDLE_TIMEOUT: Duration = Duration::from_secs(3);
 // จำกัด correlation ที่รอ overlay ตอบกลับ เพราะ frame เก่าอาจถูก mailbox แทนที่และไม่มี acknowledgment
 const MAX_PENDING_OVERLAY_FRAMES: usize = 64;
 
@@ -797,7 +797,7 @@ impl ApplicationRuntime {
         let Some(last_update) = self.last_subtitle_update else {
             return;
         };
-        if last_update.elapsed() < SUBTITLE_IDLE_TIMEOUT {
+        if !subtitle_idle_timed_out(last_update, Instant::now()) {
             return;
         }
         self.begin_capture_transition(update);
@@ -834,6 +834,12 @@ impl ApplicationRuntime {
     }
 }
 
+/// คืนค่า true ตั้งแต่วินาทีที่ 3 หลัง subtitle อัปเดตครั้งล่าสุด เพื่อให้ทดสอบขอบเวลาได้แน่นอน
+fn subtitle_idle_timed_out(last_update: Instant, now: Instant) -> bool {
+    now.checked_duration_since(last_update)
+        .is_some_and(|idle| idle >= SUBTITLE_IDLE_TIMEOUT)
+}
+
 /// แปลง STT window เป็นจำนวน mixed frames และจำกัดคิวไม่ให้เล็กหรือใหญ่เกินไป
 fn mixed_queue_capacity(window_ms: u32) -> usize {
     let retained_ms = usize::try_from(window_ms)
@@ -852,9 +858,23 @@ fn monotonic_duration(origin_micros: i64, rendered_micros: i64) -> Option<Durati
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    use super::monotonic_duration;
+    use super::{monotonic_duration, subtitle_idle_timed_out};
+
+    #[test]
+    fn subtitle_hides_when_idle_reaches_three_seconds() {
+        let last_update = Instant::now();
+
+        assert!(!subtitle_idle_timed_out(
+            last_update,
+            last_update + Duration::from_millis(2_999)
+        ));
+        assert!(subtitle_idle_timed_out(
+            last_update,
+            last_update + Duration::from_secs(3)
+        ));
+    }
 
     #[test]
     fn rendered_timestamp_produces_end_to_end_duration() {
