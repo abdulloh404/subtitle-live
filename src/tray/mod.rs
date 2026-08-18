@@ -36,6 +36,8 @@ pub enum TrayCommand {
 /// handle ฝั่ง runtime สำหรับส่งสถานะไปยัง tray thread
 pub struct TrayIndicator {
     updates: Sender<TrayUpdate>,
+    /// สิทธิ์ join เธรด tray ซึ่งอยู่กับ runtime เพียงตัวเดียว
+    worker: Option<thread::JoinHandle<()>>,
 }
 
 /// ข้อความภายในจาก runtime ไปยัง tray thread
@@ -64,7 +66,7 @@ impl TrayIndicator {
         };
         let handle = model.spawn().map_err(|error| error.to_string())?;
         let (updates, update_receiver) = mpsc::channel();
-        thread::Builder::new()
+        let worker = thread::Builder::new()
             .name("tray-indicator".to_owned())
             .spawn(move || {
                 while let Ok(update) = update_receiver.recv() {
@@ -82,7 +84,13 @@ impl TrayIndicator {
             })
             .map_err(|error| error.to_string())?;
 
-        Ok((Self { updates }, command_receiver))
+        Ok((
+            Self {
+                updates,
+                worker: Some(worker),
+            },
+            command_receiver,
+        ))
     }
 
     /// ส่งสถานะล่าสุดไปยัง tray thread แบบไม่บล็อก
@@ -93,6 +101,17 @@ impl TrayIndicator {
     /// ขอให้ tray thread ปิด status notifier
     pub fn shutdown(&self) {
         let _ = self.updates.send(TrayUpdate::Shutdown);
+    }
+
+    /// ขอปิด status notifier และรอให้ tray worker ออกจนเสร็จ
+    pub fn finish(&mut self) -> Result<(), String> {
+        self.shutdown();
+        let Some(worker) = self.worker.take() else {
+            return Ok(());
+        };
+        worker
+            .join()
+            .map_err(|_| "tray indicator thread panicked while shutting down".to_owned())
     }
 }
 

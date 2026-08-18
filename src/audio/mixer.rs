@@ -28,6 +28,8 @@ pub struct MixerHandle {
     audio_generation: Arc<AtomicU64>,
     /// flag สำหรับขอให้ worker ออกจาก loop
     running: Arc<AtomicBool>,
+    /// สิทธิ์ join เธรด mixer ซึ่งมีเจ้าของเพียง handle หลักตัวเดียว
+    worker: Option<thread::JoinHandle<()>>,
 }
 
 impl MixerHandle {
@@ -43,6 +45,17 @@ impl MixerHandle {
         }
         self.audio_generation.store(generation, Ordering::Release);
         self.reset_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// ขอหยุดและรอให้ worker ออกจนเสร็จในช่วงปิดแอป
+    pub fn finish(&mut self) -> Result<(), String> {
+        self.stop();
+        let Some(worker) = self.worker.take() else {
+            return Ok(());
+        };
+        worker
+            .join()
+            .map_err(|_| "audio mixer worker panicked while shutting down".to_owned())
     }
 }
 
@@ -64,7 +77,7 @@ pub fn spawn_mixer(
     let audio_generation = Arc::new(AtomicU64::new(0));
     let worker_audio_generation = Arc::clone(&audio_generation);
 
-    thread::Builder::new()
+    let worker = thread::Builder::new()
         .name("audio-mixer".to_owned())
         .spawn(move || {
             run_mixer(
@@ -81,6 +94,7 @@ pub fn spawn_mixer(
         reset_generation,
         audio_generation,
         running,
+        worker: Some(worker),
     }
 }
 
@@ -295,11 +309,22 @@ const fn generation_is_current(generation: u64, current_generation: u64) -> bool
 
 #[cfg(test)]
 mod tests {
-    use super::generation_is_current;
+    use super::{generation_is_current, spawn_mixer};
+    use crate::audio::LatestQueue;
 
     #[test]
     fn accepts_current_generation_and_discards_stale_generation() {
         assert!(generation_is_current(4, 4));
         assert!(!generation_is_current(3, 4));
+    }
+
+    #[test]
+    fn mixer_worker_can_be_joined_idempotently() {
+        let input = LatestQueue::new(1);
+        let output = LatestQueue::new(1);
+        let mut mixer = spawn_mixer(input, output);
+
+        assert!(mixer.finish().is_ok());
+        assert!(mixer.finish().is_ok());
     }
 }

@@ -70,10 +70,11 @@ impl PipeWireCommandSender {
 }
 
 /// handle ฝั่ง application สำหรับส่งคำสั่งและรับ event แบบไม่บล็อก
-#[derive(Clone)]
 pub struct PipeWireService {
     commands: PipeWireCommandSender,
     events: Arc<Mutex<mpsc::Receiver<PipeWireEvent>>>,
+    /// สิทธิ์ join เธรด PipeWire ซึ่งอยู่กับ service หลักเพียงตัวเดียว
+    worker: Option<thread::JoinHandle<()>>,
 }
 
 impl PipeWireService {
@@ -98,12 +99,38 @@ impl PipeWireService {
         self.commands.shutdown()
     }
 
+    /// ขอปิด main loop และรอให้เธรด PipeWire ออกจนเสร็จ
+    pub fn finish(&mut self) -> Result<(), String> {
+        // เธรดอาจจบไปแล้วจากข้อผิดพลาด จึงไม่ถือว่า channel ที่ปิดเป็นข้อผิดพลาดซ้ำ
+        let _ = self.shutdown();
+        let Some(worker) = self.worker.take() else {
+            return Ok(());
+        };
+        worker
+            .join()
+            .map_err(|_| "PipeWire service thread panicked while shutting down".to_owned())
+    }
+
+    /// ระบุว่า join จะคืนค่าทันที เพื่อให้ GTK เก็บ service รุ่นเก่าได้โดยไม่บล็อก
+    pub fn is_finished(&self) -> bool {
+        self.worker
+            .as_ref()
+            .is_none_or(thread::JoinHandle::is_finished)
+    }
+
     /// ดึง event ที่รออยู่ทั้งหมดโดยไม่รอ PipeWire สร้าง event ใหม่
     pub fn drain_events(&self) -> Vec<PipeWireEvent> {
         let Ok(events) = self.events.try_lock() else {
             return Vec::new();
         };
         events.try_iter().collect()
+    }
+}
+
+impl Drop for PipeWireService {
+    /// ส่งคำสั่งปิดแบบ best-effort เท่านั้น เพื่อไม่บล็อกระหว่าง unwind หรือ replace service
+    fn drop(&mut self) {
+        let _ = self.shutdown();
     }
 }
 
@@ -126,22 +153,25 @@ pub fn spawn_service(audio: LatestQueue<SourceAudioChunk>) -> PipeWireService {
     let commands = PipeWireCommandSender {
         sender: command_sender,
     };
-    let service = PipeWireService {
-        commands,
-        events: Arc::new(Mutex::new(event_receiver)),
-    };
-
     let failure_events = event_sender.clone();
-    if let Err(error) = thread::Builder::new()
+    let worker = match thread::Builder::new()
         .name("pipewire-service".to_owned())
         .spawn(move || run_service(command_receiver, event_sender, audio))
     {
-        let _ = failure_events.send(PipeWireEvent::Error(format!(
-            "failed to start PipeWire service thread: {error}"
-        )));
-    }
+        Ok(worker) => Some(worker),
+        Err(error) => {
+            let _ = failure_events.send(PipeWireEvent::Error(format!(
+                "failed to start PipeWire service thread: {error}"
+            )));
+            None
+        }
+    };
 
-    service
+    PipeWireService {
+        commands,
+        events: Arc::new(Mutex::new(event_receiver)),
+        worker,
+    }
 }
 
 fn run_service(

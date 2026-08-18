@@ -71,6 +71,8 @@ pub struct ApplicationRuntime {
     // Handle ของ worker/service ใช้ส่งคำสั่งเท่านั้น งานหนักไม่เกิดบน GTK thread
     mixer: MixerHandle,
     pipewire: PipeWireService,
+    // Service รุ่นเก่าจาก Retry ถูกสั่งปิดแล้วและรอ join หลัง GTK event loop จบ
+    retired_pipewire: Vec<PipeWireService>,
     stt: SttService,
     // Tray เป็น optional เพราะบาง desktop ไม่มี StatusNotifier host
     tray: Option<TrayIndicator>,
@@ -155,6 +157,7 @@ impl ApplicationRuntime {
             mixed_audio,
             mixer,
             pipewire,
+            retired_pipewire: Vec::new(),
             stt,
             tray,
             tray_commands,
@@ -195,6 +198,7 @@ impl ApplicationRuntime {
             return update;
         }
 
+        self.reap_retired_pipewire();
         self.handle_tray_commands(&mut update);
         self.sync_retry_intent(&mut update);
         self.sync_live_intent(&mut update);
@@ -209,6 +213,21 @@ impl ApplicationRuntime {
         self.persist_if_changed();
         self.sync_tray_state();
         update
+    }
+
+    /// join เฉพาะ PipeWire worker รุ่นเก่าที่จบแล้ว จึงไม่รอ native main loop บน GTK thread
+    fn reap_retired_pipewire(&mut self) {
+        let mut index = 0;
+        while index < self.retired_pipewire.len() {
+            if !self.retired_pipewire[index].is_finished() {
+                index += 1;
+                continue;
+            }
+            let mut service = self.retired_pipewire.swap_remove(index);
+            if let Err(error) = service.finish() {
+                tracing::error!(error = %error, "PipeWire worker รุ่นเก่าปิดไม่สมบูรณ์");
+            }
+        }
     }
 
     /// คืนสถานะ lifecycle ปัจจุบันสำหรับหน้า Settings และ tray
@@ -311,9 +330,29 @@ impl ApplicationRuntime {
         }
     }
 
-    /// รอเฉพาะงานเขียน config ที่ค้างอยู่ หลัง `Application::run` คืนค่าแล้ว
+    /// รอ worker ทุกตัวหลัง `Application::run` คืนค่าแล้ว จึงไม่บล็อก GTK main thread
     pub fn finish(&mut self) {
         self.request_shutdown();
+        if let Err(error) = self.pipewire.finish() {
+            tracing::error!(error = %error, "PipeWire worker ปิดไม่สมบูรณ์");
+        }
+        for service in &mut self.retired_pipewire {
+            if let Err(error) = service.finish() {
+                tracing::error!(error = %error, "PipeWire worker รุ่นเก่าปิดไม่สมบูรณ์");
+            }
+        }
+        self.retired_pipewire.clear();
+        if let Err(error) = self.mixer.finish() {
+            tracing::error!(error = %error, "audio mixer worker ปิดไม่สมบูรณ์");
+        }
+        if let Err(error) = self.stt.finish() {
+            tracing::error!(error = %error, "Whisper worker ปิดไม่สมบูรณ์");
+        }
+        if let Some(tray) = &mut self.tray
+            && let Err(error) = tray.finish()
+        {
+            tracing::error!(error = %error, "tray worker ปิดไม่สมบูรณ์");
+        }
         if let Some(writer) = &mut self.config_writer {
             writer.finish();
         }
@@ -431,6 +470,7 @@ impl ApplicationRuntime {
             let replacement = spawn_pipewire(self.source_audio.clone());
             let previous = std::mem::replace(&mut self.pipewire, replacement);
             let _ = previous.shutdown();
+            self.retired_pipewire.push(previous);
             self.pipewire_connected = false;
         }
         // ทิ้งผล STT เก่าก่อนส่ง Stop เพื่อไม่ลบ Stopped ที่ใช้ยืนยันคำสั่ง retry รอบนี้

@@ -11,7 +11,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use crate::config::SubtitleConfig;
 
 /// ขนาดสูงสุดของ JSON message หนึ่งรายการเพื่อจำกัดหน่วยความจำจาก IPC ที่เสียหาย
-const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 
 /// คำสั่งที่ main process ส่งให้ overlay renderer
 #[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]

@@ -124,6 +124,8 @@ pub struct SttService {
     events: LatestQueue<SttEvent>,
     /// รุ่นเสียงที่เวิร์กเกอร์ยอมรับและเผยแพร่แล้ว
     audio_generation: Arc<AtomicU64>,
+    /// สิทธิ์ join เธรด Whisper ซึ่งอยู่กับ service หลักเพียงตัวเดียว
+    worker: Option<thread::JoinHandle<()>>,
 }
 
 impl SttService {
@@ -165,6 +167,17 @@ impl SttService {
         let _ = self.commands.send(WorkerCommand::Shutdown);
     }
 
+    /// ขอปิดเวิร์กเกอร์และรอให้การอนุมานรอบปัจจุบันจบก่อนคืนทรัพยากร
+    pub fn finish(&mut self) -> Result<(), String> {
+        self.shutdown();
+        let Some(worker) = self.worker.take() else {
+            return Ok(());
+        };
+        worker
+            .join()
+            .map_err(|_| "Whisper worker panicked while shutting down".to_owned())
+    }
+
     /// ดึงเหตุการณ์ STT ที่รออยู่ทั้งหมดเพื่อให้ตัวทำงานหลักประมวลผลเป็นชุด
     pub fn drain_events(&self) -> Vec<SttEvent> {
         self.events.drain()
@@ -185,7 +198,7 @@ pub fn spawn_service(input: LatestQueue<MixedAudioChunk>) -> SttService {
     let worker_events = events.clone();
     let audio_generation = Arc::new(AtomicU64::new(0));
     let worker_generation = Arc::clone(&audio_generation);
-    thread::Builder::new()
+    let worker = thread::Builder::new()
         .name("whisper-stt".to_owned())
         .spawn(move || run_worker(input, command_receiver, worker_events, worker_generation))
         .expect("failed to spawn STT worker");
@@ -194,6 +207,7 @@ pub fn spawn_service(input: LatestQueue<MixedAudioChunk>) -> SttService {
         commands,
         events,
         audio_generation,
+        worker: Some(worker),
     }
 }
 
@@ -710,7 +724,8 @@ pub(crate) fn normalize_hypothesis_text(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_hypothesis_text;
+    use super::{normalize_hypothesis_text, spawn_service};
+    use crate::audio::LatestQueue;
 
     #[test]
     fn blank_audio_marker_is_removed_before_reconciliation() {
@@ -724,5 +739,13 @@ mod tests {
             normalize_hypothesis_text("hello[BlAnK_aUdIo]there"),
             "hello there"
         );
+    }
+
+    #[test]
+    fn idle_stt_worker_can_be_joined_idempotently() {
+        let mut service = spawn_service(LatestQueue::new(1));
+
+        assert!(service.finish().is_ok());
+        assert!(service.finish().is_ok());
     }
 }
