@@ -7,6 +7,8 @@ pub enum AppCommand {
     StartSubtitles,
     /// ปิดการจับเสียงและถอดเสียง
     StopSubtitles,
+    /// เริ่ม pipeline ใหม่หลังพบข้อผิดพลาด โดยคงการเลือกแหล่งเสียงเดิม
+    RetryPipeline,
     /// กำหนดว่าการปิดหน้าต่างตั้งค่าต้องซ่อนหน้าต่างเท่านั้นหรือไม่
     SetKeepRunningWhenClosed(bool),
     /// เปลี่ยนระยะเสียงใหม่ขั้นต่ำก่อนเรียก Whisper รอบถัดไป

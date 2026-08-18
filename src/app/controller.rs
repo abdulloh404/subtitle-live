@@ -248,6 +248,11 @@ impl ApplicationController {
                 self.state = ApplicationState::Stopped;
                 AppEvent::StateChanged(self.state)
             }
+            AppCommand::RetryPipeline => {
+                self.config.general.live_subtitles = true;
+                self.state = ApplicationState::Starting;
+                AppEvent::StateChanged(self.state)
+            }
             AppCommand::SetKeepRunningWhenClosed(enabled) => {
                 self.config.general.keep_running_when_closed = enabled;
                 AppEvent::ConfigChanged("general.keep_running_when_closed")
@@ -427,4 +432,36 @@ fn application_keys_equal(left: &ApplicationKey, right: &ApplicationKey) -> bool
 /// คืนข้อความที่ไม่ว่างและตัดค่าที่มีแต่ช่องว่างออก
 fn non_empty(value: &Option<String>) -> Option<&str> {
     value.as_deref().filter(|value| !value.trim().is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        app::{AppCommand, AppEvent, ApplicationController, ApplicationState},
+        config::{AppConfig, ApplicationRule},
+    };
+
+    #[test]
+    fn retry_pipeline_keeps_audio_source_selection() {
+        let mut config = AppConfig::default();
+        config.audio.rules.push(ApplicationRule {
+            enabled: true,
+            application_id: Some("org.example.Player".to_owned()),
+            process_binary: None,
+            application_name: Some("Player".to_owned()),
+            streams: Vec::new(),
+        });
+        let expected_rules = config.audio.rules.clone();
+        let mut controller = ApplicationController::new(config);
+        controller.set_state(ApplicationState::Error);
+
+        let event = controller.handle_command(AppCommand::RetryPipeline);
+
+        assert_eq!(
+            event,
+            AppEvent::StateChanged(ApplicationState::Starting)
+        );
+        assert!(controller.config().general.live_subtitles);
+        assert_eq!(controller.config().audio.rules, expected_rules);
+    }
 }

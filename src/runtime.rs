@@ -93,6 +93,8 @@ pub struct ApplicationRuntime {
     metrics: LatencyTracker,
     running_requested: bool,
     stt_ready: bool,
+    // ใช้ข้าม Stopped ที่เกิดจากคำสั่งหยุดโดยตั้งใจก่อนเริ่ม retry เท่านั้น
+    retry_stop_pending: bool,
     pipeline_error: Option<String>,
     // เป็น true หลัง registry ส่ง snapshot ครั้งแรก จึงไม่รายงาน Connected ก่อนเชื่อมจริง
     pipewire_connected: bool,
@@ -164,6 +166,7 @@ impl ApplicationRuntime {
             metrics: LatencyTracker::default(),
             running_requested: false,
             stt_ready: false,
+            retry_stop_pending: false,
             pipeline_error: None,
             pipewire_connected: false,
             pipewire_error: None,
@@ -293,6 +296,13 @@ impl ApplicationRuntime {
                         .borrow_mut()
                         .handle_command(AppCommand::StopSubtitles);
                 }
+                TrayCommand::RetryPipeline => {
+                    let _ = self
+                        .controller
+                        .borrow_mut()
+                        .handle_command(AppCommand::RetryPipeline);
+                    self.retry_pipeline(update);
+                }
                 TrayCommand::ShowSettings => update.show_settings = true,
                 TrayCommand::Quit => update.quit_requested = true,
             }
@@ -359,6 +369,27 @@ impl ApplicationRuntime {
         } else {
             ApplicationState::Starting
         });
+    }
+
+    /// ทิ้ง session ที่เสีย เริ่ม generation ใหม่ แล้วเข้าทางเริ่ม pipeline ปกติอีกครั้ง
+    fn retry_pipeline(&mut self, update: &mut RuntimeUpdate) {
+        // ทิ้ง event เก่าก่อนส่ง Stop เพื่อไม่ลบ Stopped ที่ใช้ยืนยันคำสั่ง retry รอบนี้
+        let _ = self.pipewire.drain_events();
+        let _ = self.stt.drain_events();
+        let _ = self.pipewire.stop_capture();
+        self.stt.stop();
+        self.retry_stop_pending = true;
+        self.source_audio.clear_reliable();
+        self.mixed_audio.clear_reliable();
+        self.pipeline_audio_generation = self
+            .pipeline_audio_generation
+            .saturating_add(1)
+            .max(1);
+        self.mixer.reset(self.pipeline_audio_generation);
+        self.running_requested = true;
+        self.pipewire_error = None;
+        self.start_pipeline();
+        update.hide_overlay = true;
     }
 
     /// หยุด capture/STT และล้างเสียงกับ transcript ที่อาจค้างจาก session เดิม
@@ -531,6 +562,9 @@ impl ApplicationRuntime {
                     self.pipeline_error = Some(error);
                     self.set_state(ApplicationState::Error);
                     update.hide_overlay = true;
+                }
+                SttEvent::Stopped if self.retry_stop_pending => {
+                    self.retry_stop_pending = false;
                 }
                 SttEvent::Stopped if self.running_requested && self.pipeline_error.is_none() => {
                     self.stt_ready = false;
