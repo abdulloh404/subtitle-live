@@ -2,7 +2,7 @@
 
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     rc::Rc,
     sync::mpsc::Receiver,
@@ -32,6 +32,8 @@ const MIX_FRAME_DURATION_MS: usize = 20;
 const INFERENCE_HEADROOM_MS: usize = 2_000;
 // เมื่อไม่มีผลถอดเสียงใหม่เกินช่วงนี้ ให้ล้างบริบทเก่าและซ่อน overlay
 const SUBTITLE_IDLE_TIMEOUT: Duration = Duration::from_secs(4);
+// จำกัด correlation ที่รอ overlay ตอบกลับ เพราะ frame เก่าอาจถูก mailbox แทนที่และไม่มี acknowledgment
+const MAX_PENDING_OVERLAY_FRAMES: usize = 64;
 
 /// ชุดการเปลี่ยนแปลงที่ GTK main thread ต้องนำไปใช้หลังจบรอบ poll หนึ่งครั้ง
 #[derive(Debug, Default)]
@@ -55,6 +57,8 @@ pub struct SubtitleFrame {
     pub text: String,
     /// ระบุว่า Whisper ยืนยัน segment นี้แล้วหรือยังเป็น partial
     pub is_final: bool,
+    /// เวลาเริ่มของ audio step ที่สร้างข้อความ สำหรับวัดจน overlay วาดเสร็จ
+    pub audio_origin_at: Instant,
 }
 
 /// เจ้าของ lifecycle ของบริการเสียง, STT, tray, config และสถานะ transcript
@@ -91,6 +95,8 @@ pub struct ApplicationRuntime {
     transcript: TranscriptReconciler,
     last_subtitle_update: Option<Instant>,
     metrics: LatencyTracker,
+    // จับคู่ frame id ของ IPC กับต้นทางเสียง โดยเก็บจำนวนคงที่เพื่อรองรับ frame ที่ถูก coalesce
+    pending_overlay_frames: VecDeque<(u64, i64)>,
     running_requested: bool,
     stt_ready: bool,
     // เลขคำขอ retry ที่ runtime ประมวลผลแล้ว ป้องกันการเริ่มซ้ำในแต่ละรอบ poll
@@ -167,6 +173,7 @@ impl ApplicationRuntime {
             transcript: TranscriptReconciler::default(),
             last_subtitle_update: None,
             metrics: LatencyTracker::default(),
+            pending_overlay_frames: VecDeque::new(),
             running_requested: false,
             stt_ready: false,
             observed_retry_generation,
@@ -237,6 +244,37 @@ impl ApplicationRuntime {
         )
     }
 
+    /// ผูก frame ที่ส่งเข้า overlay IPC กับเวลาเริ่ม audio step ต้นทาง
+    pub fn track_overlay_frame(&mut self, frame_id: u64, audio_origin_micros: i64) {
+        if self.pending_overlay_frames.len() == MAX_PENDING_OVERLAY_FRAMES {
+            self.pending_overlay_frames.pop_front();
+        }
+        self.pending_overlay_frames
+            .push_back((frame_id, audio_origin_micros));
+    }
+
+    /// บันทึก End-to-End เมื่อ helper ยืนยันว่า GTK ผ่านรอบวาดของ frame แล้ว
+    pub fn record_overlay_rendered(&mut self, frame_id: u64, rendered_at_micros: i64) {
+        let Some(position) = self
+            .pending_overlay_frames
+            .iter()
+            .position(|(pending_id, _)| *pending_id == frame_id)
+        else {
+            return;
+        };
+        let audio_origin_micros = self.pending_overlay_frames[position].1;
+        self.pending_overlay_frames.drain(..=position);
+        let Some(duration) = monotonic_duration(audio_origin_micros, rendered_at_micros) else {
+            return;
+        };
+        self.metrics.record_end_to_end(duration);
+    }
+
+    /// ล้าง frame ที่ไม่มีทางถูกวาดแล้วเมื่อ overlay ถูกซ่อนหรือ transport ล้มเหลว
+    pub fn clear_pending_overlay_frames(&mut self) {
+        self.pending_overlay_frames.clear();
+    }
+
     /// คืน model path ที่ผู้ใช้กำหนด หรือ path เริ่มต้นเมื่อไม่ได้ override
     pub fn model_path(&self) -> PathBuf {
         self.controller
@@ -263,6 +301,7 @@ impl ApplicationRuntime {
         let _ = self.pipewire.stop_capture();
         self.source_audio.clear_reliable();
         self.mixed_audio.clear_reliable();
+        self.pending_overlay_frames.clear();
         let _ = self.pipewire.shutdown();
         self.stt.stop();
         self.stt.shutdown();
@@ -545,6 +584,7 @@ impl ApplicationRuntime {
                 }
                 SttEvent::Transcript {
                     audio_generation,
+                    audio_origin_at,
                     update: transcript,
                 }
                     if self.running_requested
@@ -559,18 +599,20 @@ impl ApplicationRuntime {
                         update.subtitle = Some(SubtitleFrame {
                             text: self.transcript.presentation_text().to_owned(),
                             is_final,
+                            audio_origin_at,
                         });
                     }
                 }
                 SttEvent::Metrics {
                     audio_generation,
+                    audio_buffer_duration,
                     inference_duration,
-                    approximate_total,
                 } if self.running_requested
                     && !self.capture_transition_pending
                     && self.accepted_audio_generation == Some(audio_generation) =>
                 {
-                    self.metrics.record(inference_duration, approximate_total);
+                    self.metrics
+                        .record_stt(audio_buffer_duration, inference_duration);
                 }
                 SttEvent::Error(error) if self.running_requested => {
                     self.stt_ready = false;
@@ -780,4 +822,28 @@ fn mixed_queue_capacity(window_ms: u32) -> usize {
         .unwrap_or(3_000)
         .saturating_add(INFERENCE_HEADROOM_MS);
     retained_ms.div_ceil(MIX_FRAME_DURATION_MS).clamp(64, 2_000)
+}
+
+/// แปลง timestamp monotonic จาก main/helper เป็น duration โดยปฏิเสธลำดับเวลาที่ผิด
+fn monotonic_duration(origin_micros: i64, rendered_micros: i64) -> Option<Duration> {
+    rendered_micros
+        .checked_sub(origin_micros)
+        .and_then(|duration| u64::try_from(duration).ok())
+        .map(Duration::from_micros)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::monotonic_duration;
+
+    #[test]
+    fn rendered_timestamp_produces_end_to_end_duration() {
+        assert_eq!(
+            monotonic_duration(1_000_000, 1_275_000),
+            Some(Duration::from_millis(275))
+        );
+        assert_eq!(monotonic_duration(2_000, 1_000), None);
+    }
 }

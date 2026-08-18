@@ -55,8 +55,9 @@ pub struct SettingsPresenter {
     /// สาเหตุที่ helper ยังไม่พร้อมหรือใช้งานไม่ได้
     overlay_status_label: gtk::Label,
     audio_buffer_label: gtk::Label,
-    inference_label: gtk::Label,
-    total_label: gtk::Label,
+    whisper_label: gtk::Label,
+    end_to_end_label: gtk::Label,
+    dropped_frames_label: gtk::Label,
 }
 
 impl SettingsPresenter {
@@ -88,8 +89,9 @@ impl SettingsPresenter {
         let error_label = value_label("None");
         let model_path_label = value_label("Not configured");
         let audio_buffer_label = value_label("Not available");
-        let inference_label = value_label("Not available");
-        let total_label = value_label("Not available");
+        let whisper_label = value_label("Not available");
+        let end_to_end_label = value_label("Not available");
+        let dropped_frames_label = value_label("Source 0 · Mixed 0");
         let pipewire_status_label = value_label("Starting");
         let overlay_starting = backend_info.overlay_backend != OverlayRuntimeBackend::Unavailable;
         let subtitle_backend_label = value_label(if overlay_starting {
@@ -152,8 +154,9 @@ impl SettingsPresenter {
             &status_label,
             &error_label,
             &audio_buffer_label,
-            &inference_label,
-            &total_label,
+            &whisper_label,
+            &end_to_end_label,
+            &dropped_frames_label,
         ));
         window.add(&about_page(
             &snapshot,
@@ -196,8 +199,9 @@ impl SettingsPresenter {
             xwayland_available_label,
             overlay_status_label,
             audio_buffer_label,
-            inference_label,
-            total_label,
+            whisper_label,
+            end_to_end_label,
+            dropped_frames_label,
         }
     }
 
@@ -223,19 +227,24 @@ impl SettingsPresenter {
 
     /// แสดง snapshot latency ล่าสุดโดยไม่เก็บประวัติซ้ำในชั้น UI
     pub fn update_metrics(&self, metrics: MetricsSnapshot) {
-        self.audio_buffer_label.set_label(&format_dropped(
+        self.audio_buffer_label.set_label(&format_metric(
+            metrics.audio_buffer_latest,
+            metrics.audio_buffer_p50,
+            metrics.audio_buffer_p95,
+        ));
+        self.whisper_label.set_label(&format_metric(
+            metrics.whisper_latest,
+            metrics.whisper_p50,
+            metrics.whisper_p95,
+        ));
+        self.end_to_end_label.set_label(&format_metric(
+            metrics.end_to_end_latest,
+            metrics.end_to_end_p50,
+            metrics.end_to_end_p95,
+        ));
+        self.dropped_frames_label.set_label(&format_dropped(
             metrics.source_queue_dropped,
             metrics.mixed_queue_dropped,
-        ));
-        self.inference_label.set_label(&format_metric(
-            metrics.inference_latest,
-            metrics.inference_p50,
-            metrics.inference_p95,
-        ));
-        self.total_label.set_label(&format_metric(
-            metrics.total_latest,
-            metrics.total_p50,
-            metrics.total_p95,
         ));
     }
 
@@ -736,8 +745,9 @@ fn performance_page(
     status_label: &gtk::Label,
     error_label: &gtk::Label,
     audio_buffer_label: &gtk::Label,
-    inference_label: &gtk::Label,
-    total_label: &gtk::Label,
+    whisper_label: &gtk::Label,
+    end_to_end_label: &gtk::Label,
+    dropped_frames_label: &gtk::Label,
 ) -> adw::PreferencesPage {
     let page = preferences_page("Performance", "utilities-system-monitor-symbolic");
     let status_group = adw::PreferencesGroup::builder().title("Pipeline").build();
@@ -755,9 +765,13 @@ fn performance_page(
         false,
     );
     metrics_group.add(&metrics_row);
-    metrics_group.add(&value_row_with_label("Audio Queues", audio_buffer_label));
-    metrics_group.add(&value_row_with_label("STT Inference", inference_label));
-    metrics_group.add(&value_row_with_label("Approximate Total", total_label));
+    metrics_group.add(&value_row_with_label("Audio Buffer", audio_buffer_label));
+    metrics_group.add(&value_row_with_label("Whisper Inference", whisper_label));
+    metrics_group.add(&value_row_with_label("End-to-End", end_to_end_label));
+    metrics_group.add(&value_row_with_label(
+        "Dropped Frames",
+        dropped_frames_label,
+    ));
     page.add(&metrics_group);
     page
 }
@@ -906,7 +920,7 @@ fn message_row(title: &str, subtitle: &str) -> adw::ActionRow {
 fn format_metric(latest: Option<Duration>, p50: Option<Duration>, p95: Option<Duration>) -> String {
     match (latest, p50, p95) {
         (Some(latest), Some(p50), Some(p95)) => format!(
-            "latest {} · p50 {} · p95 {}",
+            "Latest {} · P50 {} · P95 {}",
             duration_ms(latest),
             duration_ms(p50),
             duration_ms(p95)
@@ -917,7 +931,7 @@ fn format_metric(latest: Option<Duration>, p50: Option<Duration>, p95: Option<Du
 
 /// สรุปจำนวน audio frame ที่ถูกทิ้งจากคิวแต่ละช่วง
 fn format_dropped(source: u64, mixed: u64) -> String {
-    format!("dropped source {source} · mixed {mixed}")
+    format!("Source {source} · Mixed {mixed}")
 }
 
 /// แปลง duration เป็นข้อความ millisecond

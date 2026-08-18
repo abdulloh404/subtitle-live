@@ -17,6 +17,10 @@ use super::x11::{configure_overlay_window, is_x11_window};
 const FINAL_HOLD_TIME: Duration = Duration::from_secs(4);
 // พื้นหลังเว้นซ้ายและขวาข้างละ 20 พิกเซล จึงต้องหักออกก่อนวัดข้อความ
 const CAPTION_HORIZONTAL_PADDING_PX: u32 = 40;
+/// callback หนึ่งครั้งที่รอให้ GTK ผ่านช่วง paint
+type PaintCallback = Box<dyn FnOnce()>;
+/// ช่อง callback ล่าสุดที่ใช้ร่วมกันระหว่าง presenter กับ frame clock
+type PendingPaintCallback = Rc<RefCell<Option<PaintCallback>>>;
 
 /// เจ้าของ GTK widget ทั้งหมดของ overlay ซึ่งต้องเรียกจาก GTK main thread
 pub struct OverlayPresenter {
@@ -30,6 +34,10 @@ pub struct OverlayPresenter {
     enabled: Cell<bool>,
     /// token สำหรับยกเลิก timeout ของ final frame รุ่นเก่า
     generation: Rc<Cell<u64>>,
+    /// callback ล่าสุดที่ต้องตอบหลัง paint โดย frame ใหม่จะแทน frame เก่าเสมอ
+    pending_after_paint: PendingPaintCallback,
+    /// ป้องกันการสร้าง tick/after-paint handler มากกว่าหนึ่งชุดพร้อมกัน
+    after_paint_scheduled: Rc<Cell<bool>>,
     /// ระบุว่า renderer ใช้ X11/XWayland และต้องคง toplevel ไว้เพื่อรักษา stack
     is_x11: Rc<Cell<bool>>,
     /// label ที่รับเฉพาะ plain text ไม่ตีความ markup
@@ -125,6 +133,8 @@ impl OverlayPresenter {
             line_buffer: RefCell::new(CaptionLineBuffer::default()),
             enabled: Cell::new(false),
             generation: Rc::new(Cell::new(0)),
+            pending_after_paint: Rc::new(RefCell::new(None)),
+            after_paint_scheduled: Rc::new(Cell::new(false)),
             is_x11,
             label,
             last_text: RefCell::new(String::new()),
@@ -136,18 +146,18 @@ impl OverlayPresenter {
     }
 
     /// จัดรูปแบบและแสดง transcript frame
-    pub fn show_text(&self, text: &str, is_final: bool) {
+    pub fn show_text(&self, text: &str, is_final: bool) -> bool {
         if !self.enabled.get() {
-            return;
+            return false;
         }
         let source_text = text.trim();
         if source_text.is_empty() {
-            return;
+            return false;
         }
         let config = self.applied_config.borrow().clone().unwrap_or_default();
         let text = self.format_caption(source_text, &config);
         if text.is_empty() {
-            return;
+            return false;
         }
 
         self.label.set_label(&text);
@@ -176,10 +186,50 @@ impl OverlayPresenter {
                 }
             });
         }
+        true
+    }
+
+    /// เรียก callback หนึ่งครั้งหลัง frame clock ผ่านช่วง paint ถัดไปของ overlay
+    pub fn after_next_paint<F>(&self, callback: F)
+    where
+        F: FnOnce() + 'static,
+    {
+        self.pending_after_paint
+            .replace(Some(Box::new(callback)));
+        self.window.queue_draw();
+        if self.after_paint_scheduled.replace(true) {
+            return;
+        }
+
+        let pending_after_paint = Rc::clone(&self.pending_after_paint);
+        let after_paint_scheduled = Rc::clone(&self.after_paint_scheduled);
+        self.window.add_tick_callback(move |_, frame_clock| {
+            let pending_after_paint = Rc::clone(&pending_after_paint);
+            let after_paint_scheduled = Rc::clone(&after_paint_scheduled);
+            let handler_slot = Rc::new(RefCell::new(None));
+            let handler_slot_for_signal = Rc::clone(&handler_slot);
+            let handler_id = frame_clock.connect_after_paint(move |frame_clock| {
+                if let Some(handler_id) = handler_slot_for_signal.borrow_mut().take() {
+                    frame_clock.disconnect(handler_id);
+                }
+                after_paint_scheduled.set(false);
+                if let Some(callback) = pending_after_paint.borrow_mut().take() {
+                    callback();
+                }
+            });
+            handler_slot.replace(Some(handler_id));
+            glib::ControlFlow::Break
+        });
+    }
+
+    /// ยกเลิก acknowledgment ที่ยังไม่ผ่าน paint เมื่อข้อความถูกซ่อน
+    pub fn cancel_pending_paint(&self) {
+        self.pending_after_paint.borrow_mut().take();
     }
 
     /// ล้างข้อความ โดยคง X11 toplevel ไว้เพื่อไม่ให้ Mutter จัดชั้นใหม่
     pub fn hide(&self) {
+        self.cancel_pending_paint();
         self.generation.set(self.generation.get().wrapping_add(1));
         self.label.set_label("");
         self.surface.set_visible(false);

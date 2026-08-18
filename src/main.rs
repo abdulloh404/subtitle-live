@@ -1,6 +1,6 @@
 //! จุดเริ่มต้นของแอป GTK และสะพานส่ง event จาก runtime ไปยังหน้าต่าง Settings/Overlay
 
-use std::{cell::RefCell, rc::Rc, time::Duration};
+use std::{cell::RefCell, rc::Rc, time::{Duration, Instant}};
 
 use adw::prelude::*;
 use gtk::glib;
@@ -33,6 +33,12 @@ enum DesktopOverlay {
     Unavailable,
 }
 
+/// ข้อมูลจับคู่ frame กับนาฬิกา monotonic ก่อนส่งเข้า IPC
+struct OverlayFrameSubmission {
+    frame_id: u64,
+    audio_origin_micros: i64,
+}
+
 impl DesktopOverlay {
     /// นำค่ารูปลักษณ์ไปใช้กับ renderer ที่พร้อมใช้งาน
     fn apply_config(&self, config: &config::SubtitleConfig) {
@@ -43,12 +49,29 @@ impl DesktopOverlay {
     }
 
     /// แสดง subtitle โดย helper รับเฉพาะข้อความที่ runtime จัดการแล้ว
-    fn show_text(&self, text: &str, is_final: bool) {
+    fn show_text(
+        &self,
+        text: &str,
+        is_final: bool,
+        audio_origin_at: Instant,
+    ) -> Option<OverlayFrameSubmission> {
         match self {
             Self::Helper(client) => {
-                client.show_text(text, is_final);
+                let now = Instant::now();
+                let submitted_at_micros = glib::monotonic_time();
+                let audio_age_micros = i64::try_from(
+                    now.saturating_duration_since(audio_origin_at).as_micros(),
+                )
+                .unwrap_or(i64::MAX);
+                client
+                    .show_text(text, is_final)
+                    .map(|frame_id| OverlayFrameSubmission {
+                        frame_id,
+                        audio_origin_micros: submitted_at_micros
+                            .saturating_sub(audio_age_micros),
+                    })
             }
-            Self::Unavailable => {}
+            Self::Unavailable => None,
         }
     }
 
@@ -61,11 +84,12 @@ impl DesktopOverlay {
     }
 
     /// รับสถานะ helper แบบไม่ block และบันทึกเฉพาะ lifecycle/error
-    fn poll_events(&self) {
+    fn poll_events(&self) -> Vec<OverlayEvent> {
         let Self::Helper(client) = self else {
-            return;
+            return Vec::new();
         };
-        for event in client.drain_events() {
+        let events = client.drain_events();
+        for event in &events {
             match event {
                 OverlayEvent::Ready => tracing::info!(
                     overlay_backend = client.backend().as_str(),
@@ -79,6 +103,7 @@ impl DesktopOverlay {
                 OverlayEvent::Pong { .. } | OverlayEvent::Rendered { .. } => {}
             }
         }
+        events
     }
 
     /// คืนสถานะ renderer ล่าสุดสำหรับหน้า About
@@ -322,7 +347,25 @@ fn install_runtime_poll(
             desktop.settings.update_state(state, last_error.as_deref());
             desktop.settings.update_metrics(metrics);
             desktop.settings.update_pipewire_status(pipewire_status);
-            desktop.overlay.poll_events();
+            let overlay_events = desktop.overlay.poll_events();
+            {
+                let mut runtime = runtime.borrow_mut();
+                let runtime = runtime
+                    .as_mut()
+                    .expect("primary application runtime was not initialized");
+                for event in &overlay_events {
+                    match event {
+                        OverlayEvent::Rendered {
+                            frame_id,
+                            rendered_at_micros,
+                        } => {
+                            runtime.record_overlay_rendered(*frame_id, *rendered_at_micros);
+                        }
+                        OverlayEvent::Error { .. } => runtime.clear_pending_overlay_frames(),
+                        OverlayEvent::Ready | OverlayEvent::Pong { .. } => {}
+                    }
+                }
+            }
             let overlay_error = desktop.overlay.last_error();
             desktop.settings.update_overlay_status(
                 desktop_session,
@@ -333,9 +376,25 @@ fn install_runtime_poll(
             desktop.overlay.apply_config(&subtitle_config);
             if update.hide_overlay {
                 desktop.overlay.hide();
+                if let Some(runtime) = runtime.borrow_mut().as_mut() {
+                    runtime.clear_pending_overlay_frames();
+                }
             }
             if let Some(subtitle) = update.subtitle {
-                desktop.overlay.show_text(&subtitle.text, subtitle.is_final);
+                if let Some(submission) = desktop
+                    .overlay
+                    .show_text(
+                        &subtitle.text,
+                        subtitle.is_final,
+                        subtitle.audio_origin_at,
+                    )
+                    && let Some(runtime) = runtime.borrow_mut().as_mut()
+                {
+                    runtime.track_overlay_frame(
+                        submission.frame_id,
+                        submission.audio_origin_micros,
+                    );
+                }
             }
             if update.show_settings {
                 desktop.settings.present();

@@ -53,10 +53,12 @@ pub enum OverlayEvent {
         /// ค่าอ้างอิงจากคำสั่ง Ping
         nonce: u64,
     },
-    /// GTK renderer นำข้อความของ frame นี้ไปใช้แล้ว
+    /// GTK frame clock ผ่านช่วง paint หลังนำข้อความของ frame นี้ไปใช้แล้ว
     Rendered {
         /// รหัส frame จากคำสั่ง ShowText
         frame_id: u64,
+        /// เวลา monotonic ของ GLib เมื่อ helper ผ่านช่วง paint ใช้ร่วมกันได้บนเครื่องเดียวกัน
+        rendered_at_micros: i64,
     },
     /// Helper พบข้อผิดพลาดที่ main process ควรแสดงแก่ผู้ใช้
     Error {
@@ -203,7 +205,10 @@ mod tests {
         let command = OverlayCommand::ApplyConfig {
             config: SubtitleConfig::default(),
         };
-        let event = OverlayEvent::Rendered { frame_id: 99 };
+        let event = OverlayEvent::Rendered {
+            frame_id: 99,
+            rendered_at_micros: 123_456,
+        };
         let mut command_bytes = Vec::new();
         let mut event_bytes = Vec::new();
 

@@ -96,6 +96,8 @@ pub enum SttEvent {
     Transcript {
         /// รุ่นเสียงที่ใช้สร้างข้อความนี้
         audio_generation: u64,
+        /// เวลาเริ่มของเสียงใหม่ชุดที่ทำให้เกิดสมมติฐานนี้
+        audio_origin_at: Instant,
         /// ผลการถอดเสียงพร้อมรหัสช่วง
         update: TranscriptUpdate,
     },
@@ -103,10 +105,10 @@ pub enum SttEvent {
     Metrics {
         /// รุ่นเสียงที่ตรงกับรอบอนุมานนี้
         audio_generation: u64,
+        /// เวลาจากต้น audio step จนเริ่มเรียก Whisper
+        audio_buffer_duration: Duration,
         /// เวลาที่ใช้เฉพาะใน Whisper
         inference_duration: Duration,
-        /// เวลารวมโดยประมาณตั้งแต่ปลายเสียงล่าสุดจนสร้างผล STT เสร็จ
-        approximate_total: Duration,
     },
     /// เวิร์กเกอร์ไม่มีเซสชัน Whisper ที่กำลังทำงาน
     Stopped,
@@ -292,13 +294,14 @@ fn run_worker(
                 if let Some(update) = result.update {
                     events.push_latest(SttEvent::Transcript {
                         audio_generation: current_audio_generation,
+                        audio_origin_at: result.audio_origin_at,
                         update,
                     });
                 }
                 events.push_latest(SttEvent::Metrics {
                     audio_generation: current_audio_generation,
+                    audio_buffer_duration: result.audio_buffer_duration,
                     inference_duration: result.inference_duration,
-                    approximate_total: result.approximate_total,
                 });
             }
             Ok(None) => {}
@@ -358,8 +361,8 @@ struct ActiveStt {
     step_samples: usize,
     /// จำนวนตัวอย่างใหม่ที่สะสมตั้งแต่การอนุมานครั้งก่อน
     samples_since_inference: usize,
-    /// เวลาสิ้นสุดโดยประมาณของชิ้นเสียงล่าสุด ใช้ประเมินค่าหน่วงเวลารวม
-    latest_audio_at: Option<Instant>,
+    /// เวลาเริ่มของเสียงใหม่ที่กำลังสะสมจนครบหนึ่ง audio step
+    pending_audio_started_at: Option<Instant>,
     /// ตัวนับการทิ้งข้อมูลล่าสุดที่เห็น ใช้ตรวจจับช่วงเสียงขาดตอน
     observed_dropped: u64,
     /// รหัสช่วงคำพูดปัจจุบัน เพิ่มเมื่อยืนยันผลหรือเสียงขาดตอน
@@ -376,10 +379,12 @@ struct ActiveStt {
 struct InferenceResult {
     /// เหตุการณ์ข้อความถ้ามีคำพูดที่ใช้งานได้ในรอบนี้
     update: Option<TranscriptUpdate>,
+    /// เวลาเริ่มของเสียงใหม่ชุดที่ทำให้เกิด inference รอบนี้
+    audio_origin_at: Instant,
+    /// เวลาตั้งแต่เริ่มรับเสียงใหม่จนเริ่ม inference รวมการสะสมหนึ่ง audio step
+    audio_buffer_duration: Duration,
     /// เวลาที่ใช้เรียก Whisper โดยไม่รวมการรอเสียง
     inference_duration: Duration,
-    /// เวลารวมโดยประมาณตั้งแต่ปลายเสียงล่าสุดจนสร้างผล STT เสร็จ
-    approximate_total: Duration,
 }
 
 impl ActiveStt {
@@ -418,7 +423,7 @@ impl ActiveStt {
             window_samples,
             step_samples,
             samples_since_inference: 0,
-            latest_audio_at: None,
+            pending_audio_started_at: None,
             observed_dropped,
             segment_id: 1,
             previous_hypothesis: String::new(),
@@ -461,9 +466,8 @@ impl ActiveStt {
         }
 
         for chunk in chunks {
-            let sample_duration =
-                Duration::from_secs_f64(chunk.samples.len() as f64 / SAMPLE_RATE_HZ as f64);
-            self.latest_audio_at = Some(chunk.captured_at + sample_duration);
+            self.pending_audio_started_at
+                .get_or_insert(chunk.captured_at);
             self.samples_since_inference = self
                 .samples_since_inference
                 .saturating_add(chunk.samples.len());
@@ -508,6 +512,12 @@ impl ActiveStt {
 
         let inference_segment_id = self.segment_id;
         let whisper_model_started = Instant::now();
+        let audio_origin_at = self
+            .pending_audio_started_at
+            .take()
+            .unwrap_or(whisper_model_started);
+        let audio_buffer_duration =
+            whisper_model_started.saturating_duration_since(audio_origin_at);
         let gpu_backend_started = Instant::now();
         self.state
             .full(params, audio)
@@ -517,10 +527,6 @@ impl ActiveStt {
         let processed_text = normalize_hypothesis_text(&raw_text);
         let update = self.reconcile_hypothesis(processed_text.clone());
         let whisper_model_duration = whisper_model_started.elapsed();
-        let approximate_total = self.latest_audio_at.map_or(gpu_backend_duration, |captured_at| {
-            Instant::now().saturating_duration_since(captured_at)
-        });
-
         tracing::debug!(
             event = "whisper_model_latency",
             segment_id = inference_segment_id,
@@ -552,8 +558,9 @@ impl ActiveStt {
 
         Ok(Some(InferenceResult {
             update,
+            audio_origin_at,
+            audio_buffer_duration,
             inference_duration: gpu_backend_duration,
-            approximate_total,
         }))
     }
 
@@ -593,7 +600,7 @@ impl ActiveStt {
     fn reset_audio(&mut self) {
         self.rolling_audio.clear();
         self.samples_since_inference = 0;
-        self.latest_audio_at = None;
+        self.pending_audio_started_at = None;
     }
 
     /// ล้างทั้งเสียงและสมมติฐานเมื่อแหล่งเสียงหยุด เปลี่ยน หรือมีข้อมูลตกหล่น

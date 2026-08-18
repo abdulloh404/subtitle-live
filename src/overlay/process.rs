@@ -113,8 +113,15 @@ fn install_command_poll(
                     text,
                     is_final,
                 }) => {
-                    presenter.show_text(&text, is_final);
-                    let _ = event_sender.send(OverlayEvent::Rendered { frame_id });
+                    if presenter.show_text(&text, is_final) {
+                        let event_sender = event_sender.clone();
+                        presenter.after_next_paint(move || {
+                            let _ = event_sender.send(OverlayEvent::Rendered {
+                                frame_id,
+                                rendered_at_micros: glib::monotonic_time(),
+                            });
+                        });
+                    }
                 }
                 Ok(OverlayCommand::Hide) => presenter.hide(),
                 Ok(OverlayCommand::ApplyConfig { config }) => presenter.apply_config(&config),

@@ -175,16 +175,16 @@ impl OverlayClient {
         self.last_error.borrow().clone()
     }
 
-    /// ส่ง presentation text และคืน frame id ที่ใช้จับคู่ Rendered event
-    pub fn show_text(&self, text: &str, is_final: bool) -> u64 {
+    /// ส่ง presentation text และคืน frame id เฉพาะเมื่อรับเข้าคิว IPC สำเร็จ
+    pub fn show_text(&self, text: &str, is_final: bool) -> Option<u64> {
         let frame_id = self.next_frame_id.get();
-        self.next_frame_id.set(frame_id.wrapping_add(1));
+        self.next_frame_id.set(frame_id.wrapping_add(1).max(1));
         self.send(OverlayCommand::ShowText {
             frame_id,
             text: text.to_owned(),
             is_final,
-        });
-        frame_id
+        })
+        .then_some(frame_id)
     }
 
     /// ล้าง subtitle โดยไม่ปิด helper หรือ unmap X11 window
