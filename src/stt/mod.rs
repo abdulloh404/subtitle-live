@@ -31,7 +31,7 @@ const STABLE_PASSES_TO_FINAL: u8 = 2;
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 // ระดับ RMS ต่ำกว่านี้ถือเป็นความเงียบและไม่ส่งเข้าโมเดล Whisper
 const SILENCE_RMS_THRESHOLD: f32 = 0.001;
-// เมื่อเปิด VAD จะใช้เกณฑ์สูงขึ้นเพื่อกันเสียงพื้นหลังเบาก่อนถึง Whisper
+// เมื่อเปิดตัวกรองกิจกรรมเสียง จะใช้เกณฑ์ RMS สูงขึ้นเพื่อกันเสียงพลังงานต่ำก่อนถึง Whisper
 const VAD_RMS_THRESHOLD: f32 = 0.003;
 
 /// ค่าที่เปลี่ยนระหว่างทำงานได้โดยไม่ต้องโหลดโมเดล Whisper ใหม่
@@ -41,7 +41,7 @@ pub struct SttStreamingConfig {
     pub step_ms: u32,
     /// ความยาวเสียงย้อนหลังสูงสุดที่ส่งเข้า Whisper
     pub window_ms: u32,
-    /// ใช้ตัวกรองพลังงานเสียงพูดที่เข้มกว่าตัวกรองความเงียบพื้นฐาน
+    /// ใช้เกณฑ์พลังงานเสียง RMS ที่เข้มกว่าตัวกรองความเงียบพื้นฐาน โดยไม่ได้แยกว่าเป็นเสียงพูดหรือไม่
     pub vad_enabled: bool,
 }
 
@@ -56,7 +56,7 @@ pub struct SttStartConfig {
     pub step_ms: u32,
     /// ความยาวเสียงย้อนหลังสูงสุดที่ส่งเข้า Whisper
     pub window_ms: u32,
-    /// ใช้ตัวกรองพลังงานเสียงพูดที่เข้มกว่าตัวกรองความเงียบพื้นฐาน
+    /// ใช้เกณฑ์พลังงานเสียง RMS ที่เข้มกว่าตัวกรองความเงียบพื้นฐาน โดยไม่ได้แยกว่าเป็นเสียงพูดหรือไม่
     pub vad_enabled: bool,
 }
 
@@ -135,7 +135,7 @@ impl SttService {
         let _ = self.commands.send(WorkerCommand::Stop);
     }
 
-    /// เปลี่ยนจังหวะ streaming และ VAD โดยใช้โมเดลเดิมที่โหลดอยู่
+    /// เปลี่ยนจังหวะ streaming และตัวกรองกิจกรรมเสียงโดยใช้โมเดลเดิมที่โหลดอยู่
     pub fn update_streaming(&self, config: SttStreamingConfig) {
         let _ = self.commands.send(WorkerCommand::UpdateStreaming(config));
     }

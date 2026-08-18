@@ -588,8 +588,8 @@ fn speech_recognition_page(
     streaming_group.add(&window_row);
 
     let (vad_row, vad_switch) = switch_row(
-        "Voice Activity Detection",
-        "Use a stronger energy gate before recognition",
+        "Audio Activity Filter",
+        "Skip low-energy audio before recognition; this does not identify speech",
         snapshot.vad_enabled,
         true,
     );

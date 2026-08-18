@@ -295,7 +295,7 @@ pub struct SttConfig {
     pub step_ms: u32,
     /// ความยาวเสียงย้อนหลังสูงสุดที่ใช้เป็น context
     pub window_ms: u32,
-    /// เปิดการตรวจจับช่วงที่มีเสียงพูดก่อนเรียก STT
+    /// เปิดตัวกรองกิจกรรมเสียงด้วยระดับพลังงาน RMS ก่อนเรียก STT
     pub vad_enabled: bool,
 }
 

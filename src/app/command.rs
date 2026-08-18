@@ -15,7 +15,7 @@ pub enum AppCommand {
     SetSttStepMs(u32),
     /// เปลี่ยนความยาวเสียงย้อนหลังที่ส่งเป็นบริบทให้ Whisper
     SetSttWindowMs(u32),
-    /// เปิดหรือปิดตัวกรองพลังงานเสียงพูดก่อนเรียก Whisper
+    /// เปิดหรือปิดตัวกรองเสียงพลังงานต่ำก่อนเรียก Whisper
     SetVadEnabled(bool),
     /// เปิดหรือปิด overlay โดยไม่เปลี่ยนสถานะการถอดเสียง
     SetSubtitleVisible(bool),
