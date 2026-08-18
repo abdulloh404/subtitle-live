@@ -65,7 +65,9 @@ pub fn run_overlay_helper() -> io::Result<()> {
         let _ = event_sender.send(WriterMessage::Event(OverlayEvent::Ready));
     });
 
-    application.run();
+    // ส่งเฉพาะ argv[0] ให้ GApplication เพื่อไม่ให้ flag ภายในอย่าง
+    // `--overlay-helper` ถูก GTK parse ซ้ำแล้วปิด child process
+    application.run_with_args(&["subtitle-live-overlay"]);
     // ยกเลิก async read ก่อนปล่อย GTK จึงไม่มี reader thread ค้างรอ stdin
     cleanup_cancellable.cancel();
     drop(application);
