@@ -231,7 +231,7 @@ fn run_worker(
                 active = None;
                 audio_paused = false;
                 current_audio_generation = 0;
-                input.clear();
+                input.clear_reliable();
                 events.push_latest_reliable(SttEvent::Loading);
                 match ActiveStt::load(config, input.dropped()) {
                     Ok(loaded) => {
@@ -248,11 +248,11 @@ fn run_worker(
                 active = None;
                 audio_paused = false;
                 current_audio_generation = 0;
-                input.clear();
+                input.clear_reliable();
                 events.push_latest_reliable(SttEvent::Stopped);
             }
             CommandState::Command(WorkerCommand::UpdateStreaming(config)) => {
-                input.clear();
+                input.clear_reliable();
                 if let Some(stt) = active.as_mut()
                     && let Err(error) = stt.update_streaming(config)
                 {
@@ -261,13 +261,13 @@ fn run_worker(
             }
             CommandState::Command(WorkerCommand::PauseAudio) => {
                 audio_paused = true;
-                input.clear();
+                input.clear_reliable();
                 if let Some(stt) = active.as_mut() {
                     stt.reset_discontinuity();
                 }
             }
             CommandState::Command(WorkerCommand::ResumeAudio(generation)) => {
-                input.clear();
+                input.clear_reliable();
                 if let Some(stt) = active.as_mut() {
                     stt.reset_discontinuity();
                     audio_paused = false;
@@ -275,7 +275,10 @@ fn run_worker(
                     audio_generation.store(generation, Ordering::Release);
                 }
             }
-            CommandState::Command(WorkerCommand::Shutdown) | CommandState::Disconnected => break,
+            CommandState::Command(WorkerCommand::Shutdown) | CommandState::Disconnected => {
+                input.clear_reliable();
+                break;
+            }
             CommandState::Idle => {}
         }
 
@@ -303,7 +306,7 @@ fn run_worker(
             Ok(None) => {}
             Err(error) => {
                 active = None;
-                input.clear();
+                input.clear_reliable();
                 events.push_latest_reliable(SttEvent::Error(error));
                 events.push_latest_reliable(SttEvent::Stopped);
             }

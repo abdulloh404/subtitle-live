@@ -250,6 +250,8 @@ impl ApplicationRuntime {
         self.shutdown_requested = true;
         self.persist_if_changed();
         let _ = self.pipewire.stop_capture();
+        self.source_audio.clear_reliable();
+        self.mixed_audio.clear_reliable();
         let _ = self.pipewire.shutdown();
         self.stt.stop();
         self.stt.shutdown();
@@ -332,8 +334,8 @@ impl ApplicationRuntime {
         self.stt_resume_generation = None;
         self.accepted_audio_generation = None;
         self.applied_targets.clear();
-        self.source_audio.clear();
-        self.mixed_audio.clear();
+        self.source_audio.clear_reliable();
+        self.mixed_audio.clear_reliable();
         self.mixer.reset();
         self.transcript.clear();
         self.last_subtitle_update = None;
@@ -368,8 +370,8 @@ impl ApplicationRuntime {
         self.stt_resume_generation = None;
         self.accepted_audio_generation = None;
         self.applied_targets.clear();
-        self.source_audio.clear();
-        self.mixed_audio.clear();
+        self.source_audio.clear_reliable();
+        self.mixed_audio.clear_reliable();
         self.mixer.reset();
         self.transcript.clear();
         self.last_subtitle_update = None;
@@ -398,8 +400,8 @@ impl ApplicationRuntime {
         }
 
         self.stt.pause_audio();
-        self.source_audio.clear();
-        self.mixed_audio.clear();
+        self.source_audio.clear_reliable();
+        self.mixed_audio.clear_reliable();
         self.mixer.reset();
         self.transcript.clear();
         self.last_subtitle_update = None;
@@ -428,8 +430,8 @@ impl ApplicationRuntime {
                         && self.current_runtime_is_selected(runtime_id) =>
                 {
                     if self.capture_transition_pending && self.stt_resume_generation.is_none() {
-                        self.source_audio.clear();
-                        self.mixed_audio.clear();
+                        self.source_audio.clear_reliable();
+                        self.mixed_audio.clear_reliable();
                         self.mixer.reset();
                         self.stt_resume_generation = Some(self.stt.resume_audio());
                     }
@@ -584,8 +586,8 @@ impl ApplicationRuntime {
     fn begin_capture_transition(&mut self, update: &mut RuntimeUpdate) {
         let _ = self.pipewire.stop_capture();
         self.stt.pause_audio();
-        self.source_audio.clear();
-        self.mixed_audio.clear();
+        self.source_audio.clear_reliable();
+        self.mixed_audio.clear_reliable();
         self.mixer.reset();
         self.transcript.clear();
         self.last_subtitle_update = None;
@@ -665,8 +667,8 @@ impl ApplicationRuntime {
         self.last_subtitle_update = None;
         self.transcript.clear();
         self.stt.pause_audio();
-        self.source_audio.clear();
-        self.mixed_audio.clear();
+        self.source_audio.clear_reliable();
+        self.mixed_audio.clear_reliable();
         self.mixer.reset();
         self.capture_transition_pending = true;
         self.accepted_audio_generation = None;

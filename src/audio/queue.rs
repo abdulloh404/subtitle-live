@@ -76,11 +76,21 @@ impl<T> LatestQueue<T> {
         values.drain(..).collect()
     }
 
-    /// ล้างข้อมูลในคิวโดยยังรักษาตัวนับจำนวนข้อมูลที่เคยถูกทิ้งไว้
+    /// พยายามล้างข้อมูลโดยไม่รอ mutex สำหรับเส้นทาง real-time ที่ห้ามบล็อก
+    /// และยังรักษาตัวนับจำนวนข้อมูลที่เคยถูกทิ้งไว้
     pub fn clear(&self) {
         if let Ok(mut values) = self.inner.values.try_lock() {
             values.clear();
         }
+    }
+
+    /// ล้างข้อมูลโดยรอ mutex สำหรับผู้เรียกที่ไม่ใช่ real-time และต้องรับประกันว่าคิวว่าง
+    pub fn clear_reliable(&self) {
+        let mut values = match self.inner.values.lock() {
+            Ok(values) => values,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        values.clear();
     }
 
     /// คืนจำนวนข้อมูลสะสมที่สูญหายจาก mutex ไม่ว่างหรือคิวเต็ม
@@ -107,5 +117,67 @@ impl<T> Clone for LatestQueue<T> {
         Self {
             inner: Arc::clone(&self.inner),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::mpsc,
+        thread,
+        time::Duration,
+    };
+
+    use super::LatestQueue;
+
+    #[test]
+    fn clear_does_not_wait_when_queue_is_locked() {
+        let queue = LatestQueue::new(2);
+        queue.push_latest_reliable(1);
+        let holder_queue = queue.clone();
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let holder = thread::spawn(move || {
+            let _values = holder_queue.inner.values.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+
+        locked_rx.recv().unwrap();
+        queue.clear();
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn clear_reliable_waits_for_lock_and_empties_queue() {
+        let queue = LatestQueue::new(2);
+        queue.push_latest_reliable(1);
+        let holder_queue = queue.clone();
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let holder = thread::spawn(move || {
+            let _values = holder_queue.inner.values.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+
+        locked_rx.recv().unwrap();
+        let clearer_queue = queue.clone();
+        let (cleared_tx, cleared_rx) = mpsc::channel();
+        let clearer = thread::spawn(move || {
+            clearer_queue.clear_reliable();
+            cleared_tx.send(()).unwrap();
+        });
+
+        assert!(cleared_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        release_tx.send(()).unwrap();
+        cleared_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        holder.join().unwrap();
+        clearer.join().unwrap();
+
+        assert!(queue.is_empty());
     }
 }
