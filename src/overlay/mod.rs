@@ -4,6 +4,7 @@ mod process;
 mod protocol;
 mod session;
 mod window;
+mod x11;
 
 pub use process::run_overlay_helper;
 pub use protocol::{

@@ -11,6 +11,8 @@ use gtk::{gdk, glib};
 
 use crate::{config::SubtitleConfig, subtitle::CaptionLineBuffer};
 
+use super::x11::{configure_overlay_window, is_x11_window};
+
 /// ระยะเวลาคงข้อความ final ไว้ก่อนซ่อนเมื่อไม่มีข้อความรุ่นใหม่
 const FINAL_HOLD_TIME: Duration = Duration::from_secs(4);
 // พื้นหลังเว้นซ้ายและขวาข้างละ 20 พิกเซล จึงต้องหักออกก่อนวัดข้อความ
@@ -28,6 +30,8 @@ pub struct OverlayPresenter {
     enabled: Cell<bool>,
     /// token สำหรับยกเลิก timeout ของ final frame รุ่นเก่า
     generation: Rc<Cell<u64>>,
+    /// ระบุว่า renderer ใช้ X11/XWayland และต้องคง toplevel ไว้เพื่อรักษา stack
+    is_x11: Rc<Cell<bool>>,
     /// label ที่รับเฉพาะ plain text ไม่ตีความ markup
     label: gtk::Label,
     /// ข้อความต้นทางล่าสุดสำหรับจัดรูปแบบใหม่เมื่อ config เปลี่ยน
@@ -74,10 +78,7 @@ impl OverlayPresenter {
             .valign(gtk::Align::Fill)
             .build();
         root.add_css_class("subtitle-live-overlay-root");
-        let canvas = gtk::Box::builder()
-            .hexpand(true)
-            .vexpand(true)
-            .build();
+        let canvas = gtk::Box::builder().hexpand(true).vexpand(true).build();
         root.set_child(Some(&canvas));
         root.add_overlay(&surface);
 
@@ -93,11 +94,27 @@ impl OverlayPresenter {
             .title("Subtitle-live Overlay")
             .build();
         window.add_css_class("subtitle-live-overlay");
-        window.connect_realize(|window| {
+        let is_x11 = Rc::new(Cell::new(false));
+        let is_x11_for_realize = Rc::clone(&is_x11);
+        window.connect_realize(move |window| {
             if let Some(surface) = window.surface() {
                 // พื้นที่ input ว่างทำให้ overlay ไม่ขวางการคลิกหน้าต่างด้านล่าง
                 let empty_region = gtk::cairo::Region::create();
                 surface.set_input_region(Some(&empty_region));
+            }
+            if is_x11_window(window) {
+                is_x11_for_realize.set(true);
+                configure_x11_or_report(window, false);
+            }
+        });
+        window.connect_map(|window| {
+            // ย้ำ property เฉพาะช่วงเริ่ม map เพราะ GTK อาจเขียน window type ปกติทับ
+            schedule_x11_configuration(window, Duration::from_millis(100));
+            schedule_x11_configuration(window, Duration::from_millis(500));
+        });
+        window.connect_maximized_notify(|window| {
+            if window.is_maximized() {
+                schedule_x11_configuration(window, Duration::from_millis(100));
             }
         });
         window.maximize();
@@ -108,6 +125,7 @@ impl OverlayPresenter {
             line_buffer: RefCell::new(CaptionLineBuffer::default()),
             enabled: Cell::new(false),
             generation: Rc::new(Cell::new(0)),
+            is_x11,
             label,
             last_text: RefCell::new(String::new()),
             surface,
@@ -126,21 +144,19 @@ impl OverlayPresenter {
         if source_text.is_empty() {
             return;
         }
-        let config = self
-            .applied_config
-            .borrow()
-            .clone()
-            .unwrap_or_default();
+        let config = self.applied_config.borrow().clone().unwrap_or_default();
         let text = self.format_caption(source_text, &config);
         if text.is_empty() {
             return;
         }
 
         self.label.set_label(&text);
+        self.surface.set_visible(true);
         self.last_text.replace(source_text.to_owned());
-        // GTK toplevel ปกติขอ always-on-top แบบถาวรบน GNOME Wayland ไม่ได้
-        // จึง present ใหม่ทุก frame เพื่อขอยกหน้าต่างโดยไม่รับ focus หรือ input
-        self.window.present();
+        if !self.window.is_visible() {
+            // map โดยไม่ร้องขอ active window เพื่อไม่แย่ง focus จากเกมหรือวิดีโอ
+            self.window.set_visible(true);
+        }
 
         let next_generation = self.generation.get().wrapping_add(1);
         self.generation.set(next_generation);
@@ -148,23 +164,30 @@ impl OverlayPresenter {
             let generation = Rc::clone(&self.generation);
             let window = self.window.clone();
             let label = self.label.clone();
+            let surface = self.surface.clone();
+            let is_x11 = Rc::clone(&self.is_x11);
             glib::timeout_add_local_once(FINAL_HOLD_TIME, move || {
                 if generation.get() == next_generation {
                     label.set_label("");
-                    window.hide();
+                    surface.set_visible(false);
+                    if !is_x11.get() {
+                        window.hide();
+                    }
                 }
             });
         }
     }
 
-    /// ล้างข้อความและซ่อนหน้าต่าง พร้อมยกเลิก final timeout รุ่นก่อนหน้า
+    /// ล้างข้อความ โดยคง X11 toplevel ไว้เพื่อไม่ให้ Mutter จัดชั้นใหม่
     pub fn hide(&self) {
-        self.generation
-            .set(self.generation.get().wrapping_add(1));
+        self.generation.set(self.generation.get().wrapping_add(1));
         self.label.set_label("");
+        self.surface.set_visible(false);
         self.line_buffer.borrow_mut().clear();
         self.last_text.borrow_mut().clear();
-        self.window.hide();
+        if !self.is_x11.get() {
+            self.window.hide();
+        }
     }
 
     /// เปิดหรือปิดการรับ subtitle frame ของ overlay
@@ -181,11 +204,15 @@ impl OverlayPresenter {
             return;
         }
 
-        let layout_changed = self.applied_config.borrow().as_ref().is_none_or(|previous| {
-            previous.font_size != config.font_size
-                || previous.width_px != config.width_px
-                || previous.max_lines != config.max_lines
-        });
+        let layout_changed = self
+            .applied_config
+            .borrow()
+            .as_ref()
+            .is_none_or(|previous| {
+                previous.font_size != config.font_size
+                    || previous.width_px != config.width_px
+                    || previous.max_lines != config.max_lines
+            });
         self.set_enabled(config.visible);
         apply_position(&self.surface, &config.position);
         apply_text_alignment(&self.label, &config.text_alignment);
@@ -255,4 +282,24 @@ fn apply_text_alignment(label: &gtk::Label, alignment: &str) {
     };
     label.set_justify(justification);
     label.set_xalign(xalign);
+}
+
+/// ตั้ง X11 property หลัง map โดยไม่ raise ซ้ำตาม subtitle frame
+fn schedule_x11_configuration(window: &gtk::Window, delay: Duration) {
+    if !is_x11_window(window) {
+        return;
+    }
+    let window = window.clone();
+    glib::timeout_add_local_once(delay, move || {
+        if window.is_mapped() {
+            configure_x11_or_report(&window, true);
+        }
+    });
+}
+
+/// แสดงเฉพาะข้อผิดพลาดของการตั้งค่า window โดยไม่บันทึกข้อความ subtitle
+fn configure_x11_or_report(window: &gtk::Window, mapped: bool) {
+    if let Err(error) = configure_overlay_window(window, mapped) {
+        eprintln!("ไม่สามารถกำหนด X11 subtitle overlay ได้: {error}");
+    }
 }
