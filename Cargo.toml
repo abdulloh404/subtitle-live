@@ -4,6 +4,7 @@ name = "subtitle-live"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.92"
+default-run = "subtitle-live"
 description = "Local Ubuntu live subtitles for selected PipeWire audio streams"
 publish = false
 
