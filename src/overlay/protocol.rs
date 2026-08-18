@@ -42,12 +42,34 @@ pub enum OverlayCommand {
     },
 }
 
+/// ข้อมูลจอที่ helper ตรวจพบจาก GDK/XWayland และใช้ร่วมกับหน้า Settings
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct OverlayMonitorInfo {
+    /// รหัสภายในที่คงที่ตาม connector หรือ geometry เมื่อไม่มี connector
+    pub id: String,
+    /// ชื่อสำหรับแสดงแก่ผู้ใช้โดยไม่ใช้เป็น identity
+    pub label: String,
+    /// ตำแหน่งแนวนอนใน layout ของ desktop
+    pub x: i32,
+    /// ตำแหน่งแนวตั้งใน layout ของ desktop
+    pub y: i32,
+    /// ความกว้าง logical pixel
+    pub width: i32,
+    /// ความสูง logical pixel
+    pub height: i32,
+}
+
 /// Event ที่ overlay helper ส่งกลับ main process
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OverlayEvent {
     /// Helper เปิด X11 display และพร้อมรับคำสั่งแล้ว
     Ready,
+    /// รายการจอล่าสุดจาก display เดียวกับที่วาด overlay จริง
+    MonitorsChanged {
+        /// จอที่เรียงตามตำแหน่งใน desktop layout แล้ว
+        monitors: Vec<OverlayMonitorInfo>,
+    },
     /// คำตอบของ Ping สำหรับตรวจสุขภาพ process
     Pong {
         /// ค่าอ้างอิงจากคำสั่ง Ping
@@ -157,7 +179,7 @@ where
 mod tests {
     use std::io::{BufReader, Cursor};
 
-    use super::{OverlayCommand, OverlayEvent, read_message, write_message};
+    use super::{OverlayCommand, OverlayEvent, OverlayMonitorInfo, read_message, write_message};
     use crate::config::SubtitleConfig;
 
     #[test]
@@ -225,5 +247,26 @@ mod tests {
                 .expect("event should deserialize"),
             Some(event)
         );
+    }
+
+    #[test]
+    fn monitor_event_round_trip_preserves_helper_identity() {
+        let event = OverlayEvent::MonitorsChanged {
+            monitors: vec![OverlayMonitorInfo {
+                id: "connector:DP-1".to_owned(),
+                label: "Display 1 · DP-1 · 1920×1080".to_owned(),
+                x: 0,
+                y: 0,
+                width: 1_920,
+                height: 1_080,
+            }],
+        };
+        let mut bytes = Vec::new();
+        write_message(&mut bytes, &event).expect("monitor event should serialize");
+
+        let decoded = read_message(&mut BufReader::new(Cursor::new(bytes)))
+            .expect("monitor event should deserialize");
+
+        assert_eq!(decoded, Some(event));
     }
 }

@@ -6,8 +6,8 @@ use x11rb::{
     connection::Connection,
     properties::WmHints,
     protocol::xproto::{
-        Atom, AtomEnum, ClientMessageData, ClientMessageEvent, ConnectionExt as _, EventMask,
-        PropMode, Window,
+        Atom, AtomEnum, ClientMessageData, ClientMessageEvent, ConfigureWindowAux,
+        ConnectionExt as _, EventMask, PropMode, Window,
     },
     wrapper::ConnectionExt as _,
 };
@@ -16,6 +16,10 @@ use x11rb::{
 const NET_WM_STATE_ADD: u32 = 1;
 /// source indication ว่าคำขอมาจาก application
 const NET_WM_STATE_SOURCE_APPLICATION: u32 = 1;
+/// gravity แบบระบุตำแหน่งเทียบ root window โดยตรง
+const STATIC_GRAVITY: u32 = 10;
+/// bit ที่ระบุว่าคำสั่ง move/resize มีค่า x, y, width และ height ครบ
+const NET_MOVERESIZE_ALL_FIELDS: u32 = 0b1111 << 8;
 
 /// ตรวจว่า GTK window นี้ถูกสร้างบน X11 backend
 pub(super) fn is_x11_window(window: &gtk::Window) -> bool {
@@ -100,6 +104,153 @@ pub(super) fn configure_overlay_window(window: &gtk::Window, mapped: bool) -> Re
         .map_err(|error| format!("flush คำสั่ง X11 ไม่สำเร็จ: {error}"))
 }
 
+/// ย้ายหน้าต่าง overlay ไปยัง work area ของจอเป้าหมายผ่าน window manager
+pub(super) fn move_overlay_window(
+    window: &gtk::Window,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> Result<(), String> {
+    let width = u32::try_from(width)
+        .ok()
+        .filter(|width| *width > 0)
+        .ok_or_else(|| format!("ความกว้างจอไม่ถูกต้อง: {width}"))?;
+    let height = u32::try_from(height)
+        .ok()
+        .filter(|height| *height > 0)
+        .ok_or_else(|| format!("ความสูงจอไม่ถูกต้อง: {height}"))?;
+    let surface = window
+        .surface()
+        .ok_or_else(|| "GTK overlay ยังไม่มี GDK surface".to_owned())?;
+    let x11_surface = surface
+        .downcast_ref::<X11Surface>()
+        .ok_or_else(|| "subtitle overlay ไม่ได้ใช้ X11 backend".to_owned())?;
+    let xid =
+        u32::try_from(x11_surface.xid()).map_err(|_| "X11 window id มีขนาดเกิน 32 บิต".to_owned())?;
+    let (connection, screen_index) =
+        x11rb::connect(None).map_err(|error| format!("เชื่อมต่อ X11 display ไม่สำเร็จ: {error}"))?;
+    let root = connection
+        .setup()
+        .roots
+        .get(screen_index)
+        .ok_or_else(|| format!("ไม่พบ X11 screen index {screen_index}"))?
+        .root;
+    let atoms = Atoms::load(&connection)?;
+    let (x, y, width, height) = monitor_workarea(&connection, root, &atoms, (x, y, width, height))
+        .unwrap_or((x, y, width, height));
+
+    if window.is_mapped() {
+        // หน้าต่างที่ map แล้วต้องขอผ่าน window manager; ConfigureWindow ตรง ๆ
+        // อาจถูก Mutter เมินหรือคืน geometry เดิมเมื่อเปลี่ยนจอ
+        let flags =
+            STATIC_GRAVITY | NET_MOVERESIZE_ALL_FIELDS | (NET_WM_STATE_SOURCE_APPLICATION << 12);
+        let event = ClientMessageEvent::new(
+            32,
+            xid,
+            atoms.net_moveresize_window,
+            ClientMessageData::from([
+                flags,
+                u32::from_ne_bytes(x.to_ne_bytes()),
+                u32::from_ne_bytes(y.to_ne_bytes()),
+                width,
+                height,
+            ]),
+        );
+        connection
+            .send_event(
+                false,
+                root,
+                EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+                event,
+            )
+            .map_err(|error| format!("ส่ง EWMH move/resize ไม่สำเร็จ: {error}"))?
+            .check()
+            .map_err(|error| format!("window manager ปฏิเสธการย้าย overlay: {error}"))?;
+    } else {
+        // ก่อน map ยังไม่มี window manager จัดการ จึงวาง geometry เริ่มต้นที่ XID ได้โดยตรง
+        connection
+            .configure_window(
+                xid,
+                &ConfigureWindowAux::new()
+                    .x(x)
+                    .y(y)
+                    .width(width)
+                    .height(height),
+            )
+            .map_err(|error| format!("ส่งคำขอย้าย X11 overlay ไม่สำเร็จ: {error}"))?
+            .check()
+            .map_err(|error| format!("ย้าย X11 overlay ไม่สำเร็จ: {error}"))?;
+    }
+    connection
+        .flush()
+        .map_err(|error| format!("flush คำสั่งย้าย X11 overlay ไม่สำเร็จ: {error}"))
+}
+
+/// อ่าน `_GTK_WORKAREAS_D<n>` ของ Mutter แล้วเลือกพื้นที่ที่ทับกับ monitor เป้าหมายมากที่สุด
+fn monitor_workarea<C: Connection>(
+    connection: &C,
+    root: Window,
+    atoms: &Atoms,
+    monitor: (i32, i32, u32, u32),
+) -> Option<(i32, i32, u32, u32)> {
+    let desktop = connection
+        .get_property(
+            false,
+            root,
+            atoms.net_current_desktop,
+            AtomEnum::CARDINAL,
+            0,
+            1,
+        )
+        .ok()?
+        .reply()
+        .ok()?
+        .value32()?
+        .next()? as usize;
+    let property = intern_atom(connection, format!("_GTK_WORKAREAS_D{desktop}").as_bytes()).ok()?;
+    let reply = connection
+        .get_property(false, root, property, AtomEnum::CARDINAL, 0, u32::MAX)
+        .ok()?
+        .reply()
+        .ok()?;
+    let values = reply.value32()?.collect::<Vec<_>>();
+    values
+        .chunks_exact(4)
+        .filter_map(|values| {
+            let workarea = (
+                i32::from_ne_bytes(values[0].to_ne_bytes()),
+                i32::from_ne_bytes(values[1].to_ne_bytes()),
+                values[2],
+                values[3],
+            );
+            intersect_rectangles(monitor, workarea)
+        })
+        .max_by_key(|area| u64::from(area.2) * u64::from(area.3))
+}
+
+/// คืนพื้นที่ทับซ้อนของ monitor กับ work area โดยใช้ i64 ป้องกันพิกัดล้น
+fn intersect_rectangles(
+    first: (i32, i32, u32, u32),
+    second: (i32, i32, u32, u32),
+) -> Option<(i32, i32, u32, u32)> {
+    let left = i64::from(first.0).max(i64::from(second.0));
+    let top = i64::from(first.1).max(i64::from(second.1));
+    let right =
+        (i64::from(first.0) + i64::from(first.2)).min(i64::from(second.0) + i64::from(second.2));
+    let bottom =
+        (i64::from(first.1) + i64::from(first.3)).min(i64::from(second.1) + i64::from(second.3));
+    if right <= left || bottom <= top {
+        return None;
+    }
+    Some((
+        i32::try_from(left).ok()?,
+        i32::try_from(top).ok()?,
+        u32::try_from(right - left).ok()?,
+        u32::try_from(bottom - top).ok()?,
+    ))
+}
+
 /// ปิด ICCCM input hint โดยรักษา hint อื่นที่ GTK ใส่มาแล้ว
 fn set_input_focus_disabled<C: Connection>(connection: &C, window: Window) -> Result<(), String> {
     let mut hints = WmHints::get(connection, window)
@@ -151,6 +302,8 @@ fn add_window_states<C: Connection>(
 
 /// Atom ที่ใช้กำหนด type, layer, workspace และรายการหน้าต่าง
 struct Atoms {
+    net_current_desktop: Atom,
+    net_moveresize_window: Atom,
     net_wm_window_type: Atom,
     net_wm_window_type_notification: Atom,
     net_wm_state: Atom,
@@ -164,6 +317,8 @@ impl Atoms {
     /// โหลด atom จาก X server สำหรับ connection ปัจจุบัน
     fn load<C: Connection>(connection: &C) -> Result<Self, String> {
         Ok(Self {
+            net_current_desktop: intern_atom(connection, b"_NET_CURRENT_DESKTOP")?,
+            net_moveresize_window: intern_atom(connection, b"_NET_MOVERESIZE_WINDOW")?,
             net_wm_window_type: intern_atom(connection, b"_NET_WM_WINDOW_TYPE")?,
             net_wm_window_type_notification: intern_atom(
                 connection,

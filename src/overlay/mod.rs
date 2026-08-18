@@ -10,7 +10,8 @@ mod x11;
 pub use client::{OverlayClient, OverlayClientStatus};
 pub use process::run_overlay_helper;
 pub use protocol::{
-    OverlayCommand, OverlayEvent, OverlayProtocolError, read_message, write_message,
+    OverlayCommand, OverlayEvent, OverlayMonitorInfo, OverlayProtocolError, read_message,
+    write_message,
 };
 pub use session::{DesktopBackendInfo, DesktopSession, DisplayBackend, OverlayRuntimeBackend};
 pub use window::OverlayPresenter;

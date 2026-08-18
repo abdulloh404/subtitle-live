@@ -102,7 +102,9 @@ impl DesktopOverlay {
                     error = %message,
                     "Subtitle overlay helper unavailable"
                 ),
-                OverlayEvent::Pong { .. } | OverlayEvent::Rendered { .. } => {}
+                OverlayEvent::MonitorsChanged { .. }
+                | OverlayEvent::Pong { .. }
+                | OverlayEvent::Rendered { .. } => {}
             }
         }
         events
@@ -352,6 +354,11 @@ fn install_runtime_poll(
             desktop.settings.update_metrics(metrics);
             desktop.settings.update_pipewire_status(pipewire_status);
             let overlay_events = desktop.overlay.poll_events();
+            for event in &overlay_events {
+                if let OverlayEvent::MonitorsChanged { monitors } = event {
+                    desktop.settings.update_overlay_monitors(monitors);
+                }
+            }
             {
                 let mut runtime = runtime.borrow_mut();
                 let runtime = runtime
@@ -366,7 +373,9 @@ fn install_runtime_poll(
                             runtime.record_overlay_rendered(*frame_id, *rendered_at_micros);
                         }
                         OverlayEvent::Error { .. } => runtime.clear_pending_overlay_frames(),
-                        OverlayEvent::Ready | OverlayEvent::Pong { .. } => {}
+                        OverlayEvent::Ready
+                        | OverlayEvent::MonitorsChanged { .. }
+                        | OverlayEvent::Pong { .. } => {}
                     }
                 }
             }

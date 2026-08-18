@@ -279,7 +279,9 @@ impl OverlayClient {
                 }
             }
             OverlayEvent::Error { message } => self.record_error(message.clone()),
-            OverlayEvent::Pong { .. } | OverlayEvent::Rendered { .. } => {}
+            OverlayEvent::MonitorsChanged { .. }
+            | OverlayEvent::Pong { .. }
+            | OverlayEvent::Rendered { .. } => {}
         }
     }
 

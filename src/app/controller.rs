@@ -292,6 +292,10 @@ impl ApplicationController {
                 self.config.subtitle.visible = visible;
                 AppEvent::ConfigChanged("subtitle.visible")
             }
+            AppCommand::SetSubtitleMonitor(monitor_id) => {
+                self.config.subtitle.monitor_id = monitor_id;
+                AppEvent::ConfigChanged("subtitle.monitor_id")
+            }
             AppCommand::SetSubtitlePosition(position) => {
                 if !SUBTITLE_POSITIONS.contains(&position.as_str()) {
                     return AppEvent::Error(format!("Unsupported subtitle position: {position}"));
@@ -468,5 +472,16 @@ mod tests {
         assert!(controller.config().general.live_subtitles);
         assert_eq!(controller.config().audio.rules, expected_rules);
         assert_eq!(controller.retry_generation(), generation_before_retry + 1);
+    }
+
+    #[test]
+    fn subtitle_monitor_command_updates_persisted_id() {
+        let mut controller = ApplicationController::new(AppConfig::default());
+
+        let event =
+            controller.handle_command(AppCommand::SetSubtitleMonitor("connector:DP-1".to_owned()));
+
+        assert_eq!(event, AppEvent::ConfigChanged("subtitle.monitor_id"));
+        assert_eq!(controller.config().subtitle.monitor_id, "connector:DP-1");
     }
 }

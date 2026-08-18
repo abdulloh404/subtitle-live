@@ -19,6 +19,8 @@ pub enum AppCommand {
     SetVadEnabled(bool),
     /// เปิดหรือปิด overlay โดยไม่เปลี่ยนสถานะการถอดเสียง
     SetSubtitleVisible(bool),
+    /// เลือกจอด้วยรหัสที่ overlay helper รายงาน
+    SetSubtitleMonitor(String),
     /// ย้าย overlay ไปยังตำแหน่งหน้าจอที่รองรับ
     SetSubtitlePosition(String),
     /// เปลี่ยนแนวข้อความภายในกล่องคำบรรยาย

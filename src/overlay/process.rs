@@ -10,7 +10,7 @@ use std::{
 };
 
 use adw::prelude::*;
-use gtk::gio::prelude::{FileExt, InputStreamExt};
+use gtk::gio::prelude::{FileExt, InputStreamExt, ListModelExt};
 use gtk::{gio, glib};
 
 use super::{
@@ -55,14 +55,21 @@ pub fn run_overlay_helper() -> io::Result<()> {
             command_sender.clone(),
             event_sender.clone(),
         );
-        let presenter = OverlayPresenter::new(application, &SubtitleConfig::default());
+        let presenter = Rc::new(OverlayPresenter::new(
+            application,
+            &SubtitleConfig::default(),
+        ));
+        install_monitor_watch(Rc::clone(&presenter), event_sender.clone());
         install_command_poll(
             application,
-            presenter,
+            Rc::clone(&presenter),
             command_receiver,
             event_sender.clone(),
         );
         let _ = event_sender.send(WriterMessage::Event(OverlayEvent::Ready));
+        let _ = event_sender.send(WriterMessage::Event(OverlayEvent::MonitorsChanged {
+            monitors: presenter.monitor_infos(),
+        }));
     });
 
     // ส่งเฉพาะ argv[0] ให้ GApplication เพื่อไม่ให้ flag ภายในอย่าง
@@ -73,6 +80,19 @@ pub fn run_overlay_helper() -> io::Result<()> {
     drop(application);
     let _ = cleanup_event_sender.send(WriterMessage::Shutdown);
     join_helper_worker(event_writer, "overlay IPC writer")
+}
+
+/// เฝ้ารายการจอของ display ที่ helper ใช้วาดจริงและส่ง snapshot ใหม่หลัง hotplug
+fn install_monitor_watch(presenter: Rc<OverlayPresenter>, event_sender: Sender<WriterMessage>) {
+    let Some(display) = gtk::gdk::Display::default() else {
+        return;
+    };
+    display.monitors().connect_items_changed(move |_, _, _, _| {
+        let monitors = presenter.refresh_monitors();
+        let _ = event_sender.send(WriterMessage::Event(OverlayEvent::MonitorsChanged {
+            monitors,
+        }));
+    });
 }
 
 /// ข้อความภายในสำหรับแยก event จริงออกจากคำสั่งปิด writer
@@ -227,7 +247,7 @@ fn spawn_event_writer(
 /// Poll command queue บน GTK thread และแตะ widget เฉพาะใน callback นี้
 fn install_command_poll(
     application: &adw::Application,
-    presenter: OverlayPresenter,
+    presenter: Rc<OverlayPresenter>,
     command_receiver: Receiver<OverlayCommand>,
     event_sender: Sender<WriterMessage>,
 ) {

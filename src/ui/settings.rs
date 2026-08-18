@@ -1,6 +1,11 @@
 //! การสร้างหน้า settings และเชื่อม widget event เข้ากับ application controller
 
-use std::{cell::RefCell, path::Path, rc::Rc, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    path::Path,
+    rc::Rc,
+    time::Duration,
+};
 
 use adw::prelude::*;
 use gtk::glib;
@@ -11,7 +16,7 @@ use crate::{
     metrics::MetricsSnapshot,
     overlay::{
         DesktopBackendInfo, DesktopSession, DisplayBackend, OverlayClientStatus,
-        OverlayRuntimeBackend,
+        OverlayMonitorInfo, OverlayRuntimeBackend,
     },
     pipewire::{ApplicationIdentity, ApplicationKey, StreamInfo},
     stt::compiled_compute_backend,
@@ -58,6 +63,8 @@ pub struct SettingsPresenter {
     whisper_label: gtk::Label,
     end_to_end_label: gtk::Label,
     dropped_frames_label: gtk::Label,
+    /// ตัวเลือกจอที่อัปเดตจากรายการของ overlay helper เท่านั้น
+    monitor_selector: MonitorSelector,
 }
 
 impl SettingsPresenter {
@@ -148,7 +155,8 @@ impl SettingsPresenter {
             &model_path_label,
             Rc::clone(&controller),
         ));
-        window.add(&subtitle_page(&snapshot, Rc::clone(&controller)));
+        let (subtitle_page, monitor_selector) = subtitle_page(&snapshot, Rc::clone(&controller));
+        window.add(&subtitle_page);
         window.add(&performance_page(
             &snapshot,
             &status_label,
@@ -202,6 +210,7 @@ impl SettingsPresenter {
             whisper_label,
             end_to_end_label,
             dropped_frames_label,
+            monitor_selector,
         }
     }
 
@@ -301,6 +310,11 @@ impl SettingsPresenter {
             }),
         };
         self.overlay_status_label.set_label(status_text);
+    }
+
+    /// แทนที่รายการจอด้วย snapshot จาก helper ซึ่งเป็น process ที่วาด overlay จริง
+    pub fn update_overlay_monitors(&self, monitors: &[OverlayMonitorInfo]) {
+        self.monitor_selector.update(monitors);
     }
 }
 
@@ -617,7 +631,7 @@ fn speech_recognition_page(
 fn subtitle_page(
     snapshot: &UiSnapshot,
     controller: Rc<RefCell<ApplicationController>>,
-) -> adw::PreferencesPage {
+) -> (adw::PreferencesPage, MonitorSelector) {
     let page = preferences_page("Subtitle", "insert-text-symbolic");
     let group = adw::PreferencesGroup::builder().title("Appearance").build();
     let (visible_row, visible_switch) = switch_row(
@@ -634,6 +648,9 @@ fn subtitle_page(
         glib::Propagation::Proceed
     });
     group.add(&visible_row);
+
+    let (monitor_row, monitor_selector) = MonitorSelector::new(Rc::clone(&controller));
+    group.add(&monitor_row);
 
     let selected_position = SUBTITLE_POSITIONS
         .iter()
@@ -735,7 +752,96 @@ fn subtitle_page(
     });
     group.add(&max_lines_row);
     page.add(&group);
-    page
+    (page, monitor_selector)
+}
+
+#[derive(Clone)]
+/// ตัวเลือกจอที่เก็บ ID แยกจากข้อความ เพื่อส่ง identity เดิมกลับ helper โดยไม่ตีความ label
+struct MonitorSelector {
+    dropdown: gtk::DropDown,
+    monitor_ids: Rc<RefCell<Vec<String>>>,
+    updating: Rc<Cell<bool>>,
+    controller: Rc<RefCell<ApplicationController>>,
+}
+
+impl MonitorSelector {
+    /// สร้าง dropdown สถานะเริ่มต้นระหว่างรอ helper รายงานจอ
+    fn new(controller: Rc<RefCell<ApplicationController>>) -> (adw::ActionRow, Self) {
+        let dropdown = gtk::DropDown::from_strings(&["Detecting displays…"]);
+        dropdown.set_sensitive(false);
+        dropdown.set_valign(gtk::Align::Center);
+        let row = adw::ActionRow::builder()
+            .activatable_widget(&dropdown)
+            .title("Display")
+            .subtitle("Screen used for the subtitle overlay")
+            .build();
+        row.add_suffix(&dropdown);
+        let selector = Self {
+            dropdown,
+            monitor_ids: Rc::new(RefCell::new(Vec::new())),
+            updating: Rc::new(Cell::new(false)),
+            controller,
+        };
+        let signal_selector = selector.clone();
+        selector.dropdown.connect_selected_notify(move |dropdown| {
+            if signal_selector.updating.get() {
+                return;
+            }
+            let Some(monitor_id) = signal_selector
+                .monitor_ids
+                .borrow()
+                .get(dropdown.selected() as usize)
+                .cloned()
+            else {
+                return;
+            };
+            let _ = signal_selector
+                .controller
+                .borrow_mut()
+                .handle_command(AppCommand::SetSubtitleMonitor(monitor_id));
+        });
+        (row, selector)
+    }
+
+    /// เปลี่ยน model และ selection พร้อม guard ไม่ให้การ sync UI เขียน config กลับเอง
+    fn update(&self, monitors: &[OverlayMonitorInfo]) {
+        self.updating.set(true);
+        let labels = if monitors.is_empty() {
+            vec!["No displays detected"]
+        } else {
+            monitors
+                .iter()
+                .map(|monitor| monitor.label.as_str())
+                .collect::<Vec<_>>()
+        };
+        self.dropdown
+            .set_model(Some(&gtk::StringList::new(&labels)));
+        self.monitor_ids
+            .replace(monitors.iter().map(|monitor| monitor.id.clone()).collect());
+        let configured_id = self
+            .controller
+            .borrow()
+            .config()
+            .subtitle
+            .monitor_id
+            .clone();
+        let configured_position = monitors
+            .iter()
+            .position(|monitor| !configured_id.is_empty() && monitor.id == configured_id);
+        let selected = configured_position.unwrap_or(0) as u32;
+        self.dropdown.set_selected(selected);
+        self.dropdown.set_sensitive(!monitors.is_empty());
+        self.updating.set(false);
+        if configured_position.is_none()
+            && let Some(first_monitor) = monitors.first()
+        {
+            // เมื่อจอเดิมหายหรือยังเป็นค่า auto ให้ค่าที่ persist ตรงกับ fallback ที่ helper ใช้จริง
+            let _ = self
+                .controller
+                .borrow_mut()
+                .handle_command(AppCommand::SetSubtitleMonitor(first_monitor.id.clone()));
+        }
+    }
 }
 
 /// สร้างหน้าสถานะ pipeline และ latency ที่ runtime วัดได้
