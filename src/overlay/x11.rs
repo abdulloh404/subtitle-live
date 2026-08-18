@@ -6,20 +6,11 @@ use x11rb::{
     connection::Connection,
     properties::WmHints,
     protocol::xproto::{
-        Atom, AtomEnum, ClientMessageData, ClientMessageEvent, ConfigureWindowAux,
-        ConnectionExt as _, EventMask, PropMode, Window,
+        Atom, AtomEnum, ChangeWindowAttributesAux, ConfigureWindowAux, ConnectionExt as _,
+        PropMode, StackMode, Window,
     },
     wrapper::ConnectionExt as _,
 };
-
-/// action ของ EWMH สำหรับเพิ่ม state โดยไม่สลับค่าปัจจุบัน
-const NET_WM_STATE_ADD: u32 = 1;
-/// source indication ว่าคำขอมาจาก application
-const NET_WM_STATE_SOURCE_APPLICATION: u32 = 1;
-/// gravity แบบระบุตำแหน่งเทียบ root window โดยตรง
-const STATIC_GRAVITY: u32 = 10;
-/// bit ที่ระบุว่าคำสั่ง move/resize มีค่า x, y, width และ height ครบ
-const NET_MOVERESIZE_ALL_FIELDS: u32 = 0b1111 << 8;
 
 /// ตรวจว่า GTK window นี้ถูกสร้างบน X11 backend
 pub(super) fn is_x11_window(window: &gtk::Window) -> bool {
@@ -39,18 +30,16 @@ pub(super) fn configure_overlay_window(window: &gtk::Window, mapped: bool) -> Re
     let xid =
         u32::try_from(x11_surface.xid()).map_err(|_| "X11 window id มีขนาดเกิน 32 บิต".to_owned())?;
 
-    let (connection, screen_index) =
+    let (connection, _) =
         x11rb::connect(None).map_err(|error| format!("เชื่อมต่อ X11 display ไม่สำเร็จ: {error}"))?;
-    let root = connection
-        .setup()
-        .roots
-        .get(screen_index)
-        .ok_or_else(|| format!("ไม่พบ X11 screen index {screen_index}"))?
-        .root;
     let atoms = Atoms::load(&connection)?;
 
+    if !mapped {
+        set_override_redirect(&connection, xid)?;
+    }
     set_input_focus_disabled(&connection, xid)?;
     set_focus_activation_disabled(&connection, xid, &atoms)?;
+    remove_take_focus_protocol(&connection, xid, &atoms)?;
     connection
         .change_property32(
             PropMode::REPLACE,
@@ -63,25 +52,8 @@ pub(super) fn configure_overlay_window(window: &gtk::Window, mapped: bool) -> Re
         .check()
         .map_err(|error| format!("ตั้งชนิดหน้าต่าง X11 ไม่สำเร็จ: {error}"))?;
 
-    if mapped {
-        add_window_states(
-            &connection,
-            root,
-            xid,
-            atoms.net_wm_state,
-            atoms.net_wm_state_above,
-            atoms.net_wm_state_sticky,
-        )?;
-        add_window_states(
-            &connection,
-            root,
-            xid,
-            atoms.net_wm_state,
-            atoms.net_wm_state_skip_taskbar,
-            atoms.net_wm_state_skip_pager,
-        )?;
-    } else {
-        // ก่อน map ให้ window manager อ่าน state ทั้งหมดพร้อมการสร้างหน้าต่างครั้งแรก
+    if !mapped {
+        // เก็บ intent เดิมไว้ให้เครื่องมือตรวจสอบ แม้ override-redirect ไม่ถูก WM จัดการ
         connection
             .change_property32(
                 PropMode::REPLACE,
@@ -98,6 +70,8 @@ pub(super) fn configure_overlay_window(window: &gtk::Window, mapped: bool) -> Re
             .map_err(|error| format!("ส่ง X11 window states ไม่สำเร็จ: {error}"))?
             .check()
             .map_err(|error| format!("ตั้ง X11 window states ไม่สำเร็จ: {error}"))?;
+    } else {
+        raise_overlay_window(&connection, xid)?;
     }
 
     connection
@@ -105,7 +79,7 @@ pub(super) fn configure_overlay_window(window: &gtk::Window, mapped: bool) -> Re
         .map_err(|error| format!("flush คำสั่ง X11 ไม่สำเร็จ: {error}"))
 }
 
-/// ย้ายหน้าต่าง overlay ไปยัง work area ของจอเป้าหมายผ่าน window manager
+/// ย้ายหน้าต่าง override-redirect ไปยัง work area โดยไม่ผ่าน window manager
 pub(super) fn move_overlay_window(
     window: &gtk::Window,
     x: i32,
@@ -138,54 +112,58 @@ pub(super) fn move_overlay_window(
         .ok_or_else(|| format!("ไม่พบ X11 screen index {screen_index}"))?
         .root;
     let atoms = Atoms::load(&connection)?;
-    let (x, y, width, height) = monitor_workarea(&connection, root, &atoms, (x, y, width, height))
-        .unwrap_or((x, y, width, height));
-
-    if window.is_mapped() {
-        // หน้าต่างที่ map แล้วต้องขอผ่าน window manager; ConfigureWindow ตรง ๆ
-        // อาจถูก Mutter เมินหรือคืน geometry เดิมเมื่อเปลี่ยนจอ
-        let flags =
-            STATIC_GRAVITY | NET_MOVERESIZE_ALL_FIELDS | (NET_WM_STATE_SOURCE_APPLICATION << 12);
-        let event = ClientMessageEvent::new(
-            32,
-            xid,
-            atoms.net_moveresize_window,
-            ClientMessageData::from([
-                flags,
-                u32::from_ne_bytes(x.to_ne_bytes()),
-                u32::from_ne_bytes(y.to_ne_bytes()),
-                width,
-                height,
-            ]),
-        );
-        connection
-            .send_event(
-                false,
-                root,
-                EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
-                event,
-            )
-            .map_err(|error| format!("ส่ง EWMH move/resize ไม่สำเร็จ: {error}"))?
-            .check()
-            .map_err(|error| format!("window manager ปฏิเสธการย้าย overlay: {error}"))?;
-    } else {
-        // ก่อน map ยังไม่มี window manager จัดการ จึงวาง geometry เริ่มต้นที่ XID ได้โดยตรง
-        connection
-            .configure_window(
-                xid,
-                &ConfigureWindowAux::new()
-                    .x(x)
-                    .y(y)
-                    .width(width)
-                    .height(height),
-            )
-            .map_err(|error| format!("ส่งคำขอย้าย X11 overlay ไม่สำเร็จ: {error}"))?
-            .check()
-            .map_err(|error| format!("ย้าย X11 overlay ไม่สำเร็จ: {error}"))?;
+    let monitor = (x, y, width, height);
+    let (x, y, mut width, mut height) =
+        monitor_workarea(&connection, root, &atoms, monitor).unwrap_or(monitor);
+    if (x, y, width, height) == monitor {
+        // หลีกเลี่ยงการถูก Mutter จัดเป็น fullscreen surface เมื่อจอไม่มี panel/dock
+        if height > 1 {
+            height -= 1;
+        } else if width > 1 {
+            width -= 1;
+        }
     }
+
+    connection
+        .configure_window(
+            xid,
+            &ConfigureWindowAux::new()
+                .x(x)
+                .y(y)
+                .width(width)
+                .height(height)
+                .stack_mode(StackMode::ABOVE),
+        )
+        .map_err(|error| format!("ส่งคำขอย้าย X11 overlay ไม่สำเร็จ: {error}"))?
+        .check()
+        .map_err(|error| format!("ย้าย X11 overlay ไม่สำเร็จ: {error}"))?;
     connection
         .flush()
         .map_err(|error| format!("flush คำสั่งย้าย X11 overlay ไม่สำเร็จ: {error}"))
+}
+
+/// ถอนหน้าต่างออกจาก lifecycle ของ window manager ก่อน map เพื่อไม่ให้มี active/focus state
+fn set_override_redirect<C: Connection>(connection: &C, window: Window) -> Result<(), String> {
+    connection
+        .change_window_attributes(
+            window,
+            &ChangeWindowAttributesAux::new().override_redirect(1_u32),
+        )
+        .map_err(|error| format!("ส่งค่า X11 override-redirect ไม่สำเร็จ: {error}"))?
+        .check()
+        .map_err(|error| format!("ตั้ง X11 override-redirect ไม่สำเร็จ: {error}"))
+}
+
+/// ยก subtitle overlay ขึ้นบนสุดโดยไม่ activate หรือเปลี่ยน input focus
+fn raise_overlay_window<C: Connection>(connection: &C, window: Window) -> Result<(), String> {
+    connection
+        .configure_window(
+            window,
+            &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+        )
+        .map_err(|error| format!("ส่งคำขอยก X11 overlay ไม่สำเร็จ: {error}"))?
+        .check()
+        .map_err(|error| format!("ยก X11 overlay ไม่สำเร็จ: {error}"))
 }
 
 /// อ่าน `_GTK_WORKAREAS_D<n>` ของ Mutter แล้วเลือกพื้นที่ที่ทับกับ monitor เป้าหมายมากที่สุด
@@ -298,49 +276,53 @@ fn set_focus_activation_disabled<C: Connection>(
         .map_err(|error| format!("ตั้ง X11 user time แบบไม่รับ focus ไม่สำเร็จ: {error}"))
 }
 
-/// ส่ง `_NET_WM_STATE_ADD` ครั้งละสอง state ตามรูปแบบ EWMH
-fn add_window_states<C: Connection>(
+/// ทำให้ ICCCM input model เป็น No Input โดยไม่ลบ protocol ปิดหน้าต่างหรือ ping ของ GTK
+fn remove_take_focus_protocol<C: Connection>(
     connection: &C,
-    root: Window,
     window: Window,
-    state_property: Atom,
-    first: Atom,
-    second: Atom,
+    atoms: &Atoms,
 ) -> Result<(), String> {
-    let event = ClientMessageEvent::new(
-        32,
-        window,
-        state_property,
-        ClientMessageData::from([
-            NET_WM_STATE_ADD,
-            first,
-            second,
-            NET_WM_STATE_SOURCE_APPLICATION,
-            0,
-        ]),
-    );
-    connection
-        .send_event(
+    let reply = connection
+        .get_property(
             false,
-            root,
-            EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
-            event,
+            window,
+            atoms.wm_protocols,
+            AtomEnum::ATOM,
+            0,
+            u32::MAX,
         )
-        .map_err(|error| format!("ส่ง EWMH window state ไม่สำเร็จ: {error}"))?
+        .map_err(|error| format!("ส่งคำขออ่าน WM_PROTOCOLS ไม่สำเร็จ: {error}"))?
+        .reply()
+        .map_err(|error| format!("อ่าน WM_PROTOCOLS ไม่สำเร็จ: {error}"))?;
+    let Some(protocols) = reply.value32() else {
+        return Ok(());
+    };
+    let protocols = protocols
+        .filter(|protocol| *protocol != atoms.wm_take_focus)
+        .collect::<Vec<_>>();
+    connection
+        .change_property32(
+            PropMode::REPLACE,
+            window,
+            atoms.wm_protocols,
+            AtomEnum::ATOM,
+            &protocols,
+        )
+        .map_err(|error| format!("ส่ง WM_PROTOCOLS แบบไม่รับ focus ไม่สำเร็จ: {error}"))?
         .check()
-        .map_err(|error| format!("window manager ปฏิเสธ EWMH state: {error}"))?;
-    Ok(())
+        .map_err(|error| format!("ตั้ง WM_PROTOCOLS แบบไม่รับ focus ไม่สำเร็จ: {error}"))
 }
 
 /// Atom ที่ใช้กำหนด type, layer, workspace และรายการหน้าต่าง
 struct Atoms {
     net_current_desktop: Atom,
-    net_moveresize_window: Atom,
     net_startup_id: Atom,
     net_wm_user_time: Atom,
     net_wm_user_time_window: Atom,
     net_wm_window_type: Atom,
     net_wm_window_type_notification: Atom,
+    wm_protocols: Atom,
+    wm_take_focus: Atom,
     net_wm_state: Atom,
     net_wm_state_above: Atom,
     net_wm_state_sticky: Atom,
@@ -353,7 +335,6 @@ impl Atoms {
     fn load<C: Connection>(connection: &C) -> Result<Self, String> {
         Ok(Self {
             net_current_desktop: intern_atom(connection, b"_NET_CURRENT_DESKTOP")?,
-            net_moveresize_window: intern_atom(connection, b"_NET_MOVERESIZE_WINDOW")?,
             net_startup_id: intern_atom(connection, b"_NET_STARTUP_ID")?,
             net_wm_user_time: intern_atom(connection, b"_NET_WM_USER_TIME")?,
             net_wm_user_time_window: intern_atom(connection, b"_NET_WM_USER_TIME_WINDOW")?,
@@ -362,6 +343,8 @@ impl Atoms {
                 connection,
                 b"_NET_WM_WINDOW_TYPE_NOTIFICATION",
             )?,
+            wm_protocols: intern_atom(connection, b"WM_PROTOCOLS")?,
+            wm_take_focus: intern_atom(connection, b"WM_TAKE_FOCUS")?,
             net_wm_state: intern_atom(connection, b"_NET_WM_STATE")?,
             net_wm_state_above: intern_atom(connection, b"_NET_WM_STATE_ABOVE")?,
             net_wm_state_sticky: intern_atom(connection, b"_NET_WM_STATE_STICKY")?,

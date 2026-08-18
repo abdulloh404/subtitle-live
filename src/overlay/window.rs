@@ -185,6 +185,10 @@ impl OverlayPresenter {
         self.surface.set_visible(true);
         self.last_text.replace(source_text.to_owned());
         if !self.window.is_visible() {
+            if self.is_x11.get() {
+                // ย้ำ No Input model ทันที ก่อน map เพื่อไม่ให้ GTK ขอ focus ให้ toplevel
+                configure_x11_or_report(&self.window, false);
+            }
             // map โดยไม่ร้องขอ active window เพื่อไม่แย่ง focus จากเกมหรือวิดีโอ
             self.window.set_visible(true);
         }
@@ -196,14 +200,11 @@ impl OverlayPresenter {
             let window = self.window.clone();
             let label = self.label.clone();
             let surface = self.surface.clone();
-            let is_x11 = Rc::clone(&self.is_x11);
             glib::timeout_add_local_once(FINAL_HOLD_TIME, move || {
                 if generation.get() == next_generation {
                     label.set_label("");
                     surface.set_visible(false);
-                    if !is_x11.get() {
-                        window.hide();
-                    }
+                    window.hide();
                 }
             });
         }
@@ -247,7 +248,7 @@ impl OverlayPresenter {
         self.pending_after_paint.borrow_mut().take();
     }
 
-    /// ล้างข้อความ โดยคง X11 toplevel ไว้เพื่อไม่ให้ Mutter จัดชั้นใหม่
+    /// ล้างข้อความและ unmap passive overlay เพื่อไม่ทิ้ง surface เต็มจอไว้โดยไม่จำเป็น
     pub fn hide(&self) {
         self.cancel_pending_paint();
         self.generation.set(self.generation.get().wrapping_add(1));
@@ -255,9 +256,7 @@ impl OverlayPresenter {
         self.surface.set_visible(false);
         self.line_buffer.borrow_mut().clear();
         self.last_text.borrow_mut().clear();
-        if !self.is_x11.get() {
-            self.window.hide();
-        }
+        self.window.hide();
     }
 
     /// เปิดหรือปิดการรับ subtitle frame ของ overlay
