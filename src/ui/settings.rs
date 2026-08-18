@@ -9,7 +9,10 @@ use crate::{
     app::{AppCommand, AppEvent, ApplicationController, ApplicationState},
     config::{AppConfig, SUBTITLE_POSITIONS, SUBTITLE_TEXT_ALIGNMENTS},
     metrics::MetricsSnapshot,
-    overlay::{DesktopBackendInfo, DesktopSession, DisplayBackend, OverlayRuntimeBackend},
+    overlay::{
+        DesktopBackendInfo, DesktopSession, DisplayBackend, OverlayClientStatus,
+        OverlayRuntimeBackend,
+    },
     pipewire::{ApplicationIdentity, ApplicationKey, StreamInfo},
 };
 
@@ -44,6 +47,12 @@ pub struct SettingsPresenter {
     model_path_label: gtk::Label,
     /// สถานะการเชื่อมต่อ PipeWire ที่แสดงในหน้า About
     pipewire_status_label: gtk::Label,
+    /// Backend ของ helper ที่อัปเดตตาม lifecycle จริง
+    subtitle_backend_label: gtk::Label,
+    /// สถานะ XWayland ที่ไม่อ้างเพียง environment
+    xwayland_available_label: gtk::Label,
+    /// สาเหตุที่ helper ยังไม่พร้อมหรือใช้งานไม่ได้
+    overlay_status_label: gtk::Label,
     audio_buffer_label: gtk::Label,
     inference_label: gtk::Label,
     total_label: gtk::Label,
@@ -81,6 +90,24 @@ impl SettingsPresenter {
         let inference_label = value_label("Not available");
         let total_label = value_label("Not available");
         let pipewire_status_label = value_label("Starting");
+        let overlay_starting = backend_info.overlay_backend != OverlayRuntimeBackend::Unavailable;
+        let subtitle_backend_label = value_label(if overlay_starting {
+            "Starting"
+        } else {
+            "Unavailable"
+        });
+        let xwayland_available_label = value_label(match backend_info.session {
+            DesktopSession::Wayland if overlay_starting => "Starting",
+            DesktopSession::Wayland => "No",
+            DesktopSession::X11 | DesktopSession::Unknown => "Not applicable",
+        });
+        let overlay_status_label = value_label(if overlay_starting {
+            "Starting overlay helper"
+        } else if backend_info.session == DesktopSession::Wayland {
+            "Subtitle overlay requires XWayland on this desktop session."
+        } else {
+            "Subtitle overlay requires an X11 display."
+        });
         let configured_label = value_label(&snapshot.configured_applications.to_string());
         let applications_group = adw::PreferencesGroup::builder()
             .title("Applications")
@@ -127,7 +154,14 @@ impl SettingsPresenter {
             &inference_label,
             &total_label,
         ));
-        window.add(&about_page(&snapshot, backend_info, &pipewire_status_label));
+        window.add(&about_page(
+            &snapshot,
+            backend_info,
+            &pipewire_status_label,
+            &subtitle_backend_label,
+            &xwayland_available_label,
+            &overlay_status_label,
+        ));
 
         let close_controller = Rc::clone(&controller);
         window.connect_close_request(move |window| {
@@ -157,6 +191,9 @@ impl SettingsPresenter {
             error_label,
             model_path_label,
             pipewire_status_label,
+            subtitle_backend_label,
+            xwayland_available_label,
+            overlay_status_label,
             audio_buffer_label,
             inference_label,
             total_label,
@@ -215,6 +252,45 @@ impl SettingsPresenter {
     /// แสดงสถานะ PipeWire ล่าสุดในหน้า About
     pub fn update_pipewire_status(&self, status: &str) {
         self.pipewire_status_label.set_label(status);
+    }
+
+    /// แสดง backend เฉพาะเมื่อ helper ยืนยัน Ready และแสดง Unavailable เมื่อ IPC ล้มเหลว
+    pub fn update_overlay_status(
+        &self,
+        session: DesktopSession,
+        backend: OverlayRuntimeBackend,
+        status: OverlayClientStatus,
+        error: Option<&str>,
+    ) {
+        let backend_text = match status {
+            OverlayClientStatus::Starting => "Starting",
+            OverlayClientStatus::Ready => backend.display_name(),
+            OverlayClientStatus::Error | OverlayClientStatus::Stopped => "Unavailable",
+        };
+        self.subtitle_backend_label.set_label(backend_text);
+        let xwayland_text = match session {
+            DesktopSession::Wayland
+                if status == OverlayClientStatus::Ready
+                    && backend == OverlayRuntimeBackend::XWayland =>
+            {
+                "Yes"
+            }
+            DesktopSession::Wayland if status == OverlayClientStatus::Starting => "Starting",
+            DesktopSession::Wayland => "No",
+            DesktopSession::X11 | DesktopSession::Unknown => "Not applicable",
+        };
+        self.xwayland_available_label.set_label(xwayland_text);
+        let status_text = match status {
+            OverlayClientStatus::Starting => "Starting overlay helper",
+            OverlayClientStatus::Ready => "Ready",
+            OverlayClientStatus::Stopped => "Stopped",
+            OverlayClientStatus::Error => error.unwrap_or(if session == DesktopSession::Wayland {
+                "Subtitle overlay requires XWayland on this desktop session."
+            } else {
+                "Subtitle overlay requires an X11 display."
+            }),
+        };
+        self.overlay_status_label.set_label(status_text);
     }
 }
 
@@ -690,6 +766,9 @@ fn about_page(
     snapshot: &UiSnapshot,
     backend_info: DesktopBackendInfo,
     pipewire_status_label: &gtk::Label,
+    subtitle_backend_label: &gtk::Label,
+    xwayland_available_label: &gtk::Label,
+    overlay_status_label: &gtk::Label,
 ) -> adw::PreferencesPage {
     let page = preferences_page("About", "help-about-symbolic");
     let application_group = adw::PreferencesGroup::builder()
@@ -709,16 +788,18 @@ fn about_page(
         "Settings Backend",
         backend_info.settings_backend.display_name(),
     ));
-    desktop_group.add(&value_row(
+    desktop_group.add(&value_row_with_label(
         "Subtitle Backend",
-        backend_info.overlay_backend.display_name(),
+        subtitle_backend_label,
     ));
-    let xwayland_available = match backend_info.session {
-        DesktopSession::Wayland if backend_info.xwayland_available() => "Yes",
-        DesktopSession::Wayland => "No",
-        DesktopSession::X11 | DesktopSession::Unknown => "Not applicable",
-    };
-    desktop_group.add(&value_row("XWayland Available", xwayland_available));
+    desktop_group.add(&value_row_with_label(
+        "XWayland Available",
+        xwayland_available_label,
+    ));
+    desktop_group.add(&value_row_with_label(
+        "Overlay Status",
+        overlay_status_label,
+    ));
     page.add(&desktop_group);
 
     let recognition_group = adw::PreferencesGroup::builder()

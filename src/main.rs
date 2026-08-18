@@ -10,8 +10,8 @@ use subtitle_live::{
     error::AppError,
     logging,
     overlay::{
-        DesktopBackendInfo, DesktopSession, DisplayBackend, OverlayClient, OverlayEvent,
-        OverlayRuntimeBackend, run_overlay_helper,
+        DesktopBackendInfo, DesktopSession, DisplayBackend, OverlayClient, OverlayClientStatus,
+        OverlayEvent, OverlayRuntimeBackend, run_overlay_helper,
     },
     runtime::ApplicationRuntime,
     ui::SettingsPresenter,
@@ -81,11 +81,37 @@ impl DesktopOverlay {
         }
     }
 
+    /// คืนสถานะ renderer ล่าสุดสำหรับหน้า About
+    fn status(&self) -> OverlayClientStatus {
+        match self {
+            Self::Helper(client) => client.status(),
+            Self::Unavailable => OverlayClientStatus::Error,
+        }
+    }
+
+    /// คืน error ของ helper โดยไม่รวมข้อความ subtitle
+    fn last_error(&self) -> Option<String> {
+        match self {
+            Self::Helper(client) => client.last_error(),
+            Self::Unavailable => None,
+        }
+    }
+
     /// ขอให้ renderer หยุดโดยไม่ block GTK shutdown callback
     fn request_shutdown(&self) {
         match self {
             Self::Helper(client) => client.shutdown(),
             Self::Unavailable => {}
+        }
+    }
+
+    /// รอ helper ปิดหลัง GTK event loop จบแล้ว เพื่อไม่ทิ้ง child หรือ IPC worker
+    fn finish(&self) {
+        let Self::Helper(client) = self else {
+            return;
+        };
+        if let Err(error) = client.finish() {
+            tracing::warn!(error = %error, "Subtitle overlay helper did not shut down cleanly");
         }
     }
 }
@@ -221,6 +247,8 @@ fn main() -> Result<(), AppError> {
                 Rc::clone(&activate_controller),
                 Rc::clone(&activate_runtime),
                 Rc::clone(&activate_desktop),
+                desktop_session,
+                effective_overlay_backend,
             );
         }
 
@@ -241,6 +269,9 @@ fn main() -> Result<(), AppError> {
     });
 
     application.run();
+    if let Some(desktop) = desktop.borrow().as_ref() {
+        desktop.overlay.finish();
+    }
     if let Some(runtime) = runtime.borrow_mut().as_mut() {
         runtime.finish();
     }
@@ -253,6 +284,8 @@ fn install_runtime_poll(
     controller: Rc<RefCell<ApplicationController>>,
     runtime: Rc<RefCell<Option<ApplicationRuntime>>>,
     desktop: Rc<RefCell<Option<DesktopUi>>>,
+    desktop_session: DesktopSession,
+    overlay_backend: OverlayRuntimeBackend,
 ) {
     let application = application.clone();
     glib::timeout_add_local(Duration::from_millis(20), move || {
@@ -290,6 +323,13 @@ fn install_runtime_poll(
             desktop.settings.update_metrics(metrics);
             desktop.settings.update_pipewire_status(pipewire_status);
             desktop.overlay.poll_events();
+            let overlay_error = desktop.overlay.last_error();
+            desktop.settings.update_overlay_status(
+                desktop_session,
+                overlay_backend,
+                desktop.overlay.status(),
+                overlay_error.as_deref(),
+            );
             desktop.overlay.apply_config(&subtitle_config);
             if update.hide_overlay {
                 desktop.overlay.hide();
