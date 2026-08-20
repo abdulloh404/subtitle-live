@@ -1,9 +1,10 @@
 //! ตัวเขียน transcript debug แบบ JSONL บนเธรดแยกจาก GTK และ Whisper
 
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, DirBuilder, File, OpenOptions, Permissions},
     io::{BufWriter, Write},
     path::PathBuf,
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -108,6 +109,11 @@ impl DebugLogWriter {
         self.statuses.drain()
     }
 
+    /// คืนจำนวน record สะสมที่คิวเขียนไฟล์ทิ้งในโปรเซสปัจจุบัน
+    pub fn dropped_records(&self) -> u64 {
+        self.records.dropped()
+    }
+
     /// ปิด worker และรอให้ข้อมูลที่รับไว้ก่อนคำสั่ง shutdown ถูกเขียนให้เสร็จ
     pub fn finish(&mut self) -> Result<(), String> {
         let _ = self.commands.send(WriterCommand::Shutdown);
@@ -197,13 +203,22 @@ fn open_output(path: &PathBuf) -> Result<File, String> {
     let parent = path
         .parent()
         .ok_or_else(|| format!("Debug log path has no parent: {}", path.display()))?;
-    fs::create_dir_all(parent)
+    let mut directory_builder = DirBuilder::new();
+    directory_builder.recursive(true).mode(0o700);
+    directory_builder
+        .create(parent)
         .map_err(|error| format!("สร้าง directory debug log ไม่สำเร็จ: {error}"))?;
-    OpenOptions::new()
+    fs::set_permissions(parent, Permissions::from_mode(0o700))
+        .map_err(|error| format!("กำหนดสิทธิ์ directory debug log เป็น 0700 ไม่สำเร็จ: {error}"))?;
+    let file = OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(path)
-        .map_err(|error| format!("เปิดไฟล์ debug log ไม่สำเร็จ: {error}"))
+        .map_err(|error| format!("เปิดไฟล์ debug log ไม่สำเร็จ: {error}"))?;
+    file.set_permissions(Permissions::from_mode(0o600))
+        .map_err(|error| format!("กำหนดสิทธิ์ไฟล์ debug log เป็น 0600 ไม่สำเร็จ: {error}"))?;
+    Ok(file)
 }
 
 fn write_pending(
@@ -233,7 +248,7 @@ struct JsonRecord<'a> {
     processed_text: &'a str,
     emitted_text: &'a str,
     whisper_model_latency_ms: f64,
-    gpu_backend_latency_ms: f64,
+    whisper_full_wall_ms: f64,
     gpu_backend_requested: bool,
     gpu_device: i32,
     step_ms: u32,
@@ -251,7 +266,7 @@ impl<'a> From<&'a SttDebugRecord> for JsonRecord<'a> {
             processed_text: &record.processed_text,
             emitted_text: &record.emitted_text,
             whisper_model_latency_ms: record.whisper_model_duration.as_secs_f64() * 1_000.0,
-            gpu_backend_latency_ms: record.gpu_backend_duration.as_secs_f64() * 1_000.0,
+            whisper_full_wall_ms: record.backend_full_duration.as_secs_f64() * 1_000.0,
             gpu_backend_requested: record.gpu_backend_requested,
             gpu_device: record.gpu_device,
             step_ms: record.step_ms,

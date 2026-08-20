@@ -21,6 +21,7 @@ use crate::{
         OverlayMonitorInfo, OverlayRuntimeBackend,
     },
     pipewire::{ApplicationIdentity, ApplicationKey, StreamInfo},
+    runtime::DebugDropCounts,
     stt::{SttDebugRecord, compiled_compute_backend},
 };
 
@@ -333,6 +334,11 @@ impl SettingsPresenter {
     /// แสดงสถานะไฟล์ log ล่าสุด รวม path และข้อผิดพลาดจาก writer เบื้องหลัง
     pub fn update_debug_log_status(&self, status: &DebugLogStatus) {
         self.debug_panel.update_log_status(status);
+    }
+
+    /// แสดงจำนวน debug record สะสมที่ถูกทิ้งจากคิวใน session ปัจจุบัน
+    pub fn update_debug_drop_counts(&self, counts: &DebugDropCounts) {
+        self.debug_panel.update_drop_counts(counts);
     }
 }
 
@@ -907,6 +913,7 @@ struct DebugPanel {
     blocks: Rc<RefCell<VecDeque<String>>>,
     file_status_label: gtk::Label,
     file_path_label: gtk::Label,
+    dropped_records_label: gtk::Label,
 }
 
 impl DebugPanel {
@@ -963,6 +970,14 @@ impl DebugPanel {
             }
         }
     }
+
+    /// แสดงตัวนับสะสมแยกคิว STT และคิว writer เพื่อบอกเมื่อ debug รับข้อมูลไม่ทัน
+    fn update_drop_counts(&self, counts: &DebugDropCounts) {
+        self.dropped_records_label.set_label(&format!(
+            "STT {} · File {}",
+            counts.stt_queue, counts.file_queue
+        ));
+    }
 }
 
 /// สร้างหน้า Debug ซึ่งปิดทั้ง live view และ file logging ทุกครั้งที่เปิดโปรแกรม
@@ -993,11 +1008,16 @@ fn debug_page(
 
     let file_status_label = value_label("Disabled");
     let file_path_label = value_label("Waiting for runtime");
+    let dropped_records_label = value_label("STT 0 · File 0");
     let file_group = adw::PreferencesGroup::builder()
         .title("Log File")
         .build();
     file_group.add(&value_row_with_label("Status", &file_status_label));
     file_group.add(&value_row_with_label("Path", &file_path_label));
+    file_group.add(&value_row_with_label(
+        "Dropped Debug Records",
+        &dropped_records_label,
+    ));
     page.add(&file_group);
 
     let explanation_group = adw::PreferencesGroup::builder()
@@ -1006,6 +1026,10 @@ fn debug_page(
     explanation_group.add(&message_row(
         "One rolling chunk per inference",
         "Whisper processes a rolling audio window and returns a complete hypothesis each time. It does not send one word at a time, so later hypotheses may revise earlier words before the segment becomes final.",
+    ));
+    explanation_group.add(&message_row(
+        "Backend timing",
+        "full() wall is the elapsed wall time around WhisperState::full, not GPU kernel time. The current API reports the requested backend but cannot confirm which backend actually ran.",
     ));
     page.add(&explanation_group);
 
@@ -1051,6 +1075,7 @@ fn debug_page(
         blocks: Rc::new(RefCell::new(VecDeque::new())),
         file_status_label,
         file_path_label,
+        dropped_records_label,
     };
     let clear_panel = panel.clone();
     clear_button.connect_clicked(move |_| clear_panel.clear());
@@ -1078,20 +1103,20 @@ fn debug_page(
 
 /// จัดรูปแบบ record เป็นบรรทัดคงที่ เพื่อแยกข้อความดิบและข้อความที่เข้า subtitle ชัดเจน
 fn format_debug_record(record: &SttDebugRecord) -> String {
-    let backend = if record.gpu_backend_requested {
-        format!("GPU device {}", record.gpu_device)
+    let backend_request = if record.gpu_backend_requested {
+        format!("GPU device {} (actual backend unknown)", record.gpu_device)
     } else {
-        "CPU".to_owned()
+        "CPU requested".to_owned()
     };
     format!(
-        "[{}] segment={} kind={} generation={} | whisper={} | gpu={} | backend={} | step={} ms window={} ms\nRAW: {}\nNORMALIZED: {}\nSUBTITLE INPUT: {}",
+        "[{}] segment={} kind={} generation={} | whisper={} | full() wall={} | request={} | step={} ms window={} ms\nRAW: {}\nNORMALIZED: {}\nSUBTITLE INPUT: {}",
         local_timestamp(record.timestamp_unix_ms),
         record.segment_id,
         record.kind.as_str(),
         record.audio_generation,
         precise_duration_ms(record.whisper_model_duration),
-        precise_duration_ms(record.gpu_backend_duration),
-        backend,
+        precise_duration_ms(record.backend_full_duration),
+        backend_request,
         record.step_ms,
         record.window_ms,
         escape_debug_text(&record.raw_text),

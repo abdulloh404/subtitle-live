@@ -359,6 +359,9 @@ fn install_runtime_poll(
             if let Some(status) = update.debug_log_status.as_ref() {
                 desktop.settings.update_debug_log_status(status);
             }
+            if let Some(counts) = update.debug_drop_counts.as_ref() {
+                desktop.settings.update_debug_drop_counts(counts);
+            }
             let overlay_events = desktop.overlay.poll_events();
             for event in &overlay_events {
                 if let OverlayEvent::MonitorsChanged { monitors } = event {

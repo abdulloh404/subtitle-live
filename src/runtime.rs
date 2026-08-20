@@ -51,6 +51,17 @@ pub struct RuntimeUpdate {
     pub debug_records: Vec<SttDebugRecord>,
     /// สถานะ writer ล่าสุดเมื่อมีการเปลี่ยนแปลง
     pub debug_log_status: Option<DebugLogStatus>,
+    /// จำนวน debug record สะสมที่ถูกทิ้ง เมื่อค่าเปลี่ยนจากรอบก่อน
+    pub debug_drop_counts: Option<DebugDropCounts>,
+}
+
+/// จำนวน debug record สะสมที่แต่ละคิวทิ้งตลอดอายุโปรเซส
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DebugDropCounts {
+    /// จำนวน record ที่คิวระหว่าง STT กับ runtime ทิ้ง
+    pub stt_queue: u64,
+    /// จำนวน record ที่คิวระหว่าง runtime กับ file writer ทิ้ง
+    pub file_queue: u64,
 }
 
 /// ข้อความหนึ่งเฟรมที่ runtime ส่งไปยัง GTK
@@ -120,6 +131,8 @@ pub struct ApplicationRuntime {
     applied_stt_streaming: Option<SttStreamingConfig>,
     // สถานะ debug ล่าสุดที่ runtime ส่งให้ STT และ file writer แล้ว
     applied_debug_session: DebugSessionState,
+    // snapshot ตัวนับ debug ที่ส่งให้ UI ล่าสุด เริ่มที่ศูนย์ทุกโปรเซส
+    last_debug_drop_counts: DebugDropCounts,
     shutdown_requested: bool,
 }
 
@@ -203,6 +216,7 @@ impl ApplicationRuntime {
             last_tray_state: None,
             applied_stt_streaming: None,
             applied_debug_session: DebugSessionState::default(),
+            last_debug_drop_counts: DebugDropCounts::default(),
             shutdown_requested: false,
         }
     }
@@ -225,6 +239,7 @@ impl ApplicationRuntime {
         self.sync_capture_targets(&mut update);
         self.handle_stt_events(&mut update);
         self.handle_stt_debug_records(&mut update);
+        self.sync_debug_drop_counts(&mut update);
         self.sync_stt_resume_generation();
         self.sync_capture_targets(&mut update);
         self.clear_stale_subtitle(&mut update);
@@ -349,6 +364,10 @@ impl ApplicationRuntime {
     /// รอ worker ทุกตัวหลัง `Application::run` คืนค่าแล้ว จึงไม่บล็อก GTK main thread
     pub fn finish(&mut self) {
         self.request_shutdown();
+        // อ่านค่าที่ผู้ใช้เลือกจริงตอนปิด แทน snapshot จาก poll รอบก่อนที่อาจยังไม่ทัน sync
+        let desired_debug_session = self.controller.borrow().debug_session_state();
+        self.debug_log_writer
+            .set_enabled(desired_debug_session.file_logging_enabled);
         if let Err(error) = self.pipewire.finish() {
             tracing::error!(error = %error, "PipeWire worker ปิดไม่สมบูรณ์");
         }
@@ -363,6 +382,10 @@ impl ApplicationRuntime {
         }
         if let Err(error) = self.stt.finish() {
             tracing::error!(error = %error, "Whisper worker ปิดไม่สมบูรณ์");
+        }
+        let debug_tail = self.stt.drain_debug_records();
+        if desired_debug_session.file_logging_enabled {
+            self.debug_log_writer.write_records(debug_tail);
         }
         if let Some(tray) = &mut self.tray
             && let Err(error) = tray.finish()
@@ -731,6 +754,19 @@ impl ApplicationRuntime {
         if self.applied_debug_session.live_enabled {
             update.debug_records = records;
         }
+    }
+
+    /// ส่งตัวนับคิวตกหล่นเฉพาะเมื่อ snapshot เปลี่ยน เพื่อไม่สร้างงาน UI ทุก poll
+    fn sync_debug_drop_counts(&mut self, update: &mut RuntimeUpdate) {
+        let counts = DebugDropCounts {
+            stt_queue: self.stt.debug_records_dropped(),
+            file_queue: self.debug_log_writer.dropped_records(),
+        };
+        if counts == self.last_debug_drop_counts {
+            return;
+        }
+        self.last_debug_drop_counts = counts;
+        update.debug_drop_counts = Some(counts);
     }
 
     /// คำนวณ stream ที่ตรงกับกฎคงทน และเริ่ม transition เมื่อชุดเป้าหมายเปลี่ยน

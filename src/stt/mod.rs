@@ -112,9 +112,9 @@ pub struct SttDebugRecord {
     pub emitted_text: String,
     /// เวลารวมการเรียกโมเดลและจัดผลลัพธ์รอบนี้
     pub whisper_model_duration: Duration,
-    /// เวลาเฉพาะที่ครอบ `WhisperState::full`
-    pub gpu_backend_duration: Duration,
-    /// backend ของ whisper.cpp ถูกตั้งค่าให้ร้องขอ GPU หรือไม่
+    /// เวลา wall-clock ที่ครอบ `WhisperState::full` ทั้งหมด ไม่ใช่เวลา GPU kernel โดยตรง
+    pub backend_full_duration: Duration,
+    /// backend ของ whisper.cpp ถูกตั้งค่าให้ร้องขอ GPU หรือไม่ โดยไม่ได้ยืนยันว่า GPU ทำงานจริง
     pub gpu_backend_requested: bool,
     /// หมายเลขอุปกรณ์ GPU ที่ส่งให้ whisper.cpp
     pub gpu_device: i32,
@@ -249,6 +249,11 @@ impl SttService {
     /// ดึงข้อมูล debug ที่รออยู่ทั้งหมดโดยไม่แตะคิวเหตุการณ์ STT หลัก
     pub fn drain_debug_records(&self) -> Vec<SttDebugRecord> {
         self.debug_records.drain()
+    }
+
+    /// คืนจำนวน debug record สะสมที่คิว STT ทิ้งในโปรเซสปัจจุบัน
+    pub fn debug_records_dropped(&self) -> u64 {
+        self.debug_records.dropped()
     }
 }
 
@@ -627,11 +632,11 @@ impl ActiveStt {
             .unwrap_or(whisper_model_started);
         let audio_buffer_duration =
             whisper_model_started.saturating_duration_since(audio_origin_at);
-        let gpu_backend_started = Instant::now();
+        let backend_full_started = Instant::now();
         self.state
             .full(params, audio)
             .map_err(|error| format!("Whisper inference failed: {error}"))?;
-        let gpu_backend_duration = gpu_backend_started.elapsed();
+        let backend_full_duration = backend_full_started.elapsed();
         let raw_text = collect_hypothesis(&self.state)?;
         let processed_text = normalize_hypothesis_text(&raw_text);
         let update = self.reconcile_hypothesis(processed_text.clone());
@@ -655,7 +660,7 @@ impl ActiveStt {
                 processed_text,
                 emitted_text,
                 whisper_model_duration,
-                gpu_backend_duration,
+                backend_full_duration,
                 gpu_backend_requested: self.gpu_backend_requested,
                 gpu_device: self.gpu_device,
                 step_ms: self.config.step_ms,
@@ -667,7 +672,7 @@ impl ActiveStt {
             update,
             audio_origin_at,
             audio_buffer_duration,
-            inference_duration: gpu_backend_duration,
+            inference_duration: backend_full_duration,
             debug_record,
         }))
     }
