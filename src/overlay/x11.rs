@@ -12,6 +12,9 @@ use x11rb::{
     wrapper::ConnectionExt as _,
 };
 
+/// ระยะห่างของกล่อง subtitle จากขอบ work area
+const SCREEN_EDGE_GAP_PX: i64 = 32;
+
 /// ตรวจว่า GTK window นี้ถูกสร้างบน X11 backend
 pub(super) fn is_x11_window(window: &gtk::Window) -> bool {
     window
@@ -82,19 +85,22 @@ pub(super) fn configure_overlay_window(window: &gtk::Window, mapped: bool) -> Re
 /// ย้ายหน้าต่าง override-redirect ไปยัง work area โดยไม่ผ่าน window manager
 pub(super) fn move_overlay_window(
     window: &gtk::Window,
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
+    monitor_x: i32,
+    monitor_y: i32,
+    monitor_width: i32,
+    monitor_height: i32,
+    overlay_width: i32,
+    overlay_height: i32,
+    position: &str,
 ) -> Result<(), String> {
-    let width = u32::try_from(width)
+    let monitor_width = u32::try_from(monitor_width)
         .ok()
         .filter(|width| *width > 0)
-        .ok_or_else(|| format!("ความกว้างจอไม่ถูกต้อง: {width}"))?;
-    let height = u32::try_from(height)
+        .ok_or_else(|| format!("ความกว้างจอไม่ถูกต้อง: {monitor_width}"))?;
+    let monitor_height = u32::try_from(monitor_height)
         .ok()
         .filter(|height| *height > 0)
-        .ok_or_else(|| format!("ความสูงจอไม่ถูกต้อง: {height}"))?;
+        .ok_or_else(|| format!("ความสูงจอไม่ถูกต้อง: {monitor_height}"))?;
     let surface = window
         .surface()
         .ok_or_else(|| "GTK overlay ยังไม่มี GDK surface".to_owned())?;
@@ -112,17 +118,26 @@ pub(super) fn move_overlay_window(
         .ok_or_else(|| format!("ไม่พบ X11 screen index {screen_index}"))?
         .root;
     let atoms = Atoms::load(&connection)?;
-    let monitor = (x, y, width, height);
-    let (x, y, mut width, mut height) =
+    let monitor = (monitor_x, monitor_y, monitor_width, monitor_height);
+    let (workarea_x, workarea_y, workarea_width, workarea_height) =
         monitor_workarea(&connection, root, &atoms, monitor).unwrap_or(monitor);
-    if (x, y, width, height) == monitor {
-        // หลีกเลี่ยงการถูก Mutter จัดเป็น fullscreen surface เมื่อจอไม่มี panel/dock
-        if height > 1 {
-            height -= 1;
-        } else if width > 1 {
-            width -= 1;
-        }
-    }
+    let overlay_width = u32::try_from(overlay_width)
+        .unwrap_or(1)
+        .max(1)
+        .min(workarea_width);
+    let overlay_height = u32::try_from(overlay_height)
+        .unwrap_or(1)
+        .max(1)
+        .min(workarea_height);
+    let (x, y) = anchored_position(
+        workarea_x,
+        workarea_y,
+        workarea_width,
+        workarea_height,
+        overlay_width,
+        overlay_height,
+        position,
+    );
 
     connection
         .configure_window(
@@ -130,8 +145,8 @@ pub(super) fn move_overlay_window(
             &ConfigureWindowAux::new()
                 .x(x)
                 .y(y)
-                .width(width)
-                .height(height)
+                .width(overlay_width)
+                .height(overlay_height)
                 .stack_mode(StackMode::ABOVE),
         )
         .map_err(|error| format!("ส่งคำขอย้าย X11 overlay ไม่สำเร็จ: {error}"))?
@@ -140,6 +155,41 @@ pub(super) fn move_overlay_window(
     connection
         .flush()
         .map_err(|error| format!("flush คำสั่งย้าย X11 overlay ไม่สำเร็จ: {error}"))
+}
+
+/// คำนวณมุมของหน้าต่างขนาดจริงตามตำแหน่ง 9 จุดภายใน work area ที่เลือก
+fn anchored_position(
+    workarea_x: i32,
+    workarea_y: i32,
+    workarea_width: u32,
+    workarea_height: u32,
+    overlay_width: u32,
+    overlay_height: u32,
+    position: &str,
+) -> (i32, i32) {
+    let remaining_width = i64::from(workarea_width.saturating_sub(overlay_width));
+    let remaining_height = i64::from(workarea_height.saturating_sub(overlay_height));
+    // เมื่อกล่องเกือบเต็มจอ ให้ลด gap ทั้งสองฝั่งเท่ากันเพื่อไม่ให้ตำแหน่งซ้าย/ขวาสลับกัน
+    let horizontal_gap = SCREEN_EDGE_GAP_PX.min(remaining_width / 2);
+    let vertical_gap = SCREEN_EDGE_GAP_PX.min(remaining_height / 2);
+    let horizontal_offset = match position {
+        "top-left" | "center-left" | "bottom-left" => horizontal_gap,
+        "top-right" | "center-right" | "bottom-right" => remaining_width - horizontal_gap,
+        _ => remaining_width / 2,
+    };
+    let vertical_offset = match position {
+        "top-left" | "top-center" | "top-right" => vertical_gap,
+        "center-left" | "center" | "center-right" => remaining_height / 2,
+        _ => remaining_height - vertical_gap,
+    };
+    (
+        i64::from(workarea_x)
+            .saturating_add(horizontal_offset)
+            .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        i64::from(workarea_y)
+            .saturating_add(vertical_offset)
+            .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+    )
 }
 
 /// ถอนหน้าต่างออกจาก lifecycle ของ window manager ก่อน map เพื่อไม่ให้มี active/focus state
