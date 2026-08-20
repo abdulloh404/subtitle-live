@@ -17,6 +17,10 @@ pub enum AppCommand {
     SetSttWindowMs(u32),
     /// เปิดหรือปิดตัวกรองเสียงพลังงานต่ำก่อนเรียก Whisper
     SetVadEnabled(bool),
+    /// เปิดหรือปิดการส่งข้อมูลถอดเสียงสดไปยังหน้า Debug เฉพาะเซสชันนี้
+    SetDebugLiveEnabled(bool),
+    /// เปิดหรือปิดการบันทึกข้อมูลถอดเสียงลงไฟล์เฉพาะเซสชันนี้
+    SetDebugFileLoggingEnabled(bool),
     /// เปิดหรือปิด overlay โดยไม่เปลี่ยนสถานะการถอดเสียง
     SetSubtitleVisible(bool),
     /// เลือกจอด้วยรหัสที่ overlay helper รายงาน

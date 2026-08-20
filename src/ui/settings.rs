@@ -2,6 +2,7 @@
 
 use std::{
     cell::{Cell, RefCell},
+    collections::VecDeque,
     path::Path,
     rc::Rc,
     time::Duration,
@@ -13,13 +14,14 @@ use gtk::glib;
 use crate::{
     app::{AppCommand, AppEvent, ApplicationController, ApplicationState},
     config::{AppConfig, SUBTITLE_POSITIONS, SUBTITLE_TEXT_ALIGNMENTS},
+    debug_log::DebugLogStatus,
     metrics::MetricsSnapshot,
     overlay::{
         DesktopBackendInfo, DesktopSession, DisplayBackend, OverlayClientStatus,
         OverlayMonitorInfo, OverlayRuntimeBackend,
     },
     pipewire::{ApplicationIdentity, ApplicationKey, StreamInfo},
-    stt::compiled_compute_backend,
+    stt::{SttDebugRecord, compiled_compute_backend},
 };
 
 const SETTINGS_WINDOW_NAME: &str = "subtitle-live-settings";
@@ -35,6 +37,7 @@ const SUBTITLE_POSITION_LABELS: [&str; 9] = [
     "Bottom right",
 ];
 const SUBTITLE_TEXT_ALIGNMENT_LABELS: [&str; 3] = ["Left", "Center", "Right"];
+const MAX_DEBUG_BLOCKS: usize = 200;
 
 /// widget และ state ที่จำเป็นต่อการอัปเดตหน้าต่างจาก runtime
 #[derive(Clone)]
@@ -65,6 +68,8 @@ pub struct SettingsPresenter {
     dropped_frames_label: gtk::Label,
     /// ตัวเลือกจอที่อัปเดตจากรายการของ overlay helper เท่านั้น
     monitor_selector: MonitorSelector,
+    /// แผงข้อมูลดิบจาก Whisper ที่เปิดเฉพาะเมื่อผู้ใช้ร้องขอใน session ปัจจุบัน
+    debug_panel: DebugPanel,
 }
 
 impl SettingsPresenter {
@@ -166,6 +171,8 @@ impl SettingsPresenter {
             &end_to_end_label,
             &dropped_frames_label,
         ));
+        let (debug_page, debug_panel) = debug_page(Rc::clone(&controller));
+        window.add(&debug_page);
         window.add(&about_page(
             &snapshot,
             backend_info,
@@ -211,6 +218,7 @@ impl SettingsPresenter {
             end_to_end_label,
             dropped_frames_label,
             monitor_selector,
+            debug_panel,
         }
     }
 
@@ -315,6 +323,16 @@ impl SettingsPresenter {
     /// แทนที่รายการจอด้วย snapshot จาก helper ซึ่งเป็น process ที่วาด overlay จริง
     pub fn update_overlay_monitors(&self, monitors: &[OverlayMonitorInfo]) {
         self.monitor_selector.update(monitors);
+    }
+
+    /// เพิ่มผล inference ใหม่ลงท้ายแผง Debug โดยจำกัดประวัติไม่ให้ UI โตไม่สิ้นสุด
+    pub fn append_debug_records(&self, records: &[SttDebugRecord]) {
+        self.debug_panel.append(records);
+    }
+
+    /// แสดงสถานะไฟล์ log ล่าสุด รวม path และข้อผิดพลาดจาก writer เบื้องหลัง
+    pub fn update_debug_log_status(&self, status: &DebugLogStatus) {
+        self.debug_panel.update_log_status(status);
     }
 }
 
@@ -879,6 +897,231 @@ fn performance_page(
     ));
     page.add(&metrics_group);
     page
+}
+
+#[derive(Clone)]
+/// widget และประวัติแบบจำกัดขนาดของหน้า Debug ซึ่งมีอายุเท่ากับหน้าต่าง Settings
+struct DebugPanel {
+    buffer: gtk::TextBuffer,
+    view: gtk::TextView,
+    blocks: Rc<RefCell<VecDeque<String>>>,
+    file_status_label: gtk::Label,
+    file_path_label: gtk::Label,
+}
+
+impl DebugPanel {
+    /// เพิ่มหนึ่ง block ต่อ Whisper inference ไม่ใช่หนึ่ง block ต่อคำ
+    fn append(&self, records: &[SttDebugRecord]) {
+        if records.is_empty() {
+            return;
+        }
+        let mut blocks = self.blocks.borrow_mut();
+        for record in records {
+            blocks.push_back(format_debug_record(record));
+            if blocks.len() > MAX_DEBUG_BLOCKS {
+                blocks.pop_front();
+            }
+        }
+        self.buffer.set_text(
+            &blocks
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        );
+        drop(blocks);
+
+        // รอให้ GTK คำนวณ layout ของข้อความใหม่ก่อนเลื่อนไปยังผลล่าสุด
+        let buffer = self.buffer.clone();
+        let view = self.view.clone();
+        glib::idle_add_local_once(move || {
+            let mut end = buffer.end_iter();
+            view.scroll_to_iter(&mut end, 0.0, false, 0.0, 1.0);
+        });
+    }
+
+    /// ล้างเฉพาะข้อความบนหน้าจอ โดยไม่กระทบไฟล์ log หรือ pipeline
+    fn clear(&self) {
+        self.blocks.borrow_mut().clear();
+        self.buffer.set_text("");
+    }
+
+    /// แปลงสถานะ writer เป็นข้อความที่ผู้ใช้ตรวจ path และ error ได้โดยตรง
+    fn update_log_status(&self, status: &DebugLogStatus) {
+        match status {
+            DebugLogStatus::Disabled { path } => {
+                self.file_status_label.set_label("Disabled");
+                self.file_path_label.set_label(&path.display().to_string());
+            }
+            DebugLogStatus::Writing { path } => {
+                self.file_status_label.set_label("Writing");
+                self.file_path_label.set_label(&path.display().to_string());
+            }
+            DebugLogStatus::Error { path, message } => {
+                self.file_status_label.set_label(&format!("Error: {message}"));
+                self.file_path_label.set_label(&path.display().to_string());
+            }
+        }
+    }
+}
+
+/// สร้างหน้า Debug ซึ่งปิดทั้ง live view และ file logging ทุกครั้งที่เปิดโปรแกรม
+fn debug_page(
+    controller: Rc<RefCell<ApplicationController>>,
+) -> (adw::PreferencesPage, DebugPanel) {
+    let page = preferences_page("Debug", "utilities-terminal-symbolic");
+
+    let controls_group = adw::PreferencesGroup::builder()
+        .title("Debug Controls")
+        .description("Debug collection is disabled when Subtitle-live launches.")
+        .build();
+    let (live_row, live_switch) = switch_row(
+        "Live Debug View",
+        "Show each Whisper inference as it reaches the subtitle pipeline",
+        false,
+        true,
+    );
+    let (file_row, file_switch) = switch_row(
+        "Write Debug Log File",
+        "Save the same inference records to a local log file",
+        false,
+        true,
+    );
+    controls_group.add(&live_row);
+    controls_group.add(&file_row);
+    page.add(&controls_group);
+
+    let file_status_label = value_label("Disabled");
+    let file_path_label = value_label("Waiting for runtime");
+    let file_group = adw::PreferencesGroup::builder()
+        .title("Log File")
+        .build();
+    file_group.add(&value_row_with_label("Status", &file_status_label));
+    file_group.add(&value_row_with_label("Path", &file_path_label));
+    page.add(&file_group);
+
+    let explanation_group = adw::PreferencesGroup::builder()
+        .title("How Streaming Recognition Works")
+        .build();
+    explanation_group.add(&message_row(
+        "One rolling chunk per inference",
+        "Whisper processes a rolling audio window and returns a complete hypothesis each time. It does not send one word at a time, so later hypotheses may revise earlier words before the segment becomes final.",
+    ));
+    page.add(&explanation_group);
+
+    let buffer = gtk::TextBuffer::new(None::<&gtk::TextTagTable>);
+    let view = gtk::TextView::builder()
+        .buffer(&buffer)
+        .cursor_visible(false)
+        .editable(false)
+        .left_margin(12)
+        .monospace(true)
+        .right_margin(12)
+        .top_margin(12)
+        .bottom_margin(12)
+        .wrap_mode(gtk::WrapMode::WordChar)
+        .build();
+    let scrolled = gtk::ScrolledWindow::builder()
+        .child(&view)
+        .has_frame(true)
+        .height_request(360)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .build();
+    let clear_button = gtk::Button::builder()
+        .label("Clear")
+        .valign(gtk::Align::Center)
+        .build();
+    let output_header = adw::ActionRow::builder()
+        .activatable(false)
+        .title("Latest Inferences")
+        .subtitle("Up to 200 inference blocks")
+        .build();
+    output_header.add_suffix(&clear_button);
+    let output_group = adw::PreferencesGroup::builder()
+        .title("Inference Stream")
+        .build();
+    output_group.add(&output_header);
+    output_group.add(&scrolled);
+    page.add(&output_group);
+
+    let panel = DebugPanel {
+        buffer,
+        view,
+        blocks: Rc::new(RefCell::new(VecDeque::new())),
+        file_status_label,
+        file_path_label,
+    };
+    let clear_panel = panel.clone();
+    clear_button.connect_clicked(move |_| clear_panel.clear());
+
+    let live_controller = Rc::clone(&controller);
+    let live_panel = panel.clone();
+    live_switch.connect_state_set(move |_, enabled| {
+        let _ = live_controller
+            .borrow_mut()
+            .handle_command(AppCommand::SetDebugLiveEnabled(enabled));
+        if !enabled {
+            live_panel.clear();
+        }
+        glib::Propagation::Proceed
+    });
+    file_switch.connect_state_set(move |_, enabled| {
+        let _ = controller
+            .borrow_mut()
+            .handle_command(AppCommand::SetDebugFileLoggingEnabled(enabled));
+        glib::Propagation::Proceed
+    });
+
+    (page, panel)
+}
+
+/// จัดรูปแบบ record เป็นบรรทัดคงที่ เพื่อแยกข้อความดิบและข้อความที่เข้า subtitle ชัดเจน
+fn format_debug_record(record: &SttDebugRecord) -> String {
+    let backend = if record.gpu_backend_requested {
+        format!("GPU device {}", record.gpu_device)
+    } else {
+        "CPU".to_owned()
+    };
+    format!(
+        "[{}] segment={} kind={} generation={} | whisper={} | gpu={} | backend={} | step={} ms window={} ms\nRAW: {}\nNORMALIZED: {}\nSUBTITLE INPUT: {}",
+        local_timestamp(record.timestamp_unix_ms),
+        record.segment_id,
+        record.kind.as_str(),
+        record.audio_generation,
+        precise_duration_ms(record.whisper_model_duration),
+        precise_duration_ms(record.gpu_backend_duration),
+        backend,
+        record.step_ms,
+        record.window_ms,
+        escape_debug_text(&record.raw_text),
+        escape_debug_text(&record.processed_text),
+        escape_debug_text(&record.emitted_text),
+    )
+}
+
+/// แสดง Unix timestamp เป็นเวลาท้องถิ่นพร้อม millisecond โดยไม่เพิ่ม dependency ใหม่
+fn local_timestamp(timestamp_unix_ms: u64) -> String {
+    let seconds = i64::try_from(timestamp_unix_ms / 1_000).unwrap_or(i64::MAX);
+    let milliseconds = timestamp_unix_ms % 1_000;
+    glib::DateTime::from_unix_local(seconds)
+        .and_then(|timestamp| timestamp.format("%Y-%m-%d %H:%M:%S"))
+        .map_or_else(
+            |_| timestamp_unix_ms.to_string(),
+            |timestamp| format!("{timestamp}.{milliseconds:03}"),
+        )
+}
+
+/// วัด latency แบบทศนิยมเพื่อให้รอบ GPU ที่ต่ำกว่า 1 ms ไม่ถูกปัดเป็นศูนย์
+fn precise_duration_ms(duration: Duration) -> String {
+    format!("{:.2} ms", duration.as_secs_f64() * 1_000.0)
+}
+
+/// ทำให้ newline ภายในข้อความหนึ่งค่าไม่ทำลายโครงบรรทัดของ debug block
+fn escape_debug_text(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
 }
 
 /// สร้างหน้าข้อมูลรุ่นและขอบเขตความเป็นส่วนตัว

@@ -14,7 +14,7 @@ use std::{
         mpsc::{self, Receiver, Sender, TryRecvError},
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use whisper_rs::{
@@ -25,6 +25,8 @@ use crate::audio::{LatestQueue, MixedAudioChunk, SAMPLE_RATE_HZ};
 
 // คิวเหตุการณ์มีขอบเขตเพื่อรักษาความสดของคำบรรยายเมื่อ UI รับข้อมูลไม่ทัน
 const EVENT_QUEUE_CAPACITY: usize = 64;
+// คิว debug แยกจากเหตุการณ์หลัก เพื่อไม่ให้การเปิดหน้าดูข้อมูลรบกวน subtitle
+const DEBUG_QUEUE_CAPACITY: usize = 256;
 // สมมติฐานที่ไม่เปลี่ยนติดต่อกันสองรอบถือว่านิ่งพอที่จะยืนยันเป็นผลสุดท้าย
 const STABLE_PASSES_TO_FINAL: u8 = 2;
 // เวิร์กเกอร์พักสั้น ๆ ระหว่างรอบเพื่อรับคำสั่งได้ไวโดยไม่วนใช้ CPU เปล่า
@@ -67,6 +69,59 @@ pub enum TranscriptUpdate {
     Partial { segment_id: u64, text: String },
     /// ข้อความที่นิ่งแล้วและใช้ปิดช่วงปัจจุบัน
     Final { segment_id: u64, text: String },
+}
+
+/// ชนิดผลลัพธ์ของสมมติฐาน Whisper หนึ่งรอบ
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SttDebugRecordKind {
+    /// สมมติฐานยังเปลี่ยนได้เมื่อมีเสียงใหม่
+    Partial,
+    /// สมมติฐานนิ่งและปิด segment แล้ว
+    Final,
+    /// Whisper คืนข้อความที่ถูกกรองและไม่ส่งไปยัง subtitle
+    Ignored,
+}
+
+impl SttDebugRecordKind {
+    /// คืนชื่อคงที่สำหรับแสดงผลและเขียน JSONL
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Partial => "partial",
+            Self::Final => "final",
+            Self::Ignored => "ignored",
+        }
+    }
+}
+
+/// ข้อมูลจาก Whisper หนึ่ง inference ซึ่งเป็นสมมติฐานทั้งท่อน ไม่ใช่ผลทีละคำ
+#[derive(Clone, Debug, PartialEq)]
+pub struct SttDebugRecord {
+    /// เวลา wall-clock หลัง inference จบในหน่วย Unix milliseconds
+    pub timestamp_unix_ms: u64,
+    /// รุ่นเสียงที่ใช้กันผลลัพธ์จาก source เก่า
+    pub audio_generation: u64,
+    /// รหัสช่วงคำพูดที่ Whisper กำลังแก้ไขหรือยืนยัน
+    pub segment_id: u64,
+    /// สถานะ partial, final หรือ ignored
+    pub kind: SttDebugRecordKind,
+    /// ข้อความรวมทุก segment ที่ Whisper คืนจาก inference รอบนี้
+    pub raw_text: String,
+    /// ข้อความหลังลบ marker และจัดช่องว่าง
+    pub processed_text: String,
+    /// ข้อความที่ส่งออกเป็น transcript จริง หรือว่างเมื่อถูกละทิ้ง
+    pub emitted_text: String,
+    /// เวลารวมการเรียกโมเดลและจัดผลลัพธ์รอบนี้
+    pub whisper_model_duration: Duration,
+    /// เวลาเฉพาะที่ครอบ `WhisperState::full`
+    pub gpu_backend_duration: Duration,
+    /// backend ของ whisper.cpp ถูกตั้งค่าให้ร้องขอ GPU หรือไม่
+    pub gpu_backend_requested: bool,
+    /// หมายเลขอุปกรณ์ GPU ที่ส่งให้ whisper.cpp
+    pub gpu_device: i32,
+    /// ระยะเสียงใหม่ขั้นต่ำของรอบนี้
+    pub step_ms: u32,
+    /// ความยาวบริบทเสียงของรอบนี้
+    pub window_ms: u32,
 }
 
 impl TranscriptUpdate {
@@ -122,6 +177,8 @@ pub struct SttService {
     commands: Sender<WorkerCommand>,
     /// คิวเหตุการณ์แบบเก็บข้อมูลล่าสุดเพื่อไม่ให้ STT ดันงานค้างไปถึง UI
     events: LatestQueue<SttEvent>,
+    /// คิวข้อมูล debug ที่เปิดใช้ตามคำขอและไม่ปะปนกับเหตุการณ์ subtitle
+    debug_records: LatestQueue<SttDebugRecord>,
     /// รุ่นเสียงที่เวิร์กเกอร์ยอมรับและเผยแพร่แล้ว
     audio_generation: Arc<AtomicU64>,
     /// สิทธิ์ join เธรด Whisper ซึ่งอยู่กับ service หลักเพียงตัวเดียว
@@ -142,6 +199,14 @@ impl SttService {
     /// เปลี่ยนจังหวะ streaming และตัวกรองกิจกรรมเสียงโดยใช้โมเดลเดิมที่โหลดอยู่
     pub fn update_streaming(&self, config: SttStreamingConfig) {
         let _ = self.commands.send(WorkerCommand::UpdateStreaming(config));
+    }
+
+    /// เปิดหรือปิดการสร้างข้อมูล debug ภายใน worker โดยการปิดจะล้างข้อมูลค้างทันที
+    pub fn set_debug_enabled(&self, enabled: bool) {
+        if !enabled {
+            self.debug_records.clear_reliable();
+        }
+        let _ = self.commands.send(WorkerCommand::SetDebugEnabled(enabled));
     }
 
     /// หยุดรับเสียงชั่วคราวโดยเก็บโมเดลที่โหลดแล้วไว้
@@ -180,6 +245,11 @@ impl SttService {
     pub fn drain_events(&self) -> Vec<SttEvent> {
         self.events.drain()
     }
+
+    /// ดึงข้อมูล debug ที่รออยู่ทั้งหมดโดยไม่แตะคิวเหตุการณ์ STT หลัก
+    pub fn drain_debug_records(&self) -> Vec<SttDebugRecord> {
+        self.debug_records.drain()
+    }
 }
 
 impl Drop for SttService {
@@ -194,16 +264,27 @@ pub fn spawn_service(input: LatestQueue<MixedAudioChunk>) -> SttService {
     let (commands, command_receiver) = mpsc::channel();
     let events = LatestQueue::new(EVENT_QUEUE_CAPACITY);
     let worker_events = events.clone();
+    let debug_records = LatestQueue::new(DEBUG_QUEUE_CAPACITY);
+    let worker_debug_records = debug_records.clone();
     let audio_generation = Arc::new(AtomicU64::new(0));
     let worker_generation = Arc::clone(&audio_generation);
     let worker = thread::Builder::new()
         .name("whisper-stt".to_owned())
-        .spawn(move || run_worker(input, command_receiver, worker_events, worker_generation))
+        .spawn(move || {
+            run_worker(
+                input,
+                command_receiver,
+                worker_events,
+                worker_debug_records,
+                worker_generation,
+            )
+        })
         .expect("failed to spawn STT worker");
 
     SttService {
         commands,
         events,
+        debug_records,
         audio_generation,
         worker: Some(worker),
     }
@@ -217,6 +298,8 @@ enum WorkerCommand {
     Stop,
     /// ใช้ค่าการส่งเสียงชุดใหม่โดยไม่โหลดโมเดลซ้ำ
     UpdateStreaming(SttStreamingConfig),
+    /// เปิดหรือปิดการเก็บ raw transcript สำหรับหน้าและไฟล์ debug
+    SetDebugEnabled(bool),
     /// คงโมเดลไว้แต่หยุดรับเสียงชั่วคราว
     PauseAudio,
     /// รับเสียงต่อด้วยหมายเลขรุ่นใหม่
@@ -230,11 +313,13 @@ fn run_worker(
     input: LatestQueue<MixedAudioChunk>,
     commands: Receiver<WorkerCommand>,
     events: LatestQueue<SttEvent>,
+    debug_records: LatestQueue<SttDebugRecord>,
     audio_generation: Arc<AtomicU64>,
 ) {
     let mut active: Option<ActiveStt> = None;
     let mut audio_paused = true;
     let mut current_audio_generation = 0;
+    let mut debug_enabled = false;
 
     loop {
         match next_command(&commands, active.is_some()) {
@@ -266,6 +351,12 @@ fn run_worker(
                     && let Err(error) = stt.update_streaming(config)
                 {
                     events.push_latest_reliable(SttEvent::Error(error));
+                }
+            }
+            CommandState::Command(WorkerCommand::SetDebugEnabled(enabled)) => {
+                debug_enabled = enabled;
+                if !enabled {
+                    debug_records.clear_reliable();
                 }
             }
             CommandState::Command(WorkerCommand::PauseAudio) => {
@@ -301,8 +392,11 @@ fn run_worker(
             continue;
         }
 
-        match stt.consume_latest(&input, current_audio_generation) {
+        match stt.consume_latest(&input, current_audio_generation, debug_enabled) {
             Ok(Some(result)) => {
+                if let Some(record) = result.debug_record {
+                    debug_records.push_latest(record);
+                }
                 if let Some(update) = result.update {
                     events.push_latest(SttEvent::Transcript {
                         audio_generation: current_audio_generation,
@@ -397,6 +491,8 @@ struct InferenceResult {
     audio_buffer_duration: Duration,
     /// เวลาที่ใช้เรียก Whisper โดยไม่รวมการรอเสียง
     inference_duration: Duration,
+    /// ข้อมูลเต็มของสมมติฐานรอบนี้ ซึ่งสร้างเฉพาะเมื่อผู้ใช้เปิด debug
+    debug_record: Option<SttDebugRecord>,
 }
 
 impl ActiveStt {
@@ -461,6 +557,7 @@ impl ActiveStt {
         &mut self,
         input: &LatestQueue<MixedAudioChunk>,
         current_audio_generation: u64,
+        debug_enabled: bool,
     ) -> Result<Option<InferenceResult>, String> {
         let dropped = input.dropped();
         if dropped != self.observed_dropped {
@@ -539,40 +636,39 @@ impl ActiveStt {
         let processed_text = normalize_hypothesis_text(&raw_text);
         let update = self.reconcile_hypothesis(processed_text.clone());
         let whisper_model_duration = whisper_model_started.elapsed();
-        tracing::debug!(
-            event = "whisper_model_latency",
-            segment_id = inference_segment_id,
-            whisper_model_latency_ms = whisper_model_duration.as_secs_f64() * 1_000.0,
-            "วัด latency การถอดเสียงจากโมเดล whisper.cpp"
-        );
-        tracing::debug!(
-            event = "gpu_transcription_latency",
-            segment_id = inference_segment_id,
-            gpu_backend_requested = self.gpu_backend_requested,
-            gpu_device = self.gpu_device,
-            gpu_backend_wall_ms = gpu_backend_duration.as_secs_f64() * 1_000.0,
-            "วัดเวลาครอบ WhisperState::full ของ backend ที่ร้องขอ GPU"
-        );
-        let (result_kind, emitted_text) = match update.as_ref() {
-            Some(TranscriptUpdate::Partial { text, .. }) => ("partial", text.as_str()),
-            Some(TranscriptUpdate::Final { text, .. }) => ("final", text.as_str()),
-            None => ("ignored", ""),
-        };
-        tracing::debug!(
-            event = "whisper_transcript_text",
-            segment_id = inference_segment_id,
-            result_kind,
-            raw_text = %raw_text,
-            processed_text = %processed_text,
-            emitted_text = %emitted_text,
-            "แสดงข้อความดิบและข้อความที่ตัดออกจาก Whisper"
-        );
+        let debug_record = debug_enabled.then(|| {
+            let (kind, emitted_text) = match update.as_ref() {
+                Some(TranscriptUpdate::Partial { text, .. }) => {
+                    (SttDebugRecordKind::Partial, text.clone())
+                }
+                Some(TranscriptUpdate::Final { text, .. }) => {
+                    (SttDebugRecordKind::Final, text.clone())
+                }
+                None => (SttDebugRecordKind::Ignored, String::new()),
+            };
+            SttDebugRecord {
+                timestamp_unix_ms: unix_timestamp_ms(),
+                audio_generation: current_audio_generation,
+                segment_id: inference_segment_id,
+                kind,
+                raw_text,
+                processed_text,
+                emitted_text,
+                whisper_model_duration,
+                gpu_backend_duration,
+                gpu_backend_requested: self.gpu_backend_requested,
+                gpu_device: self.gpu_device,
+                step_ms: self.config.step_ms,
+                window_ms: self.config.window_ms,
+            }
+        });
 
         Ok(Some(InferenceResult {
             update,
             audio_origin_at,
             audio_buffer_duration,
             inference_duration: gpu_backend_duration,
+            debug_record,
         }))
     }
 
@@ -623,6 +719,15 @@ impl ActiveStt {
         self.segment_id = self.segment_id.saturating_add(1);
         self.silence_active = true;
     }
+}
+
+/// คืนเวลา Unix ปัจจุบันโดย fallback เป็นศูนย์หากนาฬิการะบบอยู่ก่อน epoch
+fn unix_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0)
 }
 
 /// ตรวจค่าที่มีผลต่อความถูกต้องและขนาดงานของ Whisper ก่อนโหลดโมเดล

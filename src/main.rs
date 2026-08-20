@@ -353,6 +353,12 @@ fn install_runtime_poll(
             desktop.settings.update_state(state, last_error.as_deref());
             desktop.settings.update_metrics(metrics);
             desktop.settings.update_pipewire_status(pipewire_status);
+            desktop
+                .settings
+                .append_debug_records(&update.debug_records);
+            if let Some(status) = update.debug_log_status.as_ref() {
+                desktop.settings.update_debug_log_status(status);
+            }
             let overlay_events = desktop.overlay.poll_events();
             for event in &overlay_events {
                 if let OverlayEvent::MonitorsChanged { monitors } = event {

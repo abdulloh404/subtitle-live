@@ -11,6 +11,15 @@ use crate::{
 
 use super::{AppCommand, AppEvent, ApplicationState};
 
+/// ตัวเลือก debug ที่มีผลเฉพาะโปรเซสปัจจุบันและไม่ถูกบันทึกลง config
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DebugSessionState {
+    /// ส่งข้อมูลแต่ละรอบ inference ไปแสดงบนหน้า Debug
+    pub live_enabled: bool,
+    /// บันทึกข้อมูลแต่ละรอบ inference เป็นไฟล์ JSONL
+    pub file_logging_enabled: bool,
+}
+
 /// แหล่งข้อมูลจริงของ config สถานะ pipeline และกฎเลือก stream ในชั้นแอปพลิเคชัน
 pub struct ApplicationController {
     /// การตั้งค่าที่ผ่านการปรับค่าให้อยู่ในช่วงที่ UI รองรับ
@@ -21,6 +30,8 @@ pub struct ApplicationController {
     streams: Vec<StreamInfo>,
     /// เลขลำดับคำขอ retry เพื่อให้ runtime เห็นคำสั่งจากผู้เรียกทุกช่องทาง
     retry_generation: u64,
+    /// สถานะ debug ชั่วคราว ซึ่งเริ่มปิดใหม่ทุกครั้งที่เปิดโปรแกรม
+    debug_session: DebugSessionState,
 }
 
 impl ApplicationController {
@@ -38,6 +49,7 @@ impl ApplicationController {
             state,
             streams: Vec::new(),
             retry_generation: 0,
+            debug_session: DebugSessionState::default(),
         }
     }
 
@@ -49,6 +61,11 @@ impl ApplicationController {
     /// คืนเลขลำดับคำขอ retry ล่าสุดสำหรับให้ runtime ตรวจจับแบบไม่บล็อก
     pub const fn retry_generation(&self) -> u64 {
         self.retry_generation
+    }
+
+    /// คืนสถานะ debug ของเซสชันปัจจุบัน
+    pub const fn debug_session_state(&self) -> DebugSessionState {
+        self.debug_session
     }
 
     /// คืนการตั้งค่าปัจจุบันแบบยืมค่า
@@ -287,6 +304,14 @@ impl ApplicationController {
             AppCommand::SetVadEnabled(enabled) => {
                 self.config.stt.vad_enabled = enabled;
                 AppEvent::ConfigChanged("stt.vad_enabled")
+            }
+            AppCommand::SetDebugLiveEnabled(enabled) => {
+                self.debug_session.live_enabled = enabled;
+                AppEvent::SessionChanged
+            }
+            AppCommand::SetDebugFileLoggingEnabled(enabled) => {
+                self.debug_session.file_logging_enabled = enabled;
+                AppEvent::SessionChanged
             }
             AppCommand::SetSubtitleVisible(visible) => {
                 self.config.subtitle.visible = visible;

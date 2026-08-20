@@ -10,13 +10,14 @@ use std::{
 };
 
 use crate::{
-    app::{AppCommand, ApplicationController, ApplicationState},
+    app::{AppCommand, ApplicationController, ApplicationState, DebugSessionState},
     audio::{LatestQueue, MixedAudioChunk, MixerHandle, SourceAudioChunk, spawn_mixer},
-    config::{AppConfig, ConfigWriter},
+    config::{AppConfig, ConfigWriter, default_debug_log_path},
+    debug_log::{DebugLogStatus, DebugLogWriter},
     metrics::{LatencyTracker, MetricsSnapshot},
     pipewire::{CaptureTarget, PipeWireEvent, PipeWireService, spawn_service as spawn_pipewire},
     stt::{
-        SttEvent, SttService, SttStartConfig, SttStreamingConfig, TranscriptUpdate,
+        SttDebugRecord, SttEvent, SttService, SttStartConfig, SttStreamingConfig, TranscriptUpdate,
         spawn_service as spawn_stt,
     },
     subtitle::TranscriptReconciler,
@@ -46,6 +47,10 @@ pub struct RuntimeUpdate {
     pub show_settings: bool,
     /// ต้องออกจาก GTK application อย่างเป็นระเบียบ
     pub quit_requested: bool,
+    /// ข้อมูล inference ใหม่สำหรับหน้า Debug เฉพาะเมื่อผู้ใช้เปิด live debug
+    pub debug_records: Vec<SttDebugRecord>,
+    /// สถานะ writer ล่าสุดเมื่อมีการเปลี่ยนแปลง
+    pub debug_log_status: Option<DebugLogStatus>,
 }
 
 /// ข้อความหนึ่งเฟรมที่ runtime ส่งไปยัง GTK
@@ -77,6 +82,8 @@ pub struct ApplicationRuntime {
     tray_commands: Option<Receiver<TrayCommand>>,
     // Writer บันทึก config บน thread แยกเพื่อไม่บล็อก UI
     config_writer: Option<ConfigWriter>,
+    // Writer debug แยก thread และไม่สร้างไฟล์จนกว่าผู้ใช้เปิดในเซสชันนี้
+    debug_log_writer: DebugLogWriter,
     default_model_path: PathBuf,
     model_ready: bool,
     last_persisted_config: AppConfig,
@@ -111,6 +118,8 @@ pub struct ApplicationRuntime {
     last_tray_state: Option<TrayState>,
     // ค่า streaming ล่าสุดที่ส่งให้ STT ใช้ตรวจว่าต้องอัปเดต worker หรือไม่
     applied_stt_streaming: Option<SttStreamingConfig>,
+    // สถานะ debug ล่าสุดที่ runtime ส่งให้ STT และ file writer แล้ว
+    applied_debug_session: DebugSessionState,
     shutdown_requested: bool,
 }
 
@@ -147,6 +156,14 @@ impl ApplicationRuntime {
             }
         };
         let config_writer = persistence_enabled.then(|| ConfigWriter::spawn(config_path));
+        let debug_log_path = default_debug_log_path().unwrap_or_else(|_| {
+            default_model_path
+                .parent()
+                .and_then(|models| models.parent())
+                .map(|data| data.join("logs/transcript-debug.jsonl"))
+                .unwrap_or_else(|| PathBuf::from("transcript-debug.jsonl"))
+        });
+        let debug_log_writer = DebugLogWriter::spawn(debug_log_path);
 
         Self {
             controller,
@@ -159,6 +176,7 @@ impl ApplicationRuntime {
             tray,
             tray_commands,
             config_writer,
+            debug_log_writer,
             default_model_path,
             model_ready,
             last_persisted_config,
@@ -184,6 +202,7 @@ impl ApplicationRuntime {
             startup_warning,
             last_tray_state: None,
             applied_stt_streaming: None,
+            applied_debug_session: DebugSessionState::default(),
             shutdown_requested: false,
         }
     }
@@ -199,11 +218,13 @@ impl ApplicationRuntime {
         self.handle_tray_commands(&mut update);
         self.sync_retry_intent(&mut update);
         self.sync_live_intent(&mut update);
+        self.sync_debug_session(&mut update);
         self.sync_stt_streaming_settings(&mut update);
         self.sync_capture_targets(&mut update);
         self.handle_pipewire_events(&mut update);
         self.sync_capture_targets(&mut update);
         self.handle_stt_events(&mut update);
+        self.handle_stt_debug_records(&mut update);
         self.sync_stt_resume_generation();
         self.sync_capture_targets(&mut update);
         self.clear_stale_subtitle(&mut update);
@@ -351,6 +372,9 @@ impl ApplicationRuntime {
         if let Some(writer) = &mut self.config_writer {
             writer.finish();
         }
+        if let Err(error) = self.debug_log_writer.finish() {
+            tracing::error!(error = %error, "ตัวเขียน transcript debug ปิดไม่สมบูรณ์");
+        }
     }
 
     /// แปลงคำสั่งจาก tray เป็น AppCommand หรือ RuntimeUpdate โดยไม่แตะ worker โดยตรง
@@ -409,6 +433,30 @@ impl ApplicationRuntime {
         } else {
             self.stop_pipeline();
             update.hide_overlay = true;
+        }
+    }
+
+    /// ส่งสถานะ debug ชั่วคราวไปยัง STT และ writer โดยไม่บันทึกลง config
+    fn sync_debug_session(&mut self, update: &mut RuntimeUpdate) {
+        let desired = self.controller.borrow().debug_session_state();
+        if desired != self.applied_debug_session {
+            let capture_enabled = desired.live_enabled || desired.file_logging_enabled;
+            let previous_capture_enabled = self.applied_debug_session.live_enabled
+                || self.applied_debug_session.file_logging_enabled;
+            if capture_enabled != previous_capture_enabled {
+                self.stt.set_debug_enabled(capture_enabled);
+            }
+            if desired.file_logging_enabled
+                != self.applied_debug_session.file_logging_enabled
+            {
+                self.debug_log_writer
+                    .set_enabled(desired.file_logging_enabled);
+            }
+            self.applied_debug_session = desired;
+        }
+
+        if let Some(status) = self.debug_log_writer.drain_statuses().into_iter().last() {
+            update.debug_log_status = Some(status);
         }
     }
 
@@ -668,6 +716,20 @@ impl ApplicationRuntime {
                 | SttEvent::Metrics { .. }
                 | SttEvent::Error(_) => {}
             }
+        }
+    }
+
+    /// แยก raw transcript ออกจาก event ปกติ แล้วส่งต่อเฉพาะปลายทางที่ผู้ใช้เปิดไว้
+    fn handle_stt_debug_records(&mut self, update: &mut RuntimeUpdate) {
+        let records = self.stt.drain_debug_records();
+        if records.is_empty() {
+            return;
+        }
+        if self.applied_debug_session.file_logging_enabled {
+            self.debug_log_writer.write_records(records.iter().cloned());
+        }
+        if self.applied_debug_session.live_enabled {
+            update.debug_records = records;
         }
     }
 
