@@ -25,6 +25,8 @@ pub enum TrayCommand {
     StartSubtitles,
     /// หยุด pipeline คำบรรยาย
     StopSubtitles,
+    /// เริ่ม pipeline ใหม่หลังเกิดข้อผิดพลาด
+    RetryPipeline,
     /// แสดงหน้าต่างตั้งค่า
     ShowSettings,
     /// ออกจากแอปพลิเคชัน
@@ -34,6 +36,8 @@ pub enum TrayCommand {
 /// handle ฝั่ง runtime สำหรับส่งสถานะไปยัง tray thread
 pub struct TrayIndicator {
     updates: Sender<TrayUpdate>,
+    /// สิทธิ์ join เธรด tray ซึ่งอยู่กับ runtime เพียงตัวเดียว
+    worker: Option<thread::JoinHandle<()>>,
 }
 
 /// ข้อความภายในจาก runtime ไปยัง tray thread
@@ -62,7 +66,7 @@ impl TrayIndicator {
         };
         let handle = model.spawn().map_err(|error| error.to_string())?;
         let (updates, update_receiver) = mpsc::channel();
-        thread::Builder::new()
+        let worker = thread::Builder::new()
             .name("tray-indicator".to_owned())
             .spawn(move || {
                 while let Ok(update) = update_receiver.recv() {
@@ -80,7 +84,13 @@ impl TrayIndicator {
             })
             .map_err(|error| error.to_string())?;
 
-        Ok((Self { updates }, command_receiver))
+        Ok((
+            Self {
+                updates,
+                worker: Some(worker),
+            },
+            command_receiver,
+        ))
     }
 
     /// ส่งสถานะล่าสุดไปยัง tray thread แบบไม่บล็อก
@@ -91,6 +101,17 @@ impl TrayIndicator {
     /// ขอให้ tray thread ปิด status notifier
     pub fn shutdown(&self) {
         let _ = self.updates.send(TrayUpdate::Shutdown);
+    }
+
+    /// ขอปิด status notifier และรอให้ tray worker ออกจนเสร็จ
+    pub fn finish(&mut self) -> Result<(), String> {
+        self.shutdown();
+        let Some(worker) = self.worker.take() else {
+            return Ok(());
+        };
+        worker
+            .join()
+            .map_err(|_| "tray indicator thread panicked while shutting down".to_owned())
     }
 }
 
@@ -148,24 +169,14 @@ impl ksni::Tray for IndicatorModel {
             enabled: false,
             ..Default::default()
         };
-        let toggle = if self.state == TrayState::Active {
-            let commands = self.commands.clone();
-            StandardItem {
-                label: "Stop Subtitles".to_owned(),
-                activate: Box::new(move |_| {
-                    let _ = commands.send(TrayCommand::StopSubtitles);
-                }),
-                ..Default::default()
-            }
-        } else {
-            let commands = self.commands.clone();
-            StandardItem {
-                label: "Start Subtitles".to_owned(),
-                activate: Box::new(move |_| {
-                    let _ = commands.send(TrayCommand::StartSubtitles);
-                }),
-                ..Default::default()
-            }
+        let (action_label, action_command) = self.primary_action();
+        let action_commands = self.commands.clone();
+        let toggle = StandardItem {
+            label: action_label.to_owned(),
+            activate: Box::new(move |_| {
+                let _ = action_commands.send(action_command);
+            }),
+            ..Default::default()
         };
         let show_settings_commands = self.commands.clone();
         let show_settings = StandardItem {
@@ -197,6 +208,15 @@ impl ksni::Tray for IndicatorModel {
 }
 
 impl IndicatorModel {
+    /// เลือก action หลักให้ตรงกับสถานะจริงของ pipeline
+    const fn primary_action(&self) -> (&'static str, TrayCommand) {
+        match self.state {
+            TrayState::Active => ("Stop Subtitles", TrayCommand::StopSubtitles),
+            TrayState::Paused => ("Start Subtitles", TrayCommand::StartSubtitles),
+            TrayState::Error => ("Retry Subtitles", TrayCommand::RetryPipeline),
+        }
+    }
+
     /// แปลงสถานะเป็นข้อความสั้นสำหรับ title และเมนู
     const fn state_label(&self) -> &'static str {
         match self.state {
@@ -204,5 +224,26 @@ impl IndicatorModel {
             TrayState::Paused => "Paused",
             TrayState::Error => "Error",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+
+    use super::{IndicatorModel, TrayCommand, TrayState};
+
+    #[test]
+    fn error_state_offers_retry_pipeline() {
+        let (commands, _receiver) = mpsc::channel();
+        let model = IndicatorModel {
+            commands,
+            state: TrayState::Error,
+        };
+
+        assert_eq!(
+            model.primary_action(),
+            ("Retry Subtitles", TrayCommand::RetryPipeline)
+        );
     }
 }

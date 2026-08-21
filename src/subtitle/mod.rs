@@ -548,10 +548,7 @@ mod tests {
             1,
             "Speech [BLANK_AUDIO] remains visible now",
         );
-        assert_eq!(
-            reconciler.presentation_text(),
-            "Speech remains visible now"
-        );
+        assert_eq!(reconciler.presentation_text(), "Speech remains visible now");
     }
 
     #[test]

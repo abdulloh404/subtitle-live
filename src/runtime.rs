@@ -2,7 +2,7 @@
 
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     rc::Rc,
     sync::mpsc::Receiver,
@@ -10,15 +10,14 @@ use std::{
 };
 
 use crate::{
-    app::{AppCommand, ApplicationController, ApplicationState},
-    audio::{
-        LatestQueue, MixedAudioChunk, MixerHandle, SourceAudioChunk, spawn_mixer,
-    },
-    config::{AppConfig, ConfigWriter},
+    app::{AppCommand, ApplicationController, ApplicationState, DebugSessionState},
+    audio::{LatestQueue, MixedAudioChunk, MixerHandle, SourceAudioChunk, spawn_mixer},
+    config::{AppConfig, ConfigWriter, default_debug_log_path},
+    debug_log::{DebugLogStatus, DebugLogWriter},
     metrics::{LatencyTracker, MetricsSnapshot},
     pipewire::{CaptureTarget, PipeWireEvent, PipeWireService, spawn_service as spawn_pipewire},
     stt::{
-        SttEvent, SttService, SttStartConfig, SttStreamingConfig, TranscriptUpdate,
+        SttDebugRecord, SttEvent, SttService, SttStartConfig, SttStreamingConfig, TranscriptUpdate,
         spawn_service as spawn_stt,
     },
     subtitle::TranscriptReconciler,
@@ -31,7 +30,9 @@ const MIX_FRAME_DURATION_MS: usize = 20;
 // เผื่อพื้นที่เพิ่มเพื่อให้ STT มีช่วงรับความผันผวนโดยไม่ทำให้คิวโตแบบไม่จำกัด
 const INFERENCE_HEADROOM_MS: usize = 2_000;
 // เมื่อไม่มีผลถอดเสียงใหม่เกินช่วงนี้ ให้ล้างบริบทเก่าและซ่อน overlay
-const SUBTITLE_IDLE_TIMEOUT: Duration = Duration::from_secs(4);
+const SUBTITLE_IDLE_TIMEOUT: Duration = Duration::from_secs(3);
+// จำกัด correlation ที่รอ overlay ตอบกลับ เพราะ frame เก่าอาจถูก mailbox แทนที่และไม่มี acknowledgment
+const MAX_PENDING_OVERLAY_FRAMES: usize = 64;
 
 /// ชุดการเปลี่ยนแปลงที่ GTK main thread ต้องนำไปใช้หลังจบรอบ poll หนึ่งครั้ง
 #[derive(Debug, Default)]
@@ -46,6 +47,21 @@ pub struct RuntimeUpdate {
     pub show_settings: bool,
     /// ต้องออกจาก GTK application อย่างเป็นระเบียบ
     pub quit_requested: bool,
+    /// ข้อมูล inference ใหม่สำหรับหน้า Debug เฉพาะเมื่อผู้ใช้เปิด live debug
+    pub debug_records: Vec<SttDebugRecord>,
+    /// สถานะ writer ล่าสุดเมื่อมีการเปลี่ยนแปลง
+    pub debug_log_status: Option<DebugLogStatus>,
+    /// จำนวน debug record สะสมที่ถูกทิ้ง เมื่อค่าเปลี่ยนจากรอบก่อน
+    pub debug_drop_counts: Option<DebugDropCounts>,
+}
+
+/// จำนวน debug record สะสมที่แต่ละคิวทิ้งตลอดอายุโปรเซส
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DebugDropCounts {
+    /// จำนวน record ที่คิวระหว่าง STT กับ runtime ทิ้ง
+    pub stt_queue: u64,
+    /// จำนวน record ที่คิวระหว่าง runtime กับ file writer ทิ้ง
+    pub file_queue: u64,
 }
 
 /// ข้อความหนึ่งเฟรมที่ runtime ส่งไปยัง GTK
@@ -55,6 +71,8 @@ pub struct SubtitleFrame {
     pub text: String,
     /// ระบุว่า Whisper ยืนยัน segment นี้แล้วหรือยังเป็น partial
     pub is_final: bool,
+    /// เวลาเริ่มของ audio step ที่สร้างข้อความ สำหรับวัดจน overlay วาดเสร็จ
+    pub audio_origin_at: Instant,
 }
 
 /// เจ้าของ lifecycle ของบริการเสียง, STT, tray, config และสถานะ transcript
@@ -67,12 +85,16 @@ pub struct ApplicationRuntime {
     // Handle ของ worker/service ใช้ส่งคำสั่งเท่านั้น งานหนักไม่เกิดบน GTK thread
     mixer: MixerHandle,
     pipewire: PipeWireService,
+    // Service รุ่นเก่าจาก Retry ถูกสั่งปิดแล้วและรอ join หลัง GTK event loop จบ
+    retired_pipewire: Vec<PipeWireService>,
     stt: SttService,
     // Tray เป็น optional เพราะบาง desktop ไม่มี StatusNotifier host
     tray: Option<TrayIndicator>,
     tray_commands: Option<Receiver<TrayCommand>>,
     // Writer บันทึก config บน thread แยกเพื่อไม่บล็อก UI
     config_writer: Option<ConfigWriter>,
+    // Writer debug แยก thread และไม่สร้างไฟล์จนกว่าผู้ใช้เปิดในเซสชันนี้
+    debug_log_writer: DebugLogWriter,
     default_model_path: PathBuf,
     model_ready: bool,
     last_persisted_config: AppConfig,
@@ -83,20 +105,34 @@ pub struct ApplicationRuntime {
     capture_errors: HashMap<u32, String>,
     // ระหว่างเปลี่ยน capture จะหยุดรับ transcript จน STT ยืนยัน audio generation ใหม่
     capture_transition_pending: bool,
+    // รุ่นเดียวที่ส่งผ่าน PipeWire, mixer และ STT เพื่อกันเสียงจาก transition เก่า
+    pipeline_audio_generation: u64,
     stt_resume_generation: Option<u64>,
     accepted_audio_generation: Option<u64>,
     // Reconciler ป้องกัน partial/final ซ้ำและรักษาคำที่ commit แล้ว
     transcript: TranscriptReconciler,
     last_subtitle_update: Option<Instant>,
     metrics: LatencyTracker,
+    // จับคู่ frame id ของ IPC กับต้นทางเสียง โดยเก็บจำนวนคงที่เพื่อรองรับ frame ที่ถูก coalesce
+    pending_overlay_frames: VecDeque<(u64, i64)>,
     running_requested: bool,
     stt_ready: bool,
+    // เลขคำขอ retry ที่ runtime ประมวลผลแล้ว ป้องกันการเริ่มซ้ำในแต่ละรอบ poll
+    observed_retry_generation: u64,
+    // ใช้ข้าม Stopped ที่เกิดจากคำสั่งหยุดโดยตั้งใจก่อนเริ่ม retry เท่านั้น
+    retry_stop_pending: bool,
     pipeline_error: Option<String>,
+    // เป็น true หลัง registry ส่ง snapshot ครั้งแรก จึงไม่รายงาน Connected ก่อนเชื่อมจริง
+    pipewire_connected: bool,
     pipewire_error: Option<String>,
     startup_warning: Option<String>,
     last_tray_state: Option<TrayState>,
     // ค่า streaming ล่าสุดที่ส่งให้ STT ใช้ตรวจว่าต้องอัปเดต worker หรือไม่
     applied_stt_streaming: Option<SttStreamingConfig>,
+    // สถานะ debug ล่าสุดที่ runtime ส่งให้ STT และ file writer แล้ว
+    applied_debug_session: DebugSessionState,
+    // snapshot ตัวนับ debug ที่ส่งให้ UI ล่าสุด เริ่มที่ศูนย์ทุกโปรเซส
+    last_debug_drop_counts: DebugDropCounts,
     shutdown_requested: bool,
 }
 
@@ -111,10 +147,10 @@ impl ApplicationRuntime {
         mut startup_warning: Option<String>,
     ) -> Self {
         let last_persisted_config = controller.borrow().config_snapshot();
+        let observed_retry_generation = controller.borrow().retry_generation();
         let source_audio = LatestQueue::new(SOURCE_QUEUE_CAPACITY);
-        let mixed_audio = LatestQueue::new(mixed_queue_capacity(
-            last_persisted_config.stt.window_ms,
-        ));
+        let mixed_audio =
+            LatestQueue::new(mixed_queue_capacity(last_persisted_config.stt.window_ms));
         let mixer = spawn_mixer(source_audio.clone(), mixed_audio.clone());
         let pipewire = spawn_pipewire(source_audio.clone());
         let stt = spawn_stt(mixed_audio.clone());
@@ -133,6 +169,14 @@ impl ApplicationRuntime {
             }
         };
         let config_writer = persistence_enabled.then(|| ConfigWriter::spawn(config_path));
+        let debug_log_path = default_debug_log_path().unwrap_or_else(|_| {
+            default_model_path
+                .parent()
+                .and_then(|models| models.parent())
+                .map(|data| data.join("logs/transcript-debug.jsonl"))
+                .unwrap_or_else(|| PathBuf::from("transcript-debug.jsonl"))
+        });
+        let debug_log_writer = DebugLogWriter::spawn(debug_log_path);
 
         Self {
             controller,
@@ -140,10 +184,12 @@ impl ApplicationRuntime {
             mixed_audio,
             mixer,
             pipewire,
+            retired_pipewire: Vec::new(),
             stt,
             tray,
             tray_commands,
             config_writer,
+            debug_log_writer,
             default_model_path,
             model_ready,
             last_persisted_config,
@@ -152,18 +198,25 @@ impl ApplicationRuntime {
             active_captures: HashSet::new(),
             capture_errors: HashMap::new(),
             capture_transition_pending: false,
+            pipeline_audio_generation: 0,
             stt_resume_generation: None,
             accepted_audio_generation: None,
             transcript: TranscriptReconciler::default(),
             last_subtitle_update: None,
             metrics: LatencyTracker::default(),
+            pending_overlay_frames: VecDeque::new(),
             running_requested: false,
             stt_ready: false,
+            observed_retry_generation,
+            retry_stop_pending: false,
             pipeline_error: None,
+            pipewire_connected: false,
             pipewire_error: None,
             startup_warning,
             last_tray_state: None,
             applied_stt_streaming: None,
+            applied_debug_session: DebugSessionState::default(),
+            last_debug_drop_counts: DebugDropCounts::default(),
             shutdown_requested: false,
         }
     }
@@ -175,19 +228,39 @@ impl ApplicationRuntime {
             return update;
         }
 
+        self.reap_retired_pipewire();
         self.handle_tray_commands(&mut update);
+        self.sync_retry_intent(&mut update);
         self.sync_live_intent(&mut update);
+        self.sync_debug_session(&mut update);
         self.sync_stt_streaming_settings(&mut update);
         self.sync_capture_targets(&mut update);
         self.handle_pipewire_events(&mut update);
         self.sync_capture_targets(&mut update);
         self.handle_stt_events(&mut update);
+        self.handle_stt_debug_records(&mut update);
+        self.sync_debug_drop_counts(&mut update);
         self.sync_stt_resume_generation();
         self.sync_capture_targets(&mut update);
         self.clear_stale_subtitle(&mut update);
         self.persist_if_changed();
         self.sync_tray_state();
         update
+    }
+
+    /// join เฉพาะ PipeWire worker รุ่นเก่าที่จบแล้ว จึงไม่รอ native main loop บน GTK thread
+    fn reap_retired_pipewire(&mut self) {
+        let mut index = 0;
+        while index < self.retired_pipewire.len() {
+            if !self.retired_pipewire[index].is_finished() {
+                index += 1;
+                continue;
+            }
+            let mut service = self.retired_pipewire.swap_remove(index);
+            if let Err(error) = service.finish() {
+                tracing::error!(error = %error, "PipeWire worker รุ่นเก่าปิดไม่สมบูรณ์");
+            }
+        }
     }
 
     /// คืนสถานะ lifecycle ปัจจุบันสำหรับหน้า Settings และ tray
@@ -204,12 +277,52 @@ impl ApplicationRuntime {
             .or(self.startup_warning.as_deref())
     }
 
+    /// คืนสถานะการเชื่อมต่อ PipeWire สำหรับหน้า About
+    pub fn pipewire_status(&self) -> &'static str {
+        if self.pipewire_error.is_some() {
+            "Error"
+        } else if self.pipewire_connected {
+            "Connected"
+        } else {
+            "Starting"
+        }
+    }
+
     /// สร้าง snapshot latency พร้อมจำนวนข้อมูลที่ bounded queues จำเป็นต้องทิ้ง
     pub fn metrics_snapshot(&self) -> MetricsSnapshot {
-        self.metrics.snapshot(
-            self.source_audio.dropped(),
-            self.mixed_audio.dropped(),
-        )
+        self.metrics
+            .snapshot(self.source_audio.dropped(), self.mixed_audio.dropped())
+    }
+
+    /// ผูก frame ที่ส่งเข้า overlay IPC กับเวลาเริ่ม audio step ต้นทาง
+    pub fn track_overlay_frame(&mut self, frame_id: u64, audio_origin_micros: i64) {
+        if self.pending_overlay_frames.len() == MAX_PENDING_OVERLAY_FRAMES {
+            self.pending_overlay_frames.pop_front();
+        }
+        self.pending_overlay_frames
+            .push_back((frame_id, audio_origin_micros));
+    }
+
+    /// บันทึก End-to-End เมื่อ helper ยืนยันว่า GTK ผ่านรอบวาดของ frame แล้ว
+    pub fn record_overlay_rendered(&mut self, frame_id: u64, rendered_at_micros: i64) {
+        let Some(position) = self
+            .pending_overlay_frames
+            .iter()
+            .position(|(pending_id, _)| *pending_id == frame_id)
+        else {
+            return;
+        };
+        let audio_origin_micros = self.pending_overlay_frames[position].1;
+        self.pending_overlay_frames.drain(..=position);
+        let Some(duration) = monotonic_duration(audio_origin_micros, rendered_at_micros) else {
+            return;
+        };
+        self.metrics.record_end_to_end(duration);
+    }
+
+    /// ล้าง frame ที่ไม่มีทางถูกวาดแล้วเมื่อ overlay ถูกซ่อนหรือ transport ล้มเหลว
+    pub fn clear_pending_overlay_frames(&mut self) {
+        self.pending_overlay_frames.clear();
     }
 
     /// คืน model path ที่ผู้ใช้กำหนด หรือ path เริ่มต้นเมื่อไม่ได้ override
@@ -236,6 +349,9 @@ impl ApplicationRuntime {
         self.shutdown_requested = true;
         self.persist_if_changed();
         let _ = self.pipewire.stop_capture();
+        self.source_audio.clear_reliable();
+        self.mixed_audio.clear_reliable();
+        self.pending_overlay_frames.clear();
         let _ = self.pipewire.shutdown();
         self.stt.stop();
         self.stt.shutdown();
@@ -245,11 +361,42 @@ impl ApplicationRuntime {
         }
     }
 
-    /// รอเฉพาะงานเขียน config ที่ค้างอยู่ หลัง `Application::run` คืนค่าแล้ว
+    /// รอ worker ทุกตัวหลัง `Application::run` คืนค่าแล้ว จึงไม่บล็อก GTK main thread
     pub fn finish(&mut self) {
         self.request_shutdown();
+        // อ่านค่าที่ผู้ใช้เลือกจริงตอนปิด แทน snapshot จาก poll รอบก่อนที่อาจยังไม่ทัน sync
+        let desired_debug_session = self.controller.borrow().debug_session_state();
+        self.debug_log_writer
+            .set_enabled(desired_debug_session.file_logging_enabled);
+        if let Err(error) = self.pipewire.finish() {
+            tracing::error!(error = %error, "PipeWire worker ปิดไม่สมบูรณ์");
+        }
+        for service in &mut self.retired_pipewire {
+            if let Err(error) = service.finish() {
+                tracing::error!(error = %error, "PipeWire worker รุ่นเก่าปิดไม่สมบูรณ์");
+            }
+        }
+        self.retired_pipewire.clear();
+        if let Err(error) = self.mixer.finish() {
+            tracing::error!(error = %error, "audio mixer worker ปิดไม่สมบูรณ์");
+        }
+        if let Err(error) = self.stt.finish() {
+            tracing::error!(error = %error, "Whisper worker ปิดไม่สมบูรณ์");
+        }
+        let debug_tail = self.stt.drain_debug_records();
+        if desired_debug_session.file_logging_enabled {
+            self.debug_log_writer.write_records(debug_tail);
+        }
+        if let Some(tray) = &mut self.tray
+            && let Err(error) = tray.finish()
+        {
+            tracing::error!(error = %error, "tray worker ปิดไม่สมบูรณ์");
+        }
         if let Some(writer) = &mut self.config_writer {
             writer.finish();
+        }
+        if let Err(error) = self.debug_log_writer.finish() {
+            tracing::error!(error = %error, "ตัวเขียน transcript debug ปิดไม่สมบูรณ์");
         }
     }
 
@@ -274,20 +421,31 @@ impl ApplicationRuntime {
                         .borrow_mut()
                         .handle_command(AppCommand::StopSubtitles);
                 }
+                TrayCommand::RetryPipeline => {
+                    let _ = self
+                        .controller
+                        .borrow_mut()
+                        .handle_command(AppCommand::RetryPipeline);
+                }
                 TrayCommand::ShowSettings => update.show_settings = true,
                 TrayCommand::Quit => update.quit_requested = true,
             }
         }
     }
 
+    /// ประมวลผลคำขอ retry จาก controller เพียงครั้งเดียวไม่ว่าจะมาจาก UI หรือ tray
+    fn sync_retry_intent(&mut self, update: &mut RuntimeUpdate) {
+        let requested_generation = self.controller.borrow().retry_generation();
+        if requested_generation == self.observed_retry_generation {
+            return;
+        }
+        self.observed_retry_generation = requested_generation;
+        self.retry_pipeline(update);
+    }
+
     /// ทำให้ lifecycle จริงตรงกับค่าปุ่ม Live Subtitles ใน config
     fn sync_live_intent(&mut self, update: &mut RuntimeUpdate) {
-        let requested = self
-            .controller
-            .borrow()
-            .config()
-            .general
-            .live_subtitles;
+        let requested = self.controller.borrow().config().general.live_subtitles;
         if requested == self.running_requested {
             return;
         }
@@ -298,6 +456,30 @@ impl ApplicationRuntime {
         } else {
             self.stop_pipeline();
             update.hide_overlay = true;
+        }
+    }
+
+    /// ส่งสถานะ debug ชั่วคราวไปยัง STT และ writer โดยไม่บันทึกลง config
+    fn sync_debug_session(&mut self, update: &mut RuntimeUpdate) {
+        let desired = self.controller.borrow().debug_session_state();
+        if desired != self.applied_debug_session {
+            let capture_enabled = desired.live_enabled || desired.file_logging_enabled;
+            let previous_capture_enabled = self.applied_debug_session.live_enabled
+                || self.applied_debug_session.file_logging_enabled;
+            if capture_enabled != previous_capture_enabled {
+                self.stt.set_debug_enabled(capture_enabled);
+            }
+            if desired.file_logging_enabled
+                != self.applied_debug_session.file_logging_enabled
+            {
+                self.debug_log_writer
+                    .set_enabled(desired.file_logging_enabled);
+            }
+            self.applied_debug_session = desired;
+        }
+
+        if let Some(status) = self.debug_log_writer.drain_statuses().into_iter().last() {
+            update.debug_log_status = Some(status);
         }
     }
 
@@ -318,9 +500,9 @@ impl ApplicationRuntime {
         self.stt_resume_generation = None;
         self.accepted_audio_generation = None;
         self.applied_targets.clear();
-        self.source_audio.clear();
-        self.mixed_audio.clear();
-        self.mixer.reset();
+        self.source_audio.clear_reliable();
+        self.mixed_audio.clear_reliable();
+        self.mixer.reset(self.pipeline_audio_generation);
         self.transcript.clear();
         self.last_subtitle_update = None;
         self.applied_stt_streaming = Some(streaming);
@@ -342,6 +524,31 @@ impl ApplicationRuntime {
         });
     }
 
+    /// ทิ้ง session ที่เสีย เริ่ม generation ใหม่ แล้วเข้าทางเริ่ม pipeline ปกติอีกครั้ง
+    fn retry_pipeline(&mut self, update: &mut RuntimeUpdate) {
+        // ถ้า service หลักเสีย ให้เปลี่ยน handle ก่อนเริ่มใหม่แทนการส่งกลับไปยัง channel ที่ตายแล้ว
+        if self.pipewire_error.is_some() {
+            let replacement = spawn_pipewire(self.source_audio.clone());
+            let previous = std::mem::replace(&mut self.pipewire, replacement);
+            let _ = previous.shutdown();
+            self.retired_pipewire.push(previous);
+            self.pipewire_connected = false;
+        }
+        // ทิ้งผล STT เก่าก่อนส่ง Stop เพื่อไม่ลบ Stopped ที่ใช้ยืนยันคำสั่ง retry รอบนี้
+        let _ = self.stt.drain_events();
+        let _ = self.pipewire.stop_capture();
+        self.stt.stop();
+        self.retry_stop_pending = true;
+        self.source_audio.clear_reliable();
+        self.mixed_audio.clear_reliable();
+        self.pipeline_audio_generation = self.pipeline_audio_generation.saturating_add(1).max(1);
+        self.mixer.reset(self.pipeline_audio_generation);
+        self.running_requested = true;
+        self.pipewire_error = None;
+        self.start_pipeline();
+        update.hide_overlay = true;
+    }
+
     /// หยุด capture/STT และล้างเสียงกับ transcript ที่อาจค้างจาก session เดิม
     fn stop_pipeline(&mut self) {
         let _ = self.pipewire.stop_capture();
@@ -354,9 +561,9 @@ impl ApplicationRuntime {
         self.stt_resume_generation = None;
         self.accepted_audio_generation = None;
         self.applied_targets.clear();
-        self.source_audio.clear();
-        self.mixed_audio.clear();
-        self.mixer.reset();
+        self.source_audio.clear_reliable();
+        self.mixed_audio.clear_reliable();
+        self.mixer.reset(self.pipeline_audio_generation);
         self.transcript.clear();
         self.last_subtitle_update = None;
         self.applied_stt_streaming = None;
@@ -383,19 +590,16 @@ impl ApplicationRuntime {
             return;
         }
 
-        self.stt.pause_audio();
-        self.source_audio.clear();
-        self.mixed_audio.clear();
-        self.mixer.reset();
-        self.transcript.clear();
-        self.last_subtitle_update = None;
-        self.capture_transition_pending = true;
-        self.accepted_audio_generation = None;
-        self.stt_resume_generation = None;
+        self.begin_capture_transition(update);
         self.stt.update_streaming(desired);
-        self.stt_resume_generation = Some(self.stt.resume_audio());
+        if !self.applied_targets.is_empty()
+            && let Err(error) = self
+                .pipewire
+                .set_selected(self.applied_targets.clone(), self.pipeline_audio_generation)
+        {
+            self.pipeline_error = Some(error.to_string());
+        }
         self.applied_stt_streaming = Some(desired);
-        update.hide_overlay = true;
     }
 
     /// รับเหตุการณ์ graph/capture จาก PipeWire แล้วสะท้อนกลับไปยัง controller
@@ -403,42 +607,56 @@ impl ApplicationRuntime {
         for event in self.pipewire.drain_events() {
             match event {
                 PipeWireEvent::StreamsChanged(streams) => {
+                    self.pipewire_connected = true;
+                    self.pipewire_error = None;
                     self.controller.borrow_mut().set_streams(streams);
                     update.streams_changed = true;
                 }
-                PipeWireEvent::CaptureStarted(runtime_id)
-                    if self.running_requested
-                        && self.stt_ready
-                        && self.current_runtime_is_selected(runtime_id) =>
+                PipeWireEvent::CaptureStarted {
+                    runtime_id,
+                    audio_generation,
+                } if self.running_requested
+                    && self.stt_ready
+                    && audio_generation == self.pipeline_audio_generation
+                    && self.current_runtime_is_selected(runtime_id) =>
                 {
                     if self.capture_transition_pending && self.stt_resume_generation.is_none() {
-                        self.source_audio.clear();
-                        self.mixed_audio.clear();
-                        self.mixer.reset();
-                        self.stt_resume_generation = Some(self.stt.resume_audio());
+                        self.source_audio.clear_reliable();
+                        self.mixed_audio.clear_reliable();
+                        self.mixer.reset(self.pipeline_audio_generation);
+                        self.stt_resume_generation =
+                            Some(self.stt.resume_audio(self.pipeline_audio_generation));
                     }
                     self.active_captures.insert(runtime_id);
                     self.capture_errors.remove(&runtime_id);
                 }
-                PipeWireEvent::CaptureStopped(runtime_id) => {
+                PipeWireEvent::CaptureStopped {
+                    runtime_id,
+                    audio_generation,
+                } if audio_generation == self.pipeline_audio_generation => {
                     self.active_captures.remove(&runtime_id);
                     self.capture_errors.remove(&runtime_id);
                 }
                 PipeWireEvent::CaptureError {
                     runtime_id,
+                    audio_generation,
                     message,
                 } => {
+                    if audio_generation != self.pipeline_audio_generation {
+                        continue;
+                    }
                     self.active_captures.remove(&runtime_id);
                     if self.current_runtime_is_selected(runtime_id) {
                         self.capture_errors.insert(runtime_id, message);
                     }
                 }
                 PipeWireEvent::Error(error) => {
+                    self.pipewire_connected = false;
                     self.pipewire_error = Some(error);
                     self.set_state(ApplicationState::Error);
                     update.hide_overlay = true;
                 }
-                PipeWireEvent::CaptureStarted(_) => {}
+                PipeWireEvent::CaptureStarted { .. } | PipeWireEvent::CaptureStopped { .. } => {}
             }
         }
     }
@@ -461,12 +679,12 @@ impl ApplicationRuntime {
                 }
                 SttEvent::Transcript {
                     audio_generation,
+                    audio_origin_at,
                     update: transcript,
-                }
-                    if self.running_requested
-                        && self.stt_ready
-                        && !self.capture_transition_pending
-                        && self.accepted_audio_generation == Some(audio_generation) =>
+                } if self.running_requested
+                    && self.stt_ready
+                    && !self.capture_transition_pending
+                    && self.accepted_audio_generation == Some(audio_generation) =>
                 {
                     let is_final = matches!(&transcript, TranscriptUpdate::Final { .. });
                     let presentation_changed = self.transcript.apply(&transcript);
@@ -475,18 +693,20 @@ impl ApplicationRuntime {
                         update.subtitle = Some(SubtitleFrame {
                             text: self.transcript.presentation_text().to_owned(),
                             is_final,
+                            audio_origin_at,
                         });
                     }
                 }
                 SttEvent::Metrics {
                     audio_generation,
+                    audio_buffer_duration,
                     inference_duration,
-                    approximate_total,
                 } if self.running_requested
                     && !self.capture_transition_pending
                     && self.accepted_audio_generation == Some(audio_generation) =>
                 {
-                    self.metrics.record(inference_duration, approximate_total);
+                    self.metrics
+                        .record_stt(audio_buffer_duration, inference_duration);
                 }
                 SttEvent::Error(error) if self.running_requested => {
                     self.stt_ready = false;
@@ -499,12 +719,16 @@ impl ApplicationRuntime {
                     self.set_state(ApplicationState::Error);
                     update.hide_overlay = true;
                 }
+                SttEvent::Stopped if self.retry_stop_pending => {
+                    self.retry_stop_pending = false;
+                }
                 SttEvent::Stopped if self.running_requested && self.pipeline_error.is_none() => {
                     self.stt_ready = false;
                     self.capture_transition_pending = false;
                     self.stt_resume_generation = None;
                     self.accepted_audio_generation = None;
-                    self.pipeline_error = Some("Speech recognition stopped unexpectedly".to_owned());
+                    self.pipeline_error =
+                        Some("Speech recognition stopped unexpectedly".to_owned());
                     self.set_state(ApplicationState::Error);
                     update.hide_overlay = true;
                 }
@@ -516,6 +740,33 @@ impl ApplicationRuntime {
                 | SttEvent::Error(_) => {}
             }
         }
+    }
+
+    /// แยก raw transcript ออกจาก event ปกติ แล้วส่งต่อเฉพาะปลายทางที่ผู้ใช้เปิดไว้
+    fn handle_stt_debug_records(&mut self, update: &mut RuntimeUpdate) {
+        let records = self.stt.drain_debug_records();
+        if records.is_empty() {
+            return;
+        }
+        if self.applied_debug_session.file_logging_enabled {
+            self.debug_log_writer.write_records(records.iter().cloned());
+        }
+        if self.applied_debug_session.live_enabled {
+            update.debug_records = records;
+        }
+    }
+
+    /// ส่งตัวนับคิวตกหล่นเฉพาะเมื่อ snapshot เปลี่ยน เพื่อไม่สร้างงาน UI ทุก poll
+    fn sync_debug_drop_counts(&mut self, update: &mut RuntimeUpdate) {
+        let counts = DebugDropCounts {
+            stt_queue: self.stt.debug_records_dropped(),
+            file_queue: self.debug_log_writer.dropped_records(),
+        };
+        if counts == self.last_debug_drop_counts {
+            return;
+        }
+        self.last_debug_drop_counts = counts;
+        update.debug_drop_counts = Some(counts);
     }
 
     /// คำนวณ stream ที่ตรงกับกฎคงทน และเริ่ม transition เมื่อชุดเป้าหมายเปลี่ยน
@@ -546,14 +797,17 @@ impl ApplicationRuntime {
             return;
         }
 
-        let selection_changed = targets != self.applied_targets
-            || desired_capture_ids != self.desired_capture_ids;
+        let selection_changed =
+            targets != self.applied_targets || desired_capture_ids != self.desired_capture_ids;
         if selection_changed {
             self.begin_capture_transition(update);
             self.applied_targets = targets.clone();
             self.desired_capture_ids = desired_capture_ids;
             self.pipeline_error = None;
-            if let Err(error) = self.pipewire.set_selected(targets) {
+            if let Err(error) = self
+                .pipewire
+                .set_selected(targets, self.pipeline_audio_generation)
+            {
                 self.pipeline_error = Some(error.to_string());
             }
         } else {
@@ -567,9 +821,10 @@ impl ApplicationRuntime {
     fn begin_capture_transition(&mut self, update: &mut RuntimeUpdate) {
         let _ = self.pipewire.stop_capture();
         self.stt.pause_audio();
-        self.source_audio.clear();
-        self.mixed_audio.clear();
-        self.mixer.reset();
+        self.source_audio.clear_reliable();
+        self.mixed_audio.clear_reliable();
+        self.pipeline_audio_generation = self.pipeline_audio_generation.saturating_add(1).max(1);
+        self.mixer.reset(self.pipeline_audio_generation);
         self.transcript.clear();
         self.last_subtitle_update = None;
         self.active_captures.clear();
@@ -587,13 +842,11 @@ impl ApplicationRuntime {
             || !self.capture_errors.is_empty()
         {
             ApplicationState::Error
-        } else if !self.running_requested || !self.stt_ready {
-            ApplicationState::Starting
-        } else if self.desired_capture_ids.is_empty()
+        } else if !self.running_requested
+            || !self.stt_ready
+            || self.desired_capture_ids.is_empty()
             || self.capture_transition_pending
-            || !self
-                .desired_capture_ids
-                .is_subset(&self.active_captures)
+            || !self.desired_capture_ids.is_subset(&self.active_captures)
         {
             ApplicationState::Starting
         } else {
@@ -642,19 +895,17 @@ impl ApplicationRuntime {
         let Some(last_update) = self.last_subtitle_update else {
             return;
         };
-        if last_update.elapsed() < SUBTITLE_IDLE_TIMEOUT {
+        if !subtitle_idle_timed_out(last_update, Instant::now()) {
             return;
         }
-        self.last_subtitle_update = None;
-        self.transcript.clear();
-        self.stt.pause_audio();
-        self.source_audio.clear();
-        self.mixed_audio.clear();
-        self.mixer.reset();
-        self.capture_transition_pending = true;
-        self.accepted_audio_generation = None;
-        self.stt_resume_generation = Some(self.stt.resume_audio());
-        update.hide_overlay = true;
+        self.begin_capture_transition(update);
+        if !self.applied_targets.is_empty()
+            && let Err(error) = self
+                .pipewire
+                .set_selected(self.applied_targets.clone(), self.pipeline_audio_generation)
+        {
+            self.pipeline_error = Some(error.to_string());
+        }
     }
 
     /// ส่งสถานะไป tray เมื่อค่าที่แสดงต้องเปลี่ยนเท่านั้น
@@ -662,9 +913,9 @@ impl ApplicationRuntime {
         let state = match self.state() {
             ApplicationState::Running => TrayState::Active,
             ApplicationState::Error => TrayState::Error,
-            ApplicationState::Stopped
-            | ApplicationState::Starting
-            | ApplicationState::Stopping => TrayState::Paused,
+            ApplicationState::Stopped | ApplicationState::Starting | ApplicationState::Stopping => {
+                TrayState::Paused
+            }
         };
         if self.last_tray_state == Some(state) {
             return;
@@ -681,10 +932,54 @@ impl ApplicationRuntime {
     }
 }
 
+/// คืนค่า true ตั้งแต่วินาทีที่ 3 หลัง subtitle อัปเดตครั้งล่าสุด เพื่อให้ทดสอบขอบเวลาได้แน่นอน
+fn subtitle_idle_timed_out(last_update: Instant, now: Instant) -> bool {
+    now.checked_duration_since(last_update)
+        .is_some_and(|idle| idle >= SUBTITLE_IDLE_TIMEOUT)
+}
+
 /// แปลง STT window เป็นจำนวน mixed frames และจำกัดคิวไม่ให้เล็กหรือใหญ่เกินไป
 fn mixed_queue_capacity(window_ms: u32) -> usize {
     let retained_ms = usize::try_from(window_ms)
         .unwrap_or(3_000)
         .saturating_add(INFERENCE_HEADROOM_MS);
     retained_ms.div_ceil(MIX_FRAME_DURATION_MS).clamp(64, 2_000)
+}
+
+/// แปลง timestamp monotonic จาก main/helper เป็น duration โดยปฏิเสธลำดับเวลาที่ผิด
+fn monotonic_duration(origin_micros: i64, rendered_micros: i64) -> Option<Duration> {
+    rendered_micros
+        .checked_sub(origin_micros)
+        .and_then(|duration| u64::try_from(duration).ok())
+        .map(Duration::from_micros)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::{monotonic_duration, subtitle_idle_timed_out};
+
+    #[test]
+    fn subtitle_hides_when_idle_reaches_three_seconds() {
+        let last_update = Instant::now();
+
+        assert!(!subtitle_idle_timed_out(
+            last_update,
+            last_update + Duration::from_millis(2_999)
+        ));
+        assert!(subtitle_idle_timed_out(
+            last_update,
+            last_update + Duration::from_secs(3)
+        ));
+    }
+
+    #[test]
+    fn rendered_timestamp_produces_end_to_end_duration() {
+        assert_eq!(
+            monotonic_duration(1_000_000, 1_275_000),
+            Some(Duration::from_millis(275))
+        );
+        assert_eq!(monotonic_duration(2_000, 1_000), None);
+    }
 }

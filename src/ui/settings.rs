@@ -1,6 +1,12 @@
 //! การสร้างหน้า settings และเชื่อม widget event เข้ากับ application controller
 
-use std::{cell::RefCell, path::Path, rc::Rc, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    collections::VecDeque,
+    path::Path,
+    rc::Rc,
+    time::Duration,
+};
 
 use adw::prelude::*;
 use gtk::glib;
@@ -8,8 +14,15 @@ use gtk::glib;
 use crate::{
     app::{AppCommand, AppEvent, ApplicationController, ApplicationState},
     config::{AppConfig, SUBTITLE_POSITIONS, SUBTITLE_TEXT_ALIGNMENTS},
+    debug_log::DebugLogStatus,
     metrics::MetricsSnapshot,
+    overlay::{
+        DesktopBackendInfo, DesktopSession, DisplayBackend, OverlayClientStatus,
+        OverlayMonitorInfo, OverlayRuntimeBackend,
+    },
     pipewire::{ApplicationIdentity, ApplicationKey, StreamInfo},
+    runtime::DebugDropCounts,
+    stt::{SttDebugRecord, compiled_compute_backend},
 };
 
 const SETTINGS_WINDOW_NAME: &str = "subtitle-live-settings";
@@ -25,6 +38,7 @@ const SUBTITLE_POSITION_LABELS: [&str; 9] = [
     "Bottom right",
 ];
 const SUBTITLE_TEXT_ALIGNMENT_LABELS: [&str; 3] = ["Left", "Center", "Right"];
+const MAX_DEBUG_BLOCKS: usize = 200;
 
 /// widget และ state ที่จำเป็นต่อการอัปเดตหน้าต่างจาก runtime
 #[derive(Clone)]
@@ -41,9 +55,22 @@ pub struct SettingsPresenter {
     status_label: gtk::Label,
     error_label: gtk::Label,
     model_path_label: gtk::Label,
+    /// สถานะการเชื่อมต่อ PipeWire ที่แสดงในหน้า About
+    pipewire_status_label: gtk::Label,
+    /// Backend ของ helper ที่อัปเดตตาม lifecycle จริง
+    subtitle_backend_label: gtk::Label,
+    /// สถานะ XWayland ที่ไม่อ้างเพียง environment
+    xwayland_available_label: gtk::Label,
+    /// สาเหตุที่ helper ยังไม่พร้อมหรือใช้งานไม่ได้
+    overlay_status_label: gtk::Label,
     audio_buffer_label: gtk::Label,
-    inference_label: gtk::Label,
-    total_label: gtk::Label,
+    whisper_label: gtk::Label,
+    end_to_end_label: gtk::Label,
+    dropped_frames_label: gtk::Label,
+    /// ตัวเลือกจอที่อัปเดตจากรายการของ overlay helper เท่านั้น
+    monitor_selector: MonitorSelector,
+    /// แผงข้อมูลดิบจาก Whisper ที่เปิดเฉพาะเมื่อผู้ใช้ร้องขอใน session ปัจจุบัน
+    debug_panel: DebugPanel,
 }
 
 impl SettingsPresenter {
@@ -52,13 +79,51 @@ impl SettingsPresenter {
         application: &adw::Application,
         controller: Rc<RefCell<ApplicationController>>,
     ) -> Self {
+        let session = DesktopSession::detect();
+        Self::new_with_backend_info(
+            application,
+            controller,
+            DesktopBackendInfo::new(
+                session,
+                DisplayBackend::detect(),
+                OverlayRuntimeBackend::detect(session),
+            ),
+        )
+    }
+
+    /// สร้างหน้าต่างด้วยข้อมูล backend ที่ main process ยืนยันจากผลเปิด helper แล้ว
+    pub fn new_with_backend_info(
+        application: &adw::Application,
+        controller: Rc<RefCell<ApplicationController>>,
+        backend_info: DesktopBackendInfo,
+    ) -> Self {
         let snapshot = UiSnapshot::from_controller(&controller.borrow());
         let status_label = value_label(&snapshot.status);
         let error_label = value_label("None");
         let model_path_label = value_label("Not configured");
         let audio_buffer_label = value_label("Not available");
-        let inference_label = value_label("Not available");
-        let total_label = value_label("Not available");
+        let whisper_label = value_label("Not available");
+        let end_to_end_label = value_label("Not available");
+        let dropped_frames_label = value_label("Source 0 · Mixed 0");
+        let pipewire_status_label = value_label("Starting");
+        let overlay_starting = backend_info.overlay_backend != OverlayRuntimeBackend::Unavailable;
+        let subtitle_backend_label = value_label(if overlay_starting {
+            "Starting"
+        } else {
+            "Unavailable"
+        });
+        let xwayland_available_label = value_label(match backend_info.session {
+            DesktopSession::Wayland if overlay_starting => "Starting",
+            DesktopSession::Wayland => "No",
+            DesktopSession::X11 | DesktopSession::Unknown => "Not applicable",
+        });
+        let overlay_status_label = value_label(if overlay_starting {
+            "Starting overlay helper"
+        } else if backend_info.session == DesktopSession::Wayland {
+            "Subtitle overlay requires XWayland on this desktop session."
+        } else {
+            "Subtitle overlay requires an X11 display."
+        });
         let configured_label = value_label(&snapshot.configured_applications.to_string());
         let applications_group = adw::PreferencesGroup::builder()
             .title("Applications")
@@ -96,16 +161,27 @@ impl SettingsPresenter {
             &model_path_label,
             Rc::clone(&controller),
         ));
-        window.add(&subtitle_page(&snapshot, Rc::clone(&controller)));
+        let (subtitle_page, monitor_selector) = subtitle_page(&snapshot, Rc::clone(&controller));
+        window.add(&subtitle_page);
         window.add(&performance_page(
             &snapshot,
             &status_label,
             &error_label,
             &audio_buffer_label,
-            &inference_label,
-            &total_label,
+            &whisper_label,
+            &end_to_end_label,
+            &dropped_frames_label,
         ));
-        window.add(&about_page());
+        let (debug_page, debug_panel) = debug_page(Rc::clone(&controller));
+        window.add(&debug_page);
+        window.add(&about_page(
+            &snapshot,
+            backend_info,
+            &pipewire_status_label,
+            &subtitle_backend_label,
+            &xwayland_available_label,
+            &overlay_status_label,
+        ));
 
         let close_controller = Rc::clone(&controller);
         window.connect_close_request(move |window| {
@@ -134,9 +210,16 @@ impl SettingsPresenter {
             status_label,
             error_label,
             model_path_label,
+            pipewire_status_label,
+            subtitle_backend_label,
+            xwayland_available_label,
+            overlay_status_label,
             audio_buffer_label,
-            inference_label,
-            total_label,
+            whisper_label,
+            end_to_end_label,
+            dropped_frames_label,
+            monitor_selector,
+            debug_panel,
         }
     }
 
@@ -162,19 +245,24 @@ impl SettingsPresenter {
 
     /// แสดง snapshot latency ล่าสุดโดยไม่เก็บประวัติซ้ำในชั้น UI
     pub fn update_metrics(&self, metrics: MetricsSnapshot) {
-        self.audio_buffer_label.set_label(&format_dropped(
+        self.audio_buffer_label.set_label(&format_metric(
+            metrics.audio_buffer_latest,
+            metrics.audio_buffer_p50,
+            metrics.audio_buffer_p95,
+        ));
+        self.whisper_label.set_label(&format_metric(
+            metrics.whisper_latest,
+            metrics.whisper_p50,
+            metrics.whisper_p95,
+        ));
+        self.end_to_end_label.set_label(&format_metric(
+            metrics.end_to_end_latest,
+            metrics.end_to_end_p50,
+            metrics.end_to_end_p95,
+        ));
+        self.dropped_frames_label.set_label(&format_dropped(
             metrics.source_queue_dropped,
             metrics.mixed_queue_dropped,
-        ));
-        self.inference_label.set_label(&format_metric(
-            metrics.inference_latest,
-            metrics.inference_p50,
-            metrics.inference_p95,
-        ));
-        self.total_label.set_label(&format_metric(
-            metrics.total_latest,
-            metrics.total_p50,
-            metrics.total_p95,
         ));
     }
 
@@ -187,6 +275,70 @@ impl SettingsPresenter {
         };
         self.model_path_label
             .set_label(&format!("{} ({status})", path.display()));
+    }
+
+    /// แสดงสถานะ PipeWire ล่าสุดในหน้า About
+    pub fn update_pipewire_status(&self, status: &str) {
+        self.pipewire_status_label.set_label(status);
+    }
+
+    /// แสดง backend เฉพาะเมื่อ helper ยืนยัน Ready และแสดง Unavailable เมื่อ IPC ล้มเหลว
+    pub fn update_overlay_status(
+        &self,
+        session: DesktopSession,
+        backend: OverlayRuntimeBackend,
+        status: OverlayClientStatus,
+        error: Option<&str>,
+    ) {
+        let backend_text = match status {
+            OverlayClientStatus::Starting => "Starting",
+            OverlayClientStatus::Ready => backend.display_name(),
+            OverlayClientStatus::Error | OverlayClientStatus::Stopped => "Unavailable",
+        };
+        self.subtitle_backend_label.set_label(backend_text);
+        let xwayland_text = match session {
+            DesktopSession::Wayland
+                if status == OverlayClientStatus::Ready
+                    && backend == OverlayRuntimeBackend::XWayland =>
+            {
+                "Yes"
+            }
+            DesktopSession::Wayland if status == OverlayClientStatus::Starting => "Starting",
+            DesktopSession::Wayland => "No",
+            DesktopSession::X11 | DesktopSession::Unknown => "Not applicable",
+        };
+        self.xwayland_available_label.set_label(xwayland_text);
+        let status_text = match status {
+            OverlayClientStatus::Starting => "Starting overlay helper",
+            OverlayClientStatus::Ready => "Ready",
+            OverlayClientStatus::Stopped => "Stopped",
+            OverlayClientStatus::Error => error.unwrap_or(if session == DesktopSession::Wayland {
+                "Subtitle overlay requires XWayland on this desktop session."
+            } else {
+                "Subtitle overlay requires an X11 display."
+            }),
+        };
+        self.overlay_status_label.set_label(status_text);
+    }
+
+    /// แทนที่รายการจอด้วย snapshot จาก helper ซึ่งเป็น process ที่วาด overlay จริง
+    pub fn update_overlay_monitors(&self, monitors: &[OverlayMonitorInfo]) {
+        self.monitor_selector.update(monitors);
+    }
+
+    /// เพิ่มผล inference ใหม่ลงท้ายแผง Debug โดยจำกัดประวัติไม่ให้ UI โตไม่สิ้นสุด
+    pub fn append_debug_records(&self, records: &[SttDebugRecord]) {
+        self.debug_panel.append(records);
+    }
+
+    /// แสดงสถานะไฟล์ log ล่าสุด รวม path และข้อผิดพลาดจาก writer เบื้องหลัง
+    pub fn update_debug_log_status(&self, status: &DebugLogStatus) {
+        self.debug_panel.update_log_status(status);
+    }
+
+    /// แสดงจำนวน debug record สะสมที่ถูกทิ้งจากคิวใน session ปัจจุบัน
+    pub fn update_debug_drop_counts(&self, counts: &DebugDropCounts) {
+        self.debug_panel.update_drop_counts(counts);
     }
 }
 
@@ -483,8 +635,8 @@ fn speech_recognition_page(
     streaming_group.add(&window_row);
 
     let (vad_row, vad_switch) = switch_row(
-        "Voice Activity Detection",
-        "Use a stronger energy gate before recognition",
+        "Audio Activity Filter",
+        "Skip low-energy audio before recognition; this does not identify speech",
         snapshot.vad_enabled,
         true,
     );
@@ -503,7 +655,7 @@ fn speech_recognition_page(
 fn subtitle_page(
     snapshot: &UiSnapshot,
     controller: Rc<RefCell<ApplicationController>>,
-) -> adw::PreferencesPage {
+) -> (adw::PreferencesPage, MonitorSelector) {
     let page = preferences_page("Subtitle", "insert-text-symbolic");
     let group = adw::PreferencesGroup::builder().title("Appearance").build();
     let (visible_row, visible_switch) = switch_row(
@@ -520,6 +672,9 @@ fn subtitle_page(
         glib::Propagation::Proceed
     });
     group.add(&visible_row);
+
+    let (monitor_row, monitor_selector) = MonitorSelector::new(Rc::clone(&controller));
+    group.add(&monitor_row);
 
     let selected_position = SUBTITLE_POSITIONS
         .iter()
@@ -561,11 +716,12 @@ fn subtitle_page(
         let Some(alignment) = SUBTITLE_TEXT_ALIGNMENTS.get(dropdown.selected() as usize) else {
             return;
         };
-        let _ = alignment_controller
-            .borrow_mut()
-            .handle_command(AppCommand::SetSubtitleTextAlignment(
-                (*alignment).to_owned(),
-            ));
+        let _ =
+            alignment_controller
+                .borrow_mut()
+                .handle_command(AppCommand::SetSubtitleTextAlignment(
+                    (*alignment).to_owned(),
+                ));
     });
     group.add(&alignment_row);
 
@@ -591,9 +747,7 @@ fn subtitle_page(
     width.connect_value_changed(move |spin| {
         let _ = width_controller
             .borrow_mut()
-            .handle_command(AppCommand::SetSubtitleWidthPx(
-                spin.value_as_int() as u32
-            ));
+            .handle_command(AppCommand::SetSubtitleWidthPx(spin.value_as_int() as u32));
     });
     group.add(&width_row);
 
@@ -622,7 +776,96 @@ fn subtitle_page(
     });
     group.add(&max_lines_row);
     page.add(&group);
-    page
+    (page, monitor_selector)
+}
+
+#[derive(Clone)]
+/// ตัวเลือกจอที่เก็บ ID แยกจากข้อความ เพื่อส่ง identity เดิมกลับ helper โดยไม่ตีความ label
+struct MonitorSelector {
+    dropdown: gtk::DropDown,
+    monitor_ids: Rc<RefCell<Vec<String>>>,
+    updating: Rc<Cell<bool>>,
+    controller: Rc<RefCell<ApplicationController>>,
+}
+
+impl MonitorSelector {
+    /// สร้าง dropdown สถานะเริ่มต้นระหว่างรอ helper รายงานจอ
+    fn new(controller: Rc<RefCell<ApplicationController>>) -> (adw::ActionRow, Self) {
+        let dropdown = gtk::DropDown::from_strings(&["Detecting displays…"]);
+        dropdown.set_sensitive(false);
+        dropdown.set_valign(gtk::Align::Center);
+        let row = adw::ActionRow::builder()
+            .activatable_widget(&dropdown)
+            .title("Display")
+            .subtitle("Screen used for the subtitle overlay")
+            .build();
+        row.add_suffix(&dropdown);
+        let selector = Self {
+            dropdown,
+            monitor_ids: Rc::new(RefCell::new(Vec::new())),
+            updating: Rc::new(Cell::new(false)),
+            controller,
+        };
+        let signal_selector = selector.clone();
+        selector.dropdown.connect_selected_notify(move |dropdown| {
+            if signal_selector.updating.get() {
+                return;
+            }
+            let Some(monitor_id) = signal_selector
+                .monitor_ids
+                .borrow()
+                .get(dropdown.selected() as usize)
+                .cloned()
+            else {
+                return;
+            };
+            let _ = signal_selector
+                .controller
+                .borrow_mut()
+                .handle_command(AppCommand::SetSubtitleMonitor(monitor_id));
+        });
+        (row, selector)
+    }
+
+    /// เปลี่ยน model และ selection พร้อม guard ไม่ให้การ sync UI เขียน config กลับเอง
+    fn update(&self, monitors: &[OverlayMonitorInfo]) {
+        self.updating.set(true);
+        let labels = if monitors.is_empty() {
+            vec!["No displays detected"]
+        } else {
+            monitors
+                .iter()
+                .map(|monitor| monitor.label.as_str())
+                .collect::<Vec<_>>()
+        };
+        self.dropdown
+            .set_model(Some(&gtk::StringList::new(&labels)));
+        self.monitor_ids
+            .replace(monitors.iter().map(|monitor| monitor.id.clone()).collect());
+        let configured_id = self
+            .controller
+            .borrow()
+            .config()
+            .subtitle
+            .monitor_id
+            .clone();
+        let configured_position = monitors
+            .iter()
+            .position(|monitor| !configured_id.is_empty() && monitor.id == configured_id);
+        let selected = configured_position.unwrap_or(0) as u32;
+        self.dropdown.set_selected(selected);
+        self.dropdown.set_sensitive(!monitors.is_empty());
+        self.updating.set(false);
+        if configured_position.is_none()
+            && let Some(first_monitor) = monitors.first()
+        {
+            // เมื่อจอเดิมหายหรือยังเป็นค่า auto ให้ค่าที่ persist ตรงกับ fallback ที่ helper ใช้จริง
+            let _ = self
+                .controller
+                .borrow_mut()
+                .handle_command(AppCommand::SetSubtitleMonitor(first_monitor.id.clone()));
+        }
+    }
 }
 
 /// สร้างหน้าสถานะ pipeline และ latency ที่ runtime วัดได้
@@ -631,8 +874,9 @@ fn performance_page(
     status_label: &gtk::Label,
     error_label: &gtk::Label,
     audio_buffer_label: &gtk::Label,
-    inference_label: &gtk::Label,
-    total_label: &gtk::Label,
+    whisper_label: &gtk::Label,
+    end_to_end_label: &gtk::Label,
+    dropped_frames_label: &gtk::Label,
 ) -> adw::PreferencesPage {
     let page = preferences_page("Performance", "utilities-system-monitor-symbolic");
     let status_group = adw::PreferencesGroup::builder().title("Pipeline").build();
@@ -650,26 +894,312 @@ fn performance_page(
         false,
     );
     metrics_group.add(&metrics_row);
-    metrics_group.add(&value_row_with_label("Audio Queues", audio_buffer_label));
-    metrics_group.add(&value_row_with_label("STT Inference", inference_label));
-    metrics_group.add(&value_row_with_label("Approximate Total", total_label));
+    metrics_group.add(&value_row_with_label("Audio Buffer", audio_buffer_label));
+    metrics_group.add(&value_row_with_label("Whisper Inference", whisper_label));
+    metrics_group.add(&value_row_with_label("End-to-End", end_to_end_label));
+    metrics_group.add(&value_row_with_label(
+        "Dropped Frames",
+        dropped_frames_label,
+    ));
     page.add(&metrics_group);
     page
 }
 
+#[derive(Clone)]
+/// widget และประวัติแบบจำกัดขนาดของหน้า Debug ซึ่งมีอายุเท่ากับหน้าต่าง Settings
+struct DebugPanel {
+    buffer: gtk::TextBuffer,
+    view: gtk::TextView,
+    blocks: Rc<RefCell<VecDeque<String>>>,
+    file_status_label: gtk::Label,
+    file_path_label: gtk::Label,
+    dropped_records_label: gtk::Label,
+}
+
+impl DebugPanel {
+    /// เพิ่มหนึ่ง block ต่อ Whisper inference ไม่ใช่หนึ่ง block ต่อคำ
+    fn append(&self, records: &[SttDebugRecord]) {
+        if records.is_empty() {
+            return;
+        }
+        let mut blocks = self.blocks.borrow_mut();
+        for record in records {
+            blocks.push_back(format_debug_record(record));
+            if blocks.len() > MAX_DEBUG_BLOCKS {
+                blocks.pop_front();
+            }
+        }
+        self.buffer.set_text(
+            &blocks
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        );
+        drop(blocks);
+
+        // รอให้ GTK คำนวณ layout ของข้อความใหม่ก่อนเลื่อนไปยังผลล่าสุด
+        let buffer = self.buffer.clone();
+        let view = self.view.clone();
+        glib::idle_add_local_once(move || {
+            let mut end = buffer.end_iter();
+            view.scroll_to_iter(&mut end, 0.0, false, 0.0, 1.0);
+        });
+    }
+
+    /// ล้างเฉพาะข้อความบนหน้าจอ โดยไม่กระทบไฟล์ log หรือ pipeline
+    fn clear(&self) {
+        self.blocks.borrow_mut().clear();
+        self.buffer.set_text("");
+    }
+
+    /// แปลงสถานะ writer เป็นข้อความที่ผู้ใช้ตรวจ path และ error ได้โดยตรง
+    fn update_log_status(&self, status: &DebugLogStatus) {
+        match status {
+            DebugLogStatus::Disabled { path } => {
+                self.file_status_label.set_label("Disabled");
+                self.file_path_label.set_label(&path.display().to_string());
+            }
+            DebugLogStatus::Writing { path } => {
+                self.file_status_label.set_label("Writing");
+                self.file_path_label.set_label(&path.display().to_string());
+            }
+            DebugLogStatus::Error { path, message } => {
+                self.file_status_label.set_label(&format!("Error: {message}"));
+                self.file_path_label.set_label(&path.display().to_string());
+            }
+        }
+    }
+
+    /// แสดงตัวนับสะสมแยกคิว STT และคิว writer เพื่อบอกเมื่อ debug รับข้อมูลไม่ทัน
+    fn update_drop_counts(&self, counts: &DebugDropCounts) {
+        self.dropped_records_label.set_label(&format!(
+            "STT {} · File {}",
+            counts.stt_queue, counts.file_queue
+        ));
+    }
+}
+
+/// สร้างหน้า Debug ซึ่งปิดทั้ง live view และ file logging ทุกครั้งที่เปิดโปรแกรม
+fn debug_page(
+    controller: Rc<RefCell<ApplicationController>>,
+) -> (adw::PreferencesPage, DebugPanel) {
+    let page = preferences_page("Debug", "utilities-terminal-symbolic");
+
+    let controls_group = adw::PreferencesGroup::builder()
+        .title("Debug Controls")
+        .description("Debug collection is disabled when Subtitle-live launches.")
+        .build();
+    let (live_row, live_switch) = switch_row(
+        "Live Debug View",
+        "Show each Whisper inference as it reaches the subtitle pipeline",
+        false,
+        true,
+    );
+    let (file_row, file_switch) = switch_row(
+        "Write Debug Log File",
+        "Save the same inference records to a local log file",
+        false,
+        true,
+    );
+    controls_group.add(&live_row);
+    controls_group.add(&file_row);
+    page.add(&controls_group);
+
+    let file_status_label = value_label("Disabled");
+    let file_path_label = value_label("Waiting for runtime");
+    let dropped_records_label = value_label("STT 0 · File 0");
+    let file_group = adw::PreferencesGroup::builder()
+        .title("Log File")
+        .build();
+    file_group.add(&value_row_with_label("Status", &file_status_label));
+    file_group.add(&value_row_with_label("Path", &file_path_label));
+    file_group.add(&value_row_with_label(
+        "Dropped Debug Records",
+        &dropped_records_label,
+    ));
+    page.add(&file_group);
+
+    let explanation_group = adw::PreferencesGroup::builder()
+        .title("How Streaming Recognition Works")
+        .build();
+    explanation_group.add(&message_row(
+        "One rolling chunk per inference",
+        "Whisper processes a rolling audio window and returns a complete hypothesis each time. It does not send one word at a time, so later hypotheses may revise earlier words before the segment becomes final.",
+    ));
+    explanation_group.add(&message_row(
+        "Backend timing",
+        "full() wall is the elapsed wall time around WhisperState::full, not GPU kernel time. The current API reports the requested backend but cannot confirm which backend actually ran.",
+    ));
+    page.add(&explanation_group);
+
+    let buffer = gtk::TextBuffer::new(None::<&gtk::TextTagTable>);
+    let view = gtk::TextView::builder()
+        .buffer(&buffer)
+        .cursor_visible(false)
+        .editable(false)
+        .left_margin(12)
+        .monospace(true)
+        .right_margin(12)
+        .top_margin(12)
+        .bottom_margin(12)
+        .wrap_mode(gtk::WrapMode::WordChar)
+        .build();
+    let scrolled = gtk::ScrolledWindow::builder()
+        .child(&view)
+        .has_frame(true)
+        .height_request(360)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .build();
+    let clear_button = gtk::Button::builder()
+        .label("Clear")
+        .valign(gtk::Align::Center)
+        .build();
+    let output_header = adw::ActionRow::builder()
+        .activatable(false)
+        .title("Latest Inferences")
+        .subtitle("Up to 200 inference blocks")
+        .build();
+    output_header.add_suffix(&clear_button);
+    let output_group = adw::PreferencesGroup::builder()
+        .title("Inference Stream")
+        .build();
+    output_group.add(&output_header);
+    output_group.add(&scrolled);
+    page.add(&output_group);
+
+    let panel = DebugPanel {
+        buffer,
+        view,
+        blocks: Rc::new(RefCell::new(VecDeque::new())),
+        file_status_label,
+        file_path_label,
+        dropped_records_label,
+    };
+    let clear_panel = panel.clone();
+    clear_button.connect_clicked(move |_| clear_panel.clear());
+
+    let live_controller = Rc::clone(&controller);
+    let live_panel = panel.clone();
+    live_switch.connect_state_set(move |_, enabled| {
+        let _ = live_controller
+            .borrow_mut()
+            .handle_command(AppCommand::SetDebugLiveEnabled(enabled));
+        if !enabled {
+            live_panel.clear();
+        }
+        glib::Propagation::Proceed
+    });
+    file_switch.connect_state_set(move |_, enabled| {
+        let _ = controller
+            .borrow_mut()
+            .handle_command(AppCommand::SetDebugFileLoggingEnabled(enabled));
+        glib::Propagation::Proceed
+    });
+
+    (page, panel)
+}
+
+/// จัดรูปแบบ record เป็นบรรทัดคงที่ เพื่อแยกข้อความดิบและข้อความที่เข้า subtitle ชัดเจน
+fn format_debug_record(record: &SttDebugRecord) -> String {
+    let backend_request = if record.gpu_backend_requested {
+        format!("GPU device {} (actual backend unknown)", record.gpu_device)
+    } else {
+        "CPU requested".to_owned()
+    };
+    format!(
+        "[{}] segment={} kind={} generation={} | whisper={} | full() wall={} | request={} | step={} ms window={} ms\nRAW: {}\nNORMALIZED: {}\nSUBTITLE INPUT: {}",
+        local_timestamp(record.timestamp_unix_ms),
+        record.segment_id,
+        record.kind.as_str(),
+        record.audio_generation,
+        precise_duration_ms(record.whisper_model_duration),
+        precise_duration_ms(record.backend_full_duration),
+        backend_request,
+        record.step_ms,
+        record.window_ms,
+        escape_debug_text(&record.raw_text),
+        escape_debug_text(&record.processed_text),
+        escape_debug_text(&record.emitted_text),
+    )
+}
+
+/// แสดง Unix timestamp เป็นเวลาท้องถิ่นพร้อม millisecond โดยไม่เพิ่ม dependency ใหม่
+fn local_timestamp(timestamp_unix_ms: u64) -> String {
+    let seconds = i64::try_from(timestamp_unix_ms / 1_000).unwrap_or(i64::MAX);
+    let milliseconds = timestamp_unix_ms % 1_000;
+    glib::DateTime::from_unix_local(seconds)
+        .and_then(|timestamp| timestamp.format("%Y-%m-%d %H:%M:%S"))
+        .map_or_else(
+            |_| timestamp_unix_ms.to_string(),
+            |timestamp| format!("{timestamp}.{milliseconds:03}"),
+        )
+}
+
+/// วัด latency แบบทศนิยมเพื่อให้รอบ GPU ที่ต่ำกว่า 1 ms ไม่ถูกปัดเป็นศูนย์
+fn precise_duration_ms(duration: Duration) -> String {
+    format!("{:.2} ms", duration.as_secs_f64() * 1_000.0)
+}
+
+/// ทำให้ newline ภายในข้อความหนึ่งค่าไม่ทำลายโครงบรรทัดของ debug block
+fn escape_debug_text(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
+}
+
 /// สร้างหน้าข้อมูลรุ่นและขอบเขตความเป็นส่วนตัว
-fn about_page() -> adw::PreferencesPage {
+fn about_page(
+    snapshot: &UiSnapshot,
+    backend_info: DesktopBackendInfo,
+    pipewire_status_label: &gtk::Label,
+    subtitle_backend_label: &gtk::Label,
+    xwayland_available_label: &gtk::Label,
+    overlay_status_label: &gtk::Label,
+) -> adw::PreferencesPage {
     let page = preferences_page("About", "help-about-symbolic");
-    let group = adw::PreferencesGroup::builder()
+    let application_group = adw::PreferencesGroup::builder()
         .title("Subtitle-live")
         .build();
-    group.add(&message_row(
+    application_group.add(&message_row(
         "Local English Live Subtitles",
         "Captures selected application audio and processes it locally.",
     ));
-    group.add(&value_row("Version", env!("CARGO_PKG_VERSION")));
-    group.add(&value_row("Privacy", "Local-first"));
-    page.add(&group);
+    application_group.add(&value_row("Version", env!("CARGO_PKG_VERSION")));
+    application_group.add(&value_row("Privacy", "Local-first"));
+    page.add(&application_group);
+
+    let desktop_group = adw::PreferencesGroup::builder().title("Desktop").build();
+    desktop_group.add(&value_row("Session", backend_info.session.display_name()));
+    desktop_group.add(&value_row(
+        "Settings Backend",
+        backend_info.settings_backend.display_name(),
+    ));
+    desktop_group.add(&value_row_with_label(
+        "Subtitle Backend",
+        subtitle_backend_label,
+    ));
+    desktop_group.add(&value_row_with_label(
+        "XWayland Available",
+        xwayland_available_label,
+    ));
+    desktop_group.add(&value_row_with_label(
+        "Overlay Status",
+        overlay_status_label,
+    ));
+    page.add(&desktop_group);
+
+    let recognition_group = adw::PreferencesGroup::builder()
+        .title("Speech Recognition")
+        .build();
+    recognition_group.add(&value_row("Model", &snapshot.model));
+    recognition_group.add(&value_row("Compute Backend", &snapshot.backend));
+    page.add(&recognition_group);
+
+    let audio_group = adw::PreferencesGroup::builder().title("Audio").build();
+    audio_group.add(&value_row_with_label("PipeWire", pipewire_status_label));
+    page.add(&audio_group);
     page
 }
 
@@ -763,7 +1293,7 @@ fn message_row(title: &str, subtitle: &str) -> adw::ActionRow {
 fn format_metric(latest: Option<Duration>, p50: Option<Duration>, p95: Option<Duration>) -> String {
     match (latest, p50, p95) {
         (Some(latest), Some(p50), Some(p95)) => format!(
-            "latest {} · p50 {} · p95 {}",
+            "Latest {} · P50 {} · P95 {}",
             duration_ms(latest),
             duration_ms(p50),
             duration_ms(p95)
@@ -774,7 +1304,7 @@ fn format_metric(latest: Option<Duration>, p50: Option<Duration>, p95: Option<Du
 
 /// สรุปจำนวน audio frame ที่ถูกทิ้งจากคิวแต่ละช่วง
 fn format_dropped(source: u64, mixed: u64) -> String {
-    format!("dropped source {source} · mixed {mixed}")
+    format!("Source {source} · Mixed {mixed}")
 }
 
 /// แปลง duration เป็นข้อความ millisecond
@@ -816,7 +1346,8 @@ impl UiSnapshot {
             configured_applications: config.audio.rules.len(),
             language: language_label(config),
             model: config.stt.model.clone(),
-            backend: display_identifier(&config.stt.backend),
+            // แสดง backend ที่ไบนารีใช้จริง ไม่ใช่ค่าความต้องการ `auto` ใน config
+            backend: compiled_compute_backend().display_name().to_owned(),
             audio_step_ms: config.stt.step_ms,
             context_window_ms: config.stt.window_ms,
             vad_enabled: config.stt.vad_enabled,

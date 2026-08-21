@@ -1,17 +1,20 @@
 # คำสั่งลัดสำหรับ build, run, ตรวจรูปแบบ และดาวน์โหลดโมเดล
 .PHONY: build release run format lint test model
 
+# โหลดค่า ROCm, libclang และ GCC ให้คำสั่ง Cargo ที่ต้องคอมไพล์อัตโนมัติ
+DEV_ENV = . ./scripts/dev-env.sh
+
 # สร้าง debug binary สำหรับพัฒนา
 build:
-	cargo build
+	$(DEV_ENV) && cargo build
 
 # สร้าง optimized binary สำหรับวัดประสิทธิภาพจริง
 release:
-	cargo build --release
+	$(DEV_ENV) && cargo build --release
 
 # เปิดแอปพร้อม structured debug log ตามค่าใน src/logging.rs
 run:
-	cargo run
+	$(DEV_ENV) && cargo run
 
 # จัดรูปแบบ source Rust ทั้ง workspace
 format:
@@ -19,11 +22,11 @@ format:
 
 # ตรวจคำเตือน Clippy และถือทุกคำเตือนเป็นข้อผิดพลาด
 lint:
-	cargo clippy --all-targets --all-features -- -D warnings
+	$(DEV_ENV) && cargo clippy --all-targets --all-features -- -D warnings
 
 # รัน unit/integration tests ทุก target
 test:
-	cargo test --all-targets
+	$(DEV_ENV) && cargo test --all-targets
 
 # ดาวน์โหลดและตรวจ checksum ของโมเดล small.en เริ่มต้น
 model:

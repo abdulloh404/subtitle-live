@@ -1,5 +1,17 @@
 //! หน้าต่าง overlay สำหรับแสดงคำบรรยายโดยไม่รับ keyboard หรือ pointer input
 
+mod client;
+mod process;
+mod protocol;
+mod session;
 mod window;
+mod x11;
 
+pub use client::{OverlayClient, OverlayClientStatus};
+pub use process::run_overlay_helper;
+pub use protocol::{
+    OverlayCommand, OverlayEvent, OverlayMonitorInfo, OverlayProtocolError, read_message,
+    write_message,
+};
+pub use session::{DesktopBackendInfo, DesktopSession, DisplayBackend, OverlayRuntimeBackend};
 pub use window::OverlayPresenter;

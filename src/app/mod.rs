@@ -6,6 +6,6 @@ mod event;
 mod state;
 
 pub use command::AppCommand;
-pub use controller::ApplicationController;
+pub use controller::{ApplicationController, DebugSessionState};
 pub use event::AppEvent;
 pub use state::ApplicationState;

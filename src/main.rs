@@ -3,7 +3,7 @@
 use std::{
     cell::RefCell,
     rc::Rc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use adw::prelude::*;
@@ -13,7 +13,10 @@ use subtitle_live::{
     config,
     error::AppError,
     logging,
-    overlay::OverlayPresenter,
+    overlay::{
+        DesktopBackendInfo, DesktopSession, DisplayBackend, OverlayClient, OverlayClientStatus,
+        OverlayEvent, OverlayRuntimeBackend, run_overlay_helper,
+    },
     runtime::ApplicationRuntime,
     ui::SettingsPresenter,
 };
@@ -23,11 +26,132 @@ struct DesktopUi {
     /// หน้าต่างตั้งค่าและสถานะ pipeline
     settings: SettingsPresenter,
     /// หน้าต่างโปร่งใสที่แสดง subtitle เหนือหน้าจอ
-    overlay: OverlayPresenter,
+    overlay: DesktopOverlay,
+}
+
+/// Renderer ที่ main process เลือกตาม desktop session โดยไม่เปลี่ยน backend ของ Settings
+enum DesktopOverlay {
+    /// Main process ส่งข้อความให้ X11/XWayland helper
+    Helper(Box<OverlayClient>),
+    /// ไม่มี X11 display; pipeline อื่นยังทำงานต่อได้
+    Unavailable,
+}
+
+/// ข้อมูลจับคู่ frame กับนาฬิกา monotonic ก่อนส่งเข้า IPC
+struct OverlayFrameSubmission {
+    frame_id: u64,
+    audio_origin_micros: i64,
+}
+
+impl DesktopOverlay {
+    /// นำค่ารูปลักษณ์ไปใช้กับ renderer ที่พร้อมใช้งาน
+    fn apply_config(&self, config: &config::SubtitleConfig) {
+        match self {
+            Self::Helper(client) => client.apply_config(config),
+            Self::Unavailable => {}
+        }
+    }
+
+    /// แสดง subtitle โดย helper รับเฉพาะข้อความที่ runtime จัดการแล้ว
+    fn show_text(
+        &self,
+        text: &str,
+        is_final: bool,
+        audio_origin_at: Instant,
+    ) -> Option<OverlayFrameSubmission> {
+        match self {
+            Self::Helper(client) => {
+                let now = Instant::now();
+                let submitted_at_micros = glib::monotonic_time();
+                let audio_age_micros =
+                    i64::try_from(now.saturating_duration_since(audio_origin_at).as_micros())
+                        .unwrap_or(i64::MAX);
+                client
+                    .show_text(text, is_final)
+                    .map(|frame_id| OverlayFrameSubmission {
+                        frame_id,
+                        audio_origin_micros: submitted_at_micros.saturating_sub(audio_age_micros),
+                    })
+            }
+            Self::Unavailable => None,
+        }
+    }
+
+    /// ล้างข้อความปัจจุบันโดยไม่หยุด audio/STT pipeline
+    fn hide(&self) {
+        match self {
+            Self::Helper(client) => client.hide(),
+            Self::Unavailable => {}
+        }
+    }
+
+    /// รับสถานะ helper แบบไม่ block และบันทึกเฉพาะ lifecycle/error
+    fn poll_events(&self) -> Vec<OverlayEvent> {
+        let Self::Helper(client) = self else {
+            return Vec::new();
+        };
+        let events = client.drain_events();
+        for event in &events {
+            match event {
+                OverlayEvent::Ready => tracing::info!(
+                    overlay_backend = client.backend().as_str(),
+                    "Subtitle overlay helper ready"
+                ),
+                OverlayEvent::Error { message } => tracing::warn!(
+                    overlay_backend = client.backend().as_str(),
+                    error = %message,
+                    "Subtitle overlay helper unavailable"
+                ),
+                OverlayEvent::MonitorsChanged { .. }
+                | OverlayEvent::Pong { .. }
+                | OverlayEvent::Rendered { .. } => {}
+            }
+        }
+        events
+    }
+
+    /// คืนสถานะ renderer ล่าสุดสำหรับหน้า About
+    fn status(&self) -> OverlayClientStatus {
+        match self {
+            Self::Helper(client) => client.status(),
+            Self::Unavailable => OverlayClientStatus::Error,
+        }
+    }
+
+    /// คืน error ของ helper โดยไม่รวมข้อความ subtitle
+    fn last_error(&self) -> Option<String> {
+        match self {
+            Self::Helper(client) => client.last_error(),
+            Self::Unavailable => None,
+        }
+    }
+
+    /// ขอให้ renderer หยุดโดยไม่ block GTK shutdown callback
+    fn request_shutdown(&self) {
+        match self {
+            Self::Helper(client) => client.shutdown(),
+            Self::Unavailable => {}
+        }
+    }
+
+    /// รอ helper ปิดหลัง GTK event loop จบแล้ว เพื่อไม่ทิ้ง child หรือ IPC worker
+    fn finish(&self) {
+        let Self::Helper(client) = self else {
+            return;
+        };
+        if let Err(error) = client.finish() {
+            tracing::warn!(error = %error, "Subtitle overlay helper did not shut down cleanly");
+        }
+    }
 }
 
 /// โหลด config, สร้าง GTK application และปิด worker อย่างเป็นระเบียบเมื่อ event loop จบ
 fn main() -> Result<(), AppError> {
+    // โหมดนี้เป็น child process เท่านั้น จึงห้ามติดตั้ง logger ที่เขียน JSON ลง stdout ของ IPC
+    if std::env::args_os().any(|argument| argument == "--overlay-helper") {
+        return run_overlay_helper().map_err(|error| AppError::Overlay(error.to_string()));
+    }
+
     // เริ่ม tracing ก่อนทำ I/O เพื่อให้ข้อผิดพลาดช่วง startup ปรากฏใน terminal
     logging::init()?;
 
@@ -54,10 +178,38 @@ fn main() -> Result<(), AppError> {
         .unwrap_or_else(|| default_model_path.clone());
     let model_ready = model_path.is_file();
     let runtime = Rc::new(RefCell::new(None::<ApplicationRuntime>));
+    let desktop_session = DesktopSession::detect();
+    let overlay_backend = OverlayRuntimeBackend::detect(desktop_session);
+    let initial_subtitle_config = controller.borrow().config().subtitle.clone();
+    let overlay_client = Rc::new(RefCell::new(match overlay_backend {
+        OverlayRuntimeBackend::XWayland | OverlayRuntimeBackend::X11 => {
+            match OverlayClient::spawn(overlay_backend, &initial_subtitle_config) {
+                Ok(client) => Some(client),
+                Err(error) => {
+                    tracing::warn!(
+                        overlay_backend = overlay_backend.as_str(),
+                        error = %error,
+                        "Could not start subtitle overlay helper; the main pipeline remains available"
+                    );
+                    None
+                }
+            }
+        }
+        OverlayRuntimeBackend::Unavailable => None,
+    }));
+    let effective_overlay_backend = if overlay_client.borrow().is_some() {
+        overlay_backend
+    } else {
+        OverlayRuntimeBackend::Unavailable
+    };
 
     tracing::info!(
         state = ?controller.borrow().state(),
         config_path = %config_path.display(),
+        desktop_session = desktop_session.as_str(),
+        settings_backend = desktop_session.as_str(),
+        overlay_backend = effective_overlay_backend.as_str(),
+        xwayland_available = effective_overlay_backend == OverlayRuntimeBackend::XWayland,
         "Subtitle-live initialized"
     );
 
@@ -86,12 +238,30 @@ fn main() -> Result<(), AppError> {
     let activate_controller = Rc::clone(&controller);
     let activate_runtime = Rc::clone(&runtime);
     let activate_desktop = Rc::clone(&desktop);
+    let activate_overlay_client = Rc::clone(&overlay_client);
     application.connect_activate(move |application| {
         // Presenter เป็น GTK object จึงต้องสร้างและใช้งานบน main thread เท่านั้น
         if activate_desktop.borrow().is_none() {
-            let settings = SettingsPresenter::new(application, Rc::clone(&activate_controller));
-            let subtitle_config = activate_controller.borrow().config().subtitle.clone();
-            let overlay = OverlayPresenter::new(application, &subtitle_config);
+            let settings = SettingsPresenter::new_with_backend_info(
+                application,
+                Rc::clone(&activate_controller),
+                DesktopBackendInfo::new(
+                    desktop_session,
+                    DisplayBackend::detect(),
+                    effective_overlay_backend,
+                ),
+            );
+            let overlay = match overlay_backend {
+                OverlayRuntimeBackend::XWayland | OverlayRuntimeBackend::X11 => {
+                    activate_overlay_client
+                        .borrow_mut()
+                        .take()
+                        .map_or(DesktopOverlay::Unavailable, |client| {
+                            DesktopOverlay::Helper(Box::new(client))
+                        })
+                }
+                OverlayRuntimeBackend::Unavailable => DesktopOverlay::Unavailable,
+            };
 
             let (model_path, model_exists) = {
                 let runtime = activate_runtime.borrow();
@@ -108,6 +278,8 @@ fn main() -> Result<(), AppError> {
                 Rc::clone(&activate_controller),
                 Rc::clone(&activate_runtime),
                 Rc::clone(&activate_desktop),
+                desktop_session,
+                effective_overlay_backend,
             );
         }
 
@@ -117,13 +289,20 @@ fn main() -> Result<(), AppError> {
     });
 
     let shutdown_runtime = Rc::clone(&runtime);
+    let shutdown_desktop = Rc::clone(&desktop);
     application.connect_shutdown(move |_| {
+        if let Some(desktop) = shutdown_desktop.borrow().as_ref() {
+            desktop.overlay.request_shutdown();
+        }
         if let Some(runtime) = shutdown_runtime.borrow_mut().as_mut() {
             runtime.request_shutdown();
         }
     });
 
     application.run();
+    if let Some(desktop) = desktop.borrow().as_ref() {
+        desktop.overlay.finish();
+    }
     if let Some(runtime) = runtime.borrow_mut().as_mut() {
         runtime.finish();
     }
@@ -136,6 +315,8 @@ fn install_runtime_poll(
     controller: Rc<RefCell<ApplicationController>>,
     runtime: Rc<RefCell<Option<ApplicationRuntime>>>,
     desktop: Rc<RefCell<Option<DesktopUi>>>,
+    desktop_session: DesktopSession,
+    overlay_backend: OverlayRuntimeBackend,
 ) {
     let application = application.clone();
     glib::timeout_add_local(Duration::from_millis(20), move || {
@@ -154,7 +335,7 @@ fn install_runtime_poll(
             }
         }
 
-        let (state, last_error, metrics) = {
+        let (state, last_error, metrics, pipewire_status) = {
             let runtime = runtime.borrow();
             let runtime = runtime
                 .as_ref()
@@ -163,6 +344,7 @@ fn install_runtime_poll(
                 runtime.state(),
                 runtime.last_error().map(str::to_owned),
                 runtime.metrics_snapshot(),
+                runtime.pipewire_status(),
             )
         };
         let subtitle_config = controller.borrow().config().subtitle.clone();
@@ -170,14 +352,65 @@ fn install_runtime_poll(
             // งานส่วนนี้มีเฉพาะการอัปเดต widget; model load และ inference อยู่บน worker ทั้งหมด
             desktop.settings.update_state(state, last_error.as_deref());
             desktop.settings.update_metrics(metrics);
+            desktop.settings.update_pipewire_status(pipewire_status);
+            desktop
+                .settings
+                .append_debug_records(&update.debug_records);
+            if let Some(status) = update.debug_log_status.as_ref() {
+                desktop.settings.update_debug_log_status(status);
+            }
+            if let Some(counts) = update.debug_drop_counts.as_ref() {
+                desktop.settings.update_debug_drop_counts(counts);
+            }
+            let overlay_events = desktop.overlay.poll_events();
+            for event in &overlay_events {
+                if let OverlayEvent::MonitorsChanged { monitors } = event {
+                    desktop.settings.update_overlay_monitors(monitors);
+                }
+            }
+            {
+                let mut runtime = runtime.borrow_mut();
+                let runtime = runtime
+                    .as_mut()
+                    .expect("primary application runtime was not initialized");
+                for event in &overlay_events {
+                    match event {
+                        OverlayEvent::Rendered {
+                            frame_id,
+                            rendered_at_micros,
+                        } => {
+                            runtime.record_overlay_rendered(*frame_id, *rendered_at_micros);
+                        }
+                        OverlayEvent::Error { .. } => runtime.clear_pending_overlay_frames(),
+                        OverlayEvent::Ready
+                        | OverlayEvent::MonitorsChanged { .. }
+                        | OverlayEvent::Pong { .. } => {}
+                    }
+                }
+            }
+            let overlay_error = desktop.overlay.last_error();
+            desktop.settings.update_overlay_status(
+                desktop_session,
+                overlay_backend,
+                desktop.overlay.status(),
+                overlay_error.as_deref(),
+            );
             desktop.overlay.apply_config(&subtitle_config);
             if update.hide_overlay {
                 desktop.overlay.hide();
+                if let Some(runtime) = runtime.borrow_mut().as_mut() {
+                    runtime.clear_pending_overlay_frames();
+                }
             }
-            if let Some(subtitle) = update.subtitle {
-                desktop
-                    .overlay
-                    .show_text(&subtitle.text, subtitle.is_final);
+            if let Some(subtitle) = update.subtitle
+                && let Some(submission) = desktop.overlay.show_text(
+                    &subtitle.text,
+                    subtitle.is_final,
+                    subtitle.audio_origin_at,
+                )
+                && let Some(runtime) = runtime.borrow_mut().as_mut()
+            {
+                runtime.track_overlay_frame(submission.frame_id, submission.audio_origin_micros);
             }
             if update.show_settings {
                 desktop.settings.present();

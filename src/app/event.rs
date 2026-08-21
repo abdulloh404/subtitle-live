@@ -9,6 +9,8 @@ pub enum AppEvent {
     StateChanged(ApplicationState),
     /// ฟิลด์การตั้งค่าที่ระบุเปลี่ยนแปลงและต้องบันทึกหรือนำไปใช้
     ConfigChanged(&'static str),
+    /// สถานะชั่วคราวของเซสชันเปลี่ยน โดยไม่ต้องบันทึก config
+    SessionChanged,
     /// ต้องแสดงหน้าต่างตั้งค่า
     SettingsRequested,
     /// ต้องปิดแอปพลิเคชัน

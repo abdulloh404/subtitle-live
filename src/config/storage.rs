@@ -71,7 +71,7 @@ impl fmt::Display for ConfigError {
             ),
             Self::DataDirectoryUnavailable => write!(
                 formatter,
-                "cannot determine model directory because HOME is unavailable"
+                "cannot determine application data directory because HOME is unavailable"
             ),
         }
     }
@@ -145,6 +145,13 @@ pub fn default_path() -> Result<PathBuf, ConfigError> {
 pub fn default_model_path() -> Result<PathBuf, ConfigError> {
     absolute_environment_path("HOME")
         .map(|home| home.join(".subtitle-live/models/ggml-small.en.bin"))
+        .ok_or(ConfigError::DataDirectoryUnavailable)
+}
+
+/// คืน path ไฟล์ debug transcript ใต้ home directory โดยยังไม่สร้าง directory
+pub fn default_debug_log_path() -> Result<PathBuf, ConfigError> {
+    absolute_environment_path("HOME")
+        .map(|home| home.join(".subtitle-live/logs/transcript-debug.jsonl"))
         .ok_or(ConfigError::DataDirectoryUnavailable)
 }
 

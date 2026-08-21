@@ -11,10 +11,29 @@ use gtk::{gdk, glib};
 
 use crate::{config::SubtitleConfig, subtitle::CaptionLineBuffer};
 
+use super::{
+    OverlayMonitorInfo,
+    x11::{configure_overlay_window, is_x11_window, move_overlay_window},
+};
+
 /// ระยะเวลาคงข้อความ final ไว้ก่อนซ่อนเมื่อไม่มีข้อความรุ่นใหม่
 const FINAL_HOLD_TIME: Duration = Duration::from_secs(4);
 // พื้นหลังเว้นซ้ายและขวาข้างละ 20 พิกเซล จึงต้องหักออกก่อนวัดข้อความ
 const CAPTION_HORIZONTAL_PADDING_PX: u32 = 40;
+/// callback หนึ่งครั้งที่รอให้ GTK ผ่านช่วง paint
+type PaintCallback = Box<dyn FnOnce()>;
+/// ช่อง callback ล่าสุดที่ใช้ร่วมกันระหว่าง presenter กับ frame clock
+type PendingPaintCallback = Rc<RefCell<Option<PaintCallback>>>;
+/// geometry ของ monitor ล่าสุดซึ่งต้องย้ำอีกครั้งหลัง window ถูก map
+type TargetMonitorGeometry = Rc<Cell<Option<(i32, i32, i32, i32)>>>;
+/// ตำแหน่ง 9 จุดล่าสุดที่ใช้คำนวณพิกัดหน้าต่าง X11 ขนาดจริง
+type TargetPosition = Rc<RefCell<String>>;
+
+/// จอจริงของ GDK จับคู่กับข้อมูลที่ส่งผ่าน IPC
+struct OverlayMonitor {
+    info: OverlayMonitorInfo,
+    monitor: gdk::Monitor,
+}
 
 /// เจ้าของ GTK widget ทั้งหมดของ overlay ซึ่งต้องเรียกจาก GTK main thread
 pub struct OverlayPresenter {
@@ -28,12 +47,26 @@ pub struct OverlayPresenter {
     enabled: Cell<bool>,
     /// token สำหรับยกเลิก timeout ของ final frame รุ่นเก่า
     generation: Rc<Cell<u64>>,
+    /// callback ล่าสุดที่ต้องตอบหลัง paint โดย frame ใหม่จะแทน frame เก่าเสมอ
+    pending_after_paint: PendingPaintCallback,
+    /// ป้องกันการสร้าง tick/after-paint handler มากกว่าหนึ่งชุดพร้อมกัน
+    after_paint_scheduled: Rc<Cell<bool>>,
+    /// ระบุว่า renderer ใช้ X11/XWayland และต้องคง toplevel ไว้เพื่อรักษา stack
+    is_x11: Rc<Cell<bool>>,
     /// label ที่รับเฉพาะ plain text ไม่ตีความ markup
     label: gtk::Label,
     /// ข้อความต้นทางล่าสุดสำหรับจัดรูปแบบใหม่เมื่อ config เปลี่ยน
     last_text: RefCell<String>,
+    /// รายการจอจาก display ของ helper ซึ่งเป็นแหล่ง identity เพียงจุดเดียว
+    monitors: RefCell<Vec<OverlayMonitor>>,
+    /// root ที่ใช้วัดขนาดจริงของกล่อง subtitle โดยไม่มีพื้นที่โปร่งใสรอบนอก
+    root: gtk::Overlay,
     /// กล่องที่กำหนดตำแหน่ง anchor บนหน้าจอ
     surface: gtk::Box,
+    /// geometry ที่เลือกไว้สำหรับย้ำตำแหน่งหลัง map ครั้งแรก
+    target_monitor_geometry: TargetMonitorGeometry,
+    /// ตำแหน่งที่เลือกไว้สำหรับย้ำพิกัดหลังขนาดข้อความเปลี่ยน
+    target_position: TargetPosition,
     /// หน้าต่างโปร่งใสที่ไม่รับ input
     window: gtk::Window,
 }
@@ -63,10 +96,6 @@ impl OverlayPresenter {
             .valign(gtk::Align::End)
             .build();
         surface.add_css_class("subtitle-live-surface");
-        surface.set_margin_bottom(32);
-        surface.set_margin_end(32);
-        surface.set_margin_start(32);
-        surface.set_margin_top(32);
         surface.append(&label);
 
         let root = gtk::Overlay::builder()
@@ -74,73 +103,105 @@ impl OverlayPresenter {
             .valign(gtk::Align::Fill)
             .build();
         root.add_css_class("subtitle-live-overlay-root");
-        let canvas = gtk::Box::builder()
-            .hexpand(true)
-            .vexpand(true)
-            .build();
+        let canvas = gtk::Box::builder().hexpand(true).vexpand(true).build();
         root.set_child(Some(&canvas));
         root.add_overlay(&surface);
+        // ให้ overlay subtitle มีส่วนต่อ natural size ของหน้าต่างแทน canvas โปร่งใสเต็มจอ
+        root.set_measure_overlay(&surface, true);
 
         let window = gtk::Window::builder()
             .application(application)
             .child(&root)
             .decorated(false)
-            .default_height(600)
-            .default_width(1000)
             .focusable(false)
             .hide_on_close(true)
-            .resizable(true)
+            .resizable(false)
             .title("Subtitle-live Overlay")
             .build();
         window.add_css_class("subtitle-live-overlay");
-        window.connect_realize(|window| {
+        let is_x11 = Rc::new(Cell::new(false));
+        let target_monitor_geometry = Rc::new(Cell::new(None));
+        let target_position = Rc::new(RefCell::new(config.position.clone()));
+        let is_x11_for_realize = Rc::clone(&is_x11);
+        window.connect_realize(move |window| {
             if let Some(surface) = window.surface() {
                 // พื้นที่ input ว่างทำให้ overlay ไม่ขวางการคลิกหน้าต่างด้านล่าง
                 let empty_region = gtk::cairo::Region::create();
                 surface.set_input_region(Some(&empty_region));
             }
+            if is_x11_window(window) {
+                is_x11_for_realize.set(true);
+                configure_x11_or_report(window, false);
+            }
         });
-        window.maximize();
-
+        let target_monitor_geometry_for_map = Rc::clone(&target_monitor_geometry);
+        let target_position_for_map = Rc::clone(&target_position);
+        let root_for_map = root.clone();
+        window.connect_map(move |window| {
+            // ย้ำ property เฉพาะช่วงเริ่ม map เพราะ GTK อาจเขียน window type ปกติทับ
+            schedule_x11_configuration(window, Duration::from_millis(100));
+            schedule_x11_configuration(window, Duration::from_millis(500));
+            if target_monitor_geometry_for_map.get().is_some() {
+                // หลัง map ให้วัดกล่องจริงอีกครั้ง เพราะ allocation เริ่มต้นอาจเพิ่งเปลี่ยน
+                schedule_monitor_move(
+                    window,
+                    root_for_map.clone(),
+                    Rc::clone(&target_monitor_geometry_for_map),
+                    Rc::clone(&target_position_for_map),
+                    Duration::from_millis(100),
+                );
+            }
+        });
         let presenter = Self {
             applied_config: RefCell::new(None),
             css_provider,
             line_buffer: RefCell::new(CaptionLineBuffer::default()),
             enabled: Cell::new(false),
             generation: Rc::new(Cell::new(0)),
+            pending_after_paint: Rc::new(RefCell::new(None)),
+            after_paint_scheduled: Rc::new(Cell::new(false)),
+            is_x11,
             label,
             last_text: RefCell::new(String::new()),
+            monitors: RefCell::new(Vec::new()),
+            root,
             surface,
+            target_monitor_geometry,
+            target_position,
             window,
         };
+        presenter.refresh_monitors();
         presenter.apply_config(config);
         presenter
     }
 
     /// จัดรูปแบบและแสดง transcript frame
-    pub fn show_text(&self, text: &str, is_final: bool) {
+    pub fn show_text(&self, text: &str, is_final: bool) -> bool {
         if !self.enabled.get() {
-            return;
+            return false;
         }
         let source_text = text.trim();
         if source_text.is_empty() {
-            return;
+            return false;
         }
-        let config = self
-            .applied_config
-            .borrow()
-            .clone()
-            .unwrap_or_default();
+        let config = self.applied_config.borrow().clone().unwrap_or_default();
         let text = self.format_caption(source_text, &config);
         if text.is_empty() {
-            return;
+            return false;
         }
 
         self.label.set_label(&text);
+        self.surface.set_visible(true);
         self.last_text.replace(source_text.to_owned());
-        // GTK toplevel ปกติขอ always-on-top แบบถาวรบน GNOME Wayland ไม่ได้
-        // จึง present ใหม่ทุก frame เพื่อขอยกหน้าต่างโดยไม่รับ focus หรือ input
-        self.window.present();
+        if !self.window.is_visible() {
+            if self.is_x11.get() {
+                // ย้ำ No Input model ทันที ก่อน map เพื่อไม่ให้ GTK ขอ focus ให้ toplevel
+                configure_x11_or_report(&self.window, false);
+            }
+            // map โดยไม่ร้องขอ active window เพื่อไม่แย่ง focus จากเกมหรือวิดีโอ
+            self.window.set_visible(true);
+        }
+        self.schedule_reposition(Duration::ZERO);
 
         let next_generation = self.generation.get().wrapping_add(1);
         self.generation.set(next_generation);
@@ -148,20 +209,61 @@ impl OverlayPresenter {
             let generation = Rc::clone(&self.generation);
             let window = self.window.clone();
             let label = self.label.clone();
+            let surface = self.surface.clone();
             glib::timeout_add_local_once(FINAL_HOLD_TIME, move || {
                 if generation.get() == next_generation {
                     label.set_label("");
+                    surface.set_visible(false);
                     window.hide();
                 }
             });
         }
+        true
     }
 
-    /// ล้างข้อความและซ่อนหน้าต่าง พร้อมยกเลิก final timeout รุ่นก่อนหน้า
+    /// เรียก callback หนึ่งครั้งหลัง frame clock ผ่านช่วง paint ถัดไปของ overlay
+    pub fn after_next_paint<F>(&self, callback: F)
+    where
+        F: FnOnce() + 'static,
+    {
+        self.pending_after_paint.replace(Some(Box::new(callback)));
+        self.window.queue_draw();
+        if self.after_paint_scheduled.replace(true) {
+            return;
+        }
+
+        let pending_after_paint = Rc::clone(&self.pending_after_paint);
+        let after_paint_scheduled = Rc::clone(&self.after_paint_scheduled);
+        self.window.add_tick_callback(move |_, frame_clock| {
+            let pending_after_paint = Rc::clone(&pending_after_paint);
+            let after_paint_scheduled = Rc::clone(&after_paint_scheduled);
+            let handler_slot = Rc::new(RefCell::new(None));
+            let handler_slot_for_signal = Rc::clone(&handler_slot);
+            let handler_id = frame_clock.connect_after_paint(move |frame_clock| {
+                if let Some(handler_id) = handler_slot_for_signal.borrow_mut().take() {
+                    frame_clock.disconnect(handler_id);
+                }
+                after_paint_scheduled.set(false);
+                if let Some(callback) = pending_after_paint.borrow_mut().take() {
+                    callback();
+                }
+            });
+            handler_slot.replace(Some(handler_id));
+            glib::ControlFlow::Break
+        });
+    }
+
+    /// ยกเลิก acknowledgment ที่ยังไม่ผ่าน paint เมื่อข้อความถูกซ่อน
+    pub fn cancel_pending_paint(&self) {
+        self.pending_after_paint.borrow_mut().take();
+    }
+
+    /// ล้างข้อความและ unmap passive overlay เพื่อไม่ทิ้ง surface เต็มจอไว้โดยไม่จำเป็น
     pub fn hide(&self) {
-        self.generation
-            .set(self.generation.get().wrapping_add(1));
+        self.cancel_pending_paint();
+        self.generation.set(self.generation.get().wrapping_add(1));
         self.label.set_label("");
+        self.surface.set_visible(false);
         self.line_buffer.borrow_mut().clear();
         self.last_text.borrow_mut().clear();
         self.window.hide();
@@ -181,12 +283,30 @@ impl OverlayPresenter {
             return;
         }
 
-        let layout_changed = self.applied_config.borrow().as_ref().is_none_or(|previous| {
-            previous.font_size != config.font_size
-                || previous.width_px != config.width_px
-                || previous.max_lines != config.max_lines
-        });
+        let layout_changed = self
+            .applied_config
+            .borrow()
+            .as_ref()
+            .is_none_or(|previous| {
+                previous.font_size != config.font_size
+                    || previous.width_px != config.width_px
+                    || previous.max_lines != config.max_lines
+            });
+        let monitor_changed = self
+            .applied_config
+            .borrow()
+            .as_ref()
+            .is_none_or(|previous| previous.monitor_id != config.monitor_id);
+        let position_changed = self
+            .applied_config
+            .borrow()
+            .as_ref()
+            .is_none_or(|previous| previous.position != config.position);
         self.set_enabled(config.visible);
+        self.target_position.replace(config.position.clone());
+        if monitor_changed {
+            self.move_to_configured_monitor(&config.monitor_id);
+        }
         apply_position(&self.surface, &config.position);
         apply_text_alignment(&self.label, &config.text_alignment);
         // ปล่อยให้พื้นหลังขยายตามข้อความจริง ส่วน width_px ใช้เป็นเพดานตอนตัดบรรทัด
@@ -206,6 +326,71 @@ impl OverlayPresenter {
             }
         }
         self.applied_config.replace(Some(config.clone()));
+        if layout_changed || position_changed {
+            self.schedule_reposition(Duration::ZERO);
+        }
+    }
+
+    /// อ่านรายการจอใหม่หลัง hotplug แล้วบังคับใช้จอเป้าหมายอีกครั้งแม้ config ไม่เปลี่ยน
+    pub fn refresh_monitors(&self) -> Vec<OverlayMonitorInfo> {
+        let detected = detect_overlay_monitors();
+        let infos = detected
+            .iter()
+            .map(|monitor| monitor.info.clone())
+            .collect::<Vec<_>>();
+        self.monitors.replace(detected);
+        if let Some(config) = self.applied_config.borrow().as_ref() {
+            self.move_to_configured_monitor(&config.monitor_id);
+        }
+        infos
+    }
+
+    /// คืนข้อมูลจอปัจจุบันสำหรับส่งให้ main process โดยไม่สแกน GDK ซ้ำ
+    pub fn monitor_infos(&self) -> Vec<OverlayMonitorInfo> {
+        self.monitors
+            .borrow()
+            .iter()
+            .map(|monitor| monitor.info.clone())
+            .collect()
+    }
+
+    /// เลือก monitor จาก ID ของ helper และ fallback จอแรกเมื่อจอเดิมหายไป
+    fn move_to_configured_monitor(&self, monitor_id: &str) {
+        let monitors = self.monitors.borrow();
+        let selected = monitors
+            .iter()
+            .find(|monitor| !monitor_id.is_empty() && monitor.info.id == monitor_id)
+            .or_else(|| monitors.first());
+        if let Some(selected) = selected {
+            let geometry = selected.monitor.geometry();
+            let geometry = (
+                geometry.x(),
+                geometry.y(),
+                geometry.width(),
+                geometry.height(),
+            );
+            self.target_monitor_geometry.set(Some(geometry));
+            gtk::prelude::WidgetExt::realize(&self.window);
+            if let Err(error) = move_measured_overlay(
+                &self.window,
+                &self.root,
+                geometry,
+                self.target_position.borrow().as_str(),
+            ) {
+                eprintln!("ไม่สามารถย้าย subtitle overlay ไปจอที่เลือกได้: {error}");
+            }
+        }
+    }
+
+    /// รอให้ GTK คำนวณ natural size ใหม่ก่อนย้ายกล่องตาม work area ที่เลือก
+    fn schedule_reposition(&self, delay: Duration) {
+        schedule_monitor_move(
+            &self.window,
+            self.root.clone(),
+            Rc::clone(&self.target_monitor_geometry),
+            Rc::clone(&self.target_position),
+            delay,
+        );
     }
 
     /// วัดข้อความด้วย Pango ตามขนาดฟอนต์จริง แล้วส่งผลให้คิวตัดและดันบรรทัด
@@ -227,6 +412,93 @@ impl OverlayPresenter {
                 layout.pixel_size().0 <= available_width
             })
     }
+}
+
+/// ตรวจจอจาก display ของ helper แล้วสร้าง ID ที่คงตาม connector เมื่อมีข้อมูล
+fn detect_overlay_monitors() -> Vec<OverlayMonitor> {
+    let Some(display) = gdk::Display::default() else {
+        return Vec::new();
+    };
+    let monitors = display.monitors();
+    let mut detected = (0..monitors.n_items())
+        .filter_map(|index| {
+            monitors
+                .item(index)
+                .and_then(|item| item.downcast::<gdk::Monitor>().ok())
+        })
+        .collect::<Vec<_>>();
+    // เรียงตาม desktop layout เพื่อให้ชื่อ Display N อ่านตรงกับตำแหน่งจริง
+    detected.sort_by_key(|monitor| {
+        let geometry = monitor.geometry();
+        let identity = monitor
+            .connector()
+            .or_else(|| monitor.model())
+            .unwrap_or_default();
+        (geometry.x(), geometry.y(), identity)
+    });
+    let mut used_ids = Vec::<String>::new();
+    detected
+        .into_iter()
+        .enumerate()
+        .map(|(index, monitor)| {
+            let geometry = monitor.geometry();
+            let connector = monitor.connector().filter(|value| !value.trim().is_empty());
+            let model = monitor.model().filter(|value| !value.trim().is_empty());
+            let base_id = connector.as_ref().map_or_else(
+                || {
+                    format!(
+                        "geometry:{}:{}:{}:{}",
+                        geometry.x(),
+                        geometry.y(),
+                        geometry.width(),
+                        geometry.height()
+                    )
+                },
+                |connector| format!("connector:{connector}"),
+            );
+            let duplicate_count = used_ids
+                .iter()
+                .filter(|id| id.as_str() == base_id.as_str())
+                .count();
+            used_ids.push(base_id.clone());
+            let id = if duplicate_count == 0 {
+                base_id
+            } else {
+                format!("{base_id}#{}", duplicate_count + 1)
+            };
+            let identity = connector.or(model);
+            let label = identity.map_or_else(
+                || {
+                    format!(
+                        "Display {} · {}×{}",
+                        index + 1,
+                        geometry.width(),
+                        geometry.height()
+                    )
+                },
+                |identity| {
+                    format!(
+                        "Display {} · {} · {}×{}",
+                        index + 1,
+                        identity,
+                        geometry.width(),
+                        geometry.height()
+                    )
+                },
+            );
+            OverlayMonitor {
+                info: OverlayMonitorInfo {
+                    id,
+                    label,
+                    x: geometry.x(),
+                    y: geometry.y(),
+                    width: geometry.width(),
+                    height: geometry.height(),
+                },
+                monitor,
+            }
+        })
+        .collect()
 }
 
 /// แปลงชื่อ position เป็น GTK alignment ของกล่องข้อความ
@@ -255,4 +527,72 @@ fn apply_text_alignment(label: &gtk::Label, alignment: &str) {
     };
     label.set_justify(justification);
     label.set_xalign(xalign);
+}
+
+/// ตั้ง X11 property หลัง map โดยไม่ raise ซ้ำตาม subtitle frame
+fn schedule_x11_configuration(window: &gtk::Window, delay: Duration) {
+    if !is_x11_window(window) {
+        return;
+    }
+    let window = window.clone();
+    glib::timeout_add_local_once(delay, move || {
+        if window.is_mapped() {
+            configure_x11_or_report(&window, true);
+        }
+    });
+}
+
+/// ย้ำตำแหน่งหลัง map เพราะก่อนหน้านั้น window manager ยังไม่รู้จัก X11 toplevel
+fn schedule_monitor_move(
+    window: &gtk::Window,
+    root: gtk::Overlay,
+    target_monitor_geometry: TargetMonitorGeometry,
+    target_position: TargetPosition,
+    delay: Duration,
+) {
+    if !is_x11_window(window) {
+        return;
+    }
+    let window = window.clone();
+    glib::timeout_add_local_once(delay, move || {
+        if let Some(geometry) = target_monitor_geometry.get()
+            && window.is_mapped()
+            && let Err(error) = move_measured_overlay(
+                &window,
+                &root,
+                geometry,
+                target_position.borrow().as_str(),
+            )
+        {
+            eprintln!("ไม่สามารถย้ำตำแหน่ง subtitle overlay หลัง map ได้: {error}");
+        }
+    });
+}
+
+/// วัด natural size ของกล่องข้อความ แล้วขยับเฉพาะหน้าต่างขนาดนั้นบน X11
+fn move_measured_overlay(
+    window: &gtk::Window,
+    root: &gtk::Overlay,
+    monitor: (i32, i32, i32, i32),
+    position: &str,
+) -> Result<(), String> {
+    let (_, natural_width, _, _) = root.measure(gtk::Orientation::Horizontal, -1);
+    let (_, natural_height, _, _) = root.measure(gtk::Orientation::Vertical, natural_width);
+    move_overlay_window(
+        window,
+        monitor.0,
+        monitor.1,
+        monitor.2,
+        monitor.3,
+        natural_width.max(1),
+        natural_height.max(1),
+        position,
+    )
+}
+
+/// แสดงเฉพาะข้อผิดพลาดของการตั้งค่า window โดยไม่บันทึกข้อความ subtitle
+fn configure_x11_or_report(window: &gtk::Window, mapped: bool) {
+    if let Err(error) = configure_overlay_window(window, mapped) {
+        eprintln!("ไม่สามารถกำหนด X11 subtitle overlay ได้: {error}");
+    }
 }

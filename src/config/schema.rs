@@ -171,9 +171,10 @@ impl AppConfig {
                 ));
             }
 
-            if rule.streams.iter().any(|stream| {
-                !has_text(&stream.media_name) && !has_text(&stream.node_name)
-            })
+            if rule
+                .streams
+                .iter()
+                .any(|stream| !has_text(&stream.media_name) && !has_text(&stream.node_name))
             {
                 return Err(ConfigValidationError::new(
                     "audio.rules.streams",
@@ -295,7 +296,7 @@ pub struct SttConfig {
     pub step_ms: u32,
     /// ความยาวเสียงย้อนหลังสูงสุดที่ใช้เป็น context
     pub window_ms: u32,
-    /// เปิดการตรวจจับช่วงที่มีเสียงพูดก่อนเรียก STT
+    /// เปิดตัวกรองกิจกรรมเสียงด้วยระดับพลังงาน RMS ก่อนเรียก STT
     pub vad_enabled: bool,
 }
 
@@ -319,6 +320,9 @@ impl Default for SttConfig {
 pub struct SubtitleConfig {
     /// แสดงหรือซ่อน overlay
     pub visible: bool,
+    /// รหัสจอจาก overlay helper; ค่าว่างหมายถึงเลือกจอแรกอัตโนมัติ
+    #[serde(default)]
+    pub monitor_id: String,
     /// anchor บนหน้าจอตามค่าใน [`SUBTITLE_POSITIONS`]
     pub position: String,
     /// แนวข้อความภายในกล่องตามค่าใน [`SUBTITLE_TEXT_ALIGNMENTS`]
@@ -337,6 +341,7 @@ impl Default for SubtitleConfig {
     fn default() -> Self {
         Self {
             visible: true,
+            monitor_id: String::new(),
             position: "bottom-center".to_owned(),
             text_alignment: "left".to_owned(),
             font_size: 28,
@@ -366,4 +371,17 @@ fn has_text(value: &Option<String>) -> bool {
     value
         .as_deref()
         .is_some_and(|value| !value.trim().is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SubtitleConfig;
+
+    #[test]
+    fn subtitle_config_without_monitor_id_uses_automatic_display() {
+        let config: SubtitleConfig =
+            serde_json::from_str(r#"{"visible":false}"#).expect("config รุ่นเก่าต้องอ่านได้");
+
+        assert!(config.monitor_id.is_empty());
+    }
 }

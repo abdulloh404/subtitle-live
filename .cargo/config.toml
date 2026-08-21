@@ -1,7 +1,0 @@
-[env]
-# Clang ที่มากับ ROCm เลือก GCC 12 ซึ่งติดตั้งไม่ครบในเครื่อง Ubuntu นี้
-# จึงกำหนดให้ hipcc ใช้ GCC 11 toolchain ที่สมบูรณ์ และชี้ libclang ไปยัง ROCm โดยตรง
-CMAKE_PREFIX_PATH = { value = "/opt/rocm/core", force = false }
-HIPCC_COMPILE_FLAGS_APPEND = { value = "--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/11", force = false }
-HIPCC_LINK_FLAGS_APPEND = { value = "--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/11", force = false }
-LIBCLANG_PATH = { value = "/opt/rocm/core/llvm/lib", force = false }

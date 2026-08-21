@@ -128,11 +128,7 @@ impl CaptureTarget {
             .node_name
             .clone()
             .map(StreamDiscriminator::NodeName)
-            .or_else(|| {
-                info.media_name
-                    .clone()
-                    .map(StreamDiscriminator::MediaName)
-            })
+            .or_else(|| info.media_name.clone().map(StreamDiscriminator::MediaName))
             .or_else(|| {
                 info.object_serial
                     .clone()
@@ -155,10 +151,8 @@ impl CaptureTarget {
             return false;
         }
 
-        let application_matches = strongest_common_identity_matches(
-            &self.application,
-            &stream.application,
-        );
+        let application_matches =
+            strongest_common_identity_matches(&self.application, &stream.application);
         if !application_matches {
             return false;
         }
@@ -186,12 +180,22 @@ impl CaptureTarget {
 pub enum PipeWireEvent {
     /// snapshot ใหม่ของ playback stream ทั้งหมดที่ค้นพบ
     StreamsChanged(Vec<StreamInfo>),
-    /// capture ของ runtime node เริ่มส่งเสียงแล้ว
-    CaptureStarted(u32),
-    /// capture ของ runtime node ถูกหยุดหรือตัดการเชื่อมต่อแล้ว
-    CaptureStopped(u32),
+    /// capture ของ runtime node เริ่มส่งเสียงในรุ่นที่ระบุแล้ว
+    CaptureStarted {
+        runtime_id: u32,
+        audio_generation: u64,
+    },
+    /// capture ของ runtime node ในรุ่นที่ระบุถูกหยุดหรือตัดการเชื่อมต่อแล้ว
+    CaptureStopped {
+        runtime_id: u32,
+        audio_generation: u64,
+    },
     /// capture ของ node เดียวล้มเหลว แต่ service อาจยังทำงานต่อได้
-    CaptureError { runtime_id: u32, message: String },
+    CaptureError {
+        runtime_id: u32,
+        audio_generation: u64,
+        message: String,
+    },
     /// ข้อผิดพลาดระดับ PipeWire service หรือ core
     Error(String),
 }

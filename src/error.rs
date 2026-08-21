@@ -11,6 +11,8 @@ pub enum AppError {
     Config(ConfigError),
     /// ไม่สามารถติดตั้งตัวรับ tracing ได้
     Logging(String),
+    /// ไม่สามารถเริ่ม process สำหรับวาด subtitle overlay ได้
+    Overlay(String),
 }
 
 impl fmt::Display for AppError {
@@ -18,6 +20,7 @@ impl fmt::Display for AppError {
         match self {
             Self::Config(error) => write!(formatter, "configuration error: {error}"),
             Self::Logging(error) => write!(formatter, "failed to initialize logging: {error}"),
+            Self::Overlay(error) => write!(formatter, "overlay error: {error}"),
         }
     }
 }
@@ -26,7 +29,7 @@ impl Error for AppError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Config(error) => Some(error),
-            Self::Logging(_) => None,
+            Self::Logging(_) | Self::Overlay(_) => None,
         }
     }
 }

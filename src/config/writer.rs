@@ -17,7 +17,7 @@ pub struct ConfigWriter {
 /// คำสั่งภายในที่มีเพียง worker thread เป็นผู้รับ
 enum WriteCommand {
     /// บันทึก snapshot ล่าสุด โดย snapshot ที่ใหม่กว่าสามารถแทนค่าที่ค้างอยู่ได้
-    Save(AppConfig),
+    Save(Box<AppConfig>),
     /// เขียนงานที่ค้างอยู่แล้วหยุด worker
     Shutdown,
 }
@@ -64,7 +64,11 @@ impl ConfigWriter {
 
     /// ส่ง snapshot ไปบันทึกแบบไม่บล็อก thread ผู้เรียก
     pub fn save(&self, config: &AppConfig) {
-        if self.sender.send(WriteCommand::Save(config.clone())).is_err() {
+        if self
+            .sender
+            .send(WriteCommand::Save(Box::new(config.clone())))
+            .is_err()
+        {
             tracing::error!("ไม่สามารถติดต่อ config writer ได้");
         }
     }

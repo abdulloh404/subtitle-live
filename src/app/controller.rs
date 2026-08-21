@@ -11,6 +11,15 @@ use crate::{
 
 use super::{AppCommand, AppEvent, ApplicationState};
 
+/// ตัวเลือก debug ที่มีผลเฉพาะโปรเซสปัจจุบันและไม่ถูกบันทึกลง config
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DebugSessionState {
+    /// ส่งข้อมูลแต่ละรอบ inference ไปแสดงบนหน้า Debug
+    pub live_enabled: bool,
+    /// บันทึกข้อมูลแต่ละรอบ inference เป็นไฟล์ JSONL
+    pub file_logging_enabled: bool,
+}
+
 /// แหล่งข้อมูลจริงของ config สถานะ pipeline และกฎเลือก stream ในชั้นแอปพลิเคชัน
 pub struct ApplicationController {
     /// การตั้งค่าที่ผ่านการปรับค่าให้อยู่ในช่วงที่ UI รองรับ
@@ -19,6 +28,10 @@ pub struct ApplicationController {
     state: ApplicationState,
     /// snapshot ล่าสุดของ playback stream ที่ PipeWire ค้นพบ
     streams: Vec<StreamInfo>,
+    /// เลขลำดับคำขอ retry เพื่อให้ runtime เห็นคำสั่งจากผู้เรียกทุกช่องทาง
+    retry_generation: u64,
+    /// สถานะ debug ชั่วคราว ซึ่งเริ่มปิดใหม่ทุกครั้งที่เปิดโปรแกรม
+    debug_session: DebugSessionState,
 }
 
 impl ApplicationController {
@@ -35,12 +48,24 @@ impl ApplicationController {
             config,
             state,
             streams: Vec::new(),
+            retry_generation: 0,
+            debug_session: DebugSessionState::default(),
         }
     }
 
     /// คืนสถานะ pipeline ปัจจุบัน
     pub const fn state(&self) -> ApplicationState {
         self.state
+    }
+
+    /// คืนเลขลำดับคำขอ retry ล่าสุดสำหรับให้ runtime ตรวจจับแบบไม่บล็อก
+    pub const fn retry_generation(&self) -> u64 {
+        self.retry_generation
+    }
+
+    /// คืนสถานะ debug ของเซสชันปัจจุบัน
+    pub const fn debug_session_state(&self) -> DebugSessionState {
+        self.debug_session
     }
 
     /// คืนการตั้งค่าปัจจุบันแบบยืมค่า
@@ -237,7 +262,7 @@ impl ApplicationController {
 
     /// ตรวจสอบและประมวลผลคำสั่งหนึ่งรายการโดยไม่เรียกบริการภายนอกโดยตรง
     pub fn handle_command(&mut self, command: AppCommand) -> AppEvent {
-        let event = match command {
+        match command {
             AppCommand::StartSubtitles => {
                 self.config.general.live_subtitles = true;
                 self.state = ApplicationState::Starting;
@@ -246,6 +271,12 @@ impl ApplicationController {
             AppCommand::StopSubtitles => {
                 self.config.general.live_subtitles = false;
                 self.state = ApplicationState::Stopped;
+                AppEvent::StateChanged(self.state)
+            }
+            AppCommand::RetryPipeline => {
+                self.config.general.live_subtitles = true;
+                self.state = ApplicationState::Starting;
+                self.retry_generation = self.retry_generation.saturating_add(1);
                 AppEvent::StateChanged(self.state)
             }
             AppCommand::SetKeepRunningWhenClosed(enabled) => {
@@ -274,15 +305,25 @@ impl ApplicationController {
                 self.config.stt.vad_enabled = enabled;
                 AppEvent::ConfigChanged("stt.vad_enabled")
             }
+            AppCommand::SetDebugLiveEnabled(enabled) => {
+                self.debug_session.live_enabled = enabled;
+                AppEvent::SessionChanged
+            }
+            AppCommand::SetDebugFileLoggingEnabled(enabled) => {
+                self.debug_session.file_logging_enabled = enabled;
+                AppEvent::SessionChanged
+            }
             AppCommand::SetSubtitleVisible(visible) => {
                 self.config.subtitle.visible = visible;
                 AppEvent::ConfigChanged("subtitle.visible")
             }
+            AppCommand::SetSubtitleMonitor(monitor_id) => {
+                self.config.subtitle.monitor_id = monitor_id;
+                AppEvent::ConfigChanged("subtitle.monitor_id")
+            }
             AppCommand::SetSubtitlePosition(position) => {
                 if !SUBTITLE_POSITIONS.contains(&position.as_str()) {
-                    return AppEvent::Error(format!(
-                        "Unsupported subtitle position: {position}"
-                    ));
+                    return AppEvent::Error(format!("Unsupported subtitle position: {position}"));
                 }
                 self.config.subtitle.position = position;
                 AppEvent::ConfigChanged("subtitle.position")
@@ -334,8 +375,7 @@ impl ApplicationController {
             }
             AppCommand::ShowSettings => AppEvent::SettingsRequested,
             AppCommand::Quit => AppEvent::QuitRequested,
-        };
-        event
+        }
     }
 }
 
@@ -427,4 +467,46 @@ fn application_keys_equal(left: &ApplicationKey, right: &ApplicationKey) -> bool
 /// คืนข้อความที่ไม่ว่างและตัดค่าที่มีแต่ช่องว่างออก
 fn non_empty(value: &Option<String>) -> Option<&str> {
     value.as_deref().filter(|value| !value.trim().is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        app::{AppCommand, AppEvent, ApplicationController, ApplicationState},
+        config::{AppConfig, ApplicationRule},
+    };
+
+    #[test]
+    fn retry_pipeline_keeps_audio_source_selection() {
+        let mut config = AppConfig::default();
+        config.audio.rules.push(ApplicationRule {
+            enabled: true,
+            application_id: Some("org.example.Player".to_owned()),
+            process_binary: None,
+            application_name: Some("Player".to_owned()),
+            streams: Vec::new(),
+        });
+        let expected_rules = config.audio.rules.clone();
+        let mut controller = ApplicationController::new(config);
+        controller.set_state(ApplicationState::Error);
+        let generation_before_retry = controller.retry_generation();
+
+        let event = controller.handle_command(AppCommand::RetryPipeline);
+
+        assert_eq!(event, AppEvent::StateChanged(ApplicationState::Starting));
+        assert!(controller.config().general.live_subtitles);
+        assert_eq!(controller.config().audio.rules, expected_rules);
+        assert_eq!(controller.retry_generation(), generation_before_retry + 1);
+    }
+
+    #[test]
+    fn subtitle_monitor_command_updates_persisted_id() {
+        let mut controller = ApplicationController::new(AppConfig::default());
+
+        let event =
+            controller.handle_command(AppCommand::SetSubtitleMonitor("connector:DP-1".to_owned()));
+
+        assert_eq!(event, AppEvent::ConfigChanged("subtitle.monitor_id"));
+        assert_eq!(controller.config().subtitle.monitor_id, "connector:DP-1");
+    }
 }

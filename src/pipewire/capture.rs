@@ -4,16 +4,13 @@
 //! จากนั้น callback จะประทับเวลาโดยประมาณและส่งเสียงเข้าคิวแบบไม่รอ เพื่อไม่ให้
 //! งาน STT ที่ช้ากว่าทำให้ real-time callback สะดุด
 
-use std::{
-    mem::size_of,
-    time::Instant,
-};
+use std::{mem::size_of, time::Instant};
 
 use libspa_sys as spa_sys;
 use pipewire as pw;
 use pw::{prelude::*, spa};
 
-use crate::audio::{LatestQueue, SAMPLE_RATE_HZ, SourceAudioChunk};
+use crate::audio::{AudioBufferPool, LatestQueue, SAMPLE_RATE_HZ, SourceAudioChunk};
 
 use super::{PipeWireEvent, StreamInfo};
 
@@ -23,11 +20,21 @@ struct CaptureUserData {
     audio: LatestQueue<SourceAudioChunk>,
     /// runtime node ID ของ source นี้
     source_id: u32,
+    /// รุ่น pipeline ที่ runtime กำหนดให้ capture session นี้
+    generation: u64,
+    /// บัฟเฟอร์ที่จอง heap ล่วงหน้าเพื่อไม่ให้ callback ต้อง allocate
+    buffers: AudioBufferPool,
 }
+
+/// จำนวนก้อนสูงสุดที่ callback ของ stream เดียวถือค้างรอ mixer ได้
+const CAPTURE_BUFFER_COUNT: usize = 8;
+/// ความจุต่อก้อนหนึ่งวินาที รองรับ PipeWire quantum ปกติโดยไม่ขยาย heap
+const CAPTURE_BUFFER_MAX_SAMPLES: usize = SAMPLE_RATE_HZ as usize;
 
 /// เจ้าของ PipeWire stream ที่กำลัง capture และตัดการเชื่อมต่อได้อย่างปลอดภัย
 pub(super) struct CaptureSession {
     stream: pw::stream::Stream<CaptureUserData>,
+    generation: u64,
 }
 
 impl CaptureSession {
@@ -35,12 +42,18 @@ impl CaptureSession {
     pub(super) fn disconnect(&self) {
         let _ = self.stream.disconnect();
     }
+
+    /// คืนรุ่น pipeline ของ session เพื่อผูก event หยุดกับรอบที่ถูกต้อง
+    pub(super) const fn generation(&self) -> u64 {
+        self.generation
+    }
 }
 
 /// สร้าง capture stream ที่เจาะจง node และร้องขอเสียง mono `f32` 16 kHz
 pub(super) fn create_capture(
     mainloop: &pw::MainLoop,
     info: &StreamInfo,
+    generation: u64,
     audio: LatestQueue<SourceAudioChunk>,
     events: std::sync::mpsc::Sender<PipeWireEvent>,
 ) -> Result<CaptureSession, String> {
@@ -69,21 +82,26 @@ pub(super) fn create_capture(
         CaptureUserData {
             audio,
             source_id: info.runtime_id,
+            generation,
+            buffers: AudioBufferPool::new(CAPTURE_BUFFER_COUNT, CAPTURE_BUFFER_MAX_SAMPLES),
         },
     )
     .state_changed({
         let state_events = events.clone();
         let source_id = info.runtime_id;
+        let audio_generation = generation;
         move |_, state| match state {
             pw::stream::StreamState::Streaming => {
-                let _ = state_events.send(PipeWireEvent::CaptureStarted(source_id));
+                let _ = state_events.send(PipeWireEvent::CaptureStarted {
+                    runtime_id: source_id,
+                    audio_generation,
+                });
             }
             pw::stream::StreamState::Error(message) => {
                 let _ = state_events.send(PipeWireEvent::CaptureError {
                     runtime_id: source_id,
-                    message: format!(
-                        "PipeWire capture failed for stream {source_id}: {message}"
-                    ),
+                    audio_generation,
+                    message: format!("PipeWire capture failed for stream {source_id}: {message}"),
                 });
             }
             _ => {}
@@ -107,19 +125,29 @@ pub(super) fn create_capture(
             return;
         }
 
+        let sample_bytes = &bytes[offset..end];
+        let sample_count = sample_bytes.len() / size_of::<f32>();
+        // pool ว่างหรือ quantum ใหญ่กว่าที่เตรียมไว้ให้ทิ้งรอบนี้แทนการ allocate/block
+        let Some(mut samples) = user_data.buffers.try_acquire(sample_count) else {
+            return;
+        };
         // อ่านเฉพาะช่วงที่ PipeWire ระบุใน chunk และไม่แตะ padding ของบัฟเฟอร์
-        let samples: Vec<_> = bytes[offset..end]
-            .chunks_exact(size_of::<f32>())
-            .map(|sample| f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]))
-            .collect();
+        for sample in sample_bytes.chunks_exact(size_of::<f32>()) {
+            samples.push(f32::from_le_bytes([
+                sample[0], sample[1], sample[2], sample[3],
+            ]));
+        }
         let captured_end = Instant::now();
         let sample_duration =
             std::time::Duration::from_secs_f64(samples.len() as f64 / SAMPLE_RATE_HZ as f64);
         // ห้ามทำ formatting หรือ I/O ของ log ใน callback นี้ เพราะจะรบกวน PipeWire
         user_data.audio.push_latest(SourceAudioChunk {
+            generation: user_data.generation,
             source_id: user_data.source_id,
             samples,
-            captured_at: captured_end.checked_sub(sample_duration).unwrap_or(captured_end),
+            captured_at: captured_end
+                .checked_sub(sample_duration)
+                .unwrap_or(captured_end),
         });
     })
     .create()
@@ -162,13 +190,11 @@ pub(super) fn create_capture(
             },
         ],
     });
-    let values = spa::pod::serialize::PodSerializer::serialize(
-        std::io::Cursor::new(Vec::new()),
-        &format,
-    )
-    .map_err(|error| format!("failed to serialize capture format: {error}"))?
-    .0
-    .into_inner();
+    let values =
+        spa::pod::serialize::PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &format)
+            .map_err(|error| format!("failed to serialize capture format: {error}"))?
+            .0
+            .into_inner();
     let mut params = [values.as_ptr().cast()];
 
     stream
@@ -185,5 +211,5 @@ pub(super) fn create_capture(
             )
         })?;
 
-    Ok(CaptureSession { stream })
+    Ok(CaptureSession { stream, generation })
 }
