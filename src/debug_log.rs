@@ -17,6 +17,7 @@ use std::{
 use serde::Serialize;
 
 use crate::{audio::LatestQueue, stt::SttDebugRecord};
+use gtk::glib;
 
 // จำกัด raw transcript ที่รอเขียน เพื่อไม่ให้หน่วยความจำโตเมื่อดิสก์ทำงานช้า
 const RECORD_QUEUE_CAPACITY: usize = 512;
@@ -241,7 +242,7 @@ fn write_pending(
 
 #[derive(Serialize)]
 struct JsonRecord<'a> {
-    timestamp_unix_ms: u64,
+    timestamp: String,
     audio_generation: u64,
     segment_id: u64,
     kind: &'static str,
@@ -259,7 +260,7 @@ struct JsonRecord<'a> {
 impl<'a> From<&'a SttDebugRecord> for JsonRecord<'a> {
     fn from(record: &'a SttDebugRecord) -> Self {
         Self {
-            timestamp_unix_ms: record.timestamp_unix_ms,
+            timestamp: utc_timestamp(record.timestamp_unix_ms),
             audio_generation: record.audio_generation,
             segment_id: record.segment_id,
             kind: record.kind.as_str(),
@@ -274,4 +275,16 @@ impl<'a> From<&'a SttDebugRecord> for JsonRecord<'a> {
             window_ms: record.window_ms,
         }
     }
+}
+
+/// แปลง Unix timestamp เป็น ISO 8601 แบบ UTC พร้อม millisecond
+fn utc_timestamp(timestamp_unix_ms: u64) -> String {
+    let seconds = i64::try_from(timestamp_unix_ms / 1_000).unwrap_or(i64::MAX);
+    let milliseconds = timestamp_unix_ms % 1_000;
+    glib::DateTime::from_unix_utc(seconds)
+        .and_then(|timestamp| timestamp.format("%Y-%m-%dT%H:%M:%S"))
+        .map_or_else(
+            |_| timestamp_unix_ms.to_string(),
+            |timestamp| format!("{timestamp}.{milliseconds:03}Z"),
+        )
 }
