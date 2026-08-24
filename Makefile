@@ -1,6 +1,6 @@
 # คำสั่งลัดสำหรับ build, run, ตรวจรูปแบบ และดาวน์โหลดโมเดล
 .PHONY: build build-cuda build-rocm release release-cuda release-rocm \
-	run run-cuda run-rocm format lint lint-cuda lint-rocm test model
+	run run-cuda run-rocm format lint lint-cuda lint-rocm test model install-hooks
 
 # สภาพแวดล้อมทั่วไปใช้ได้กับ CPU และ CUDA; ROCm ต้องเพิ่มค่า hipcc แยกต่างหาก
 DEV_ENV = . ./scripts/dev-env.sh
@@ -39,6 +39,9 @@ run-rocm:
 # จัดรูปแบบ source Rust ทั้ง workspace
 format:
 	cargo fmt --all
+
+install-hooks:
+	git config core.hooksPath .githooks
 
 # CUDA กับ ROCm เปิดพร้อมกันไม่ได้ จึงแยก lint ตาม build profile
 lint:
