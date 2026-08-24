@@ -425,19 +425,33 @@ impl CaptionLineBuffer {
     where
         F: FnMut(&str) -> bool,
     {
-        let incoming = words(text);
+        let mut incoming = words(text);
         if incoming.is_empty() {
             return self.presentation(max_lines);
         }
 
         if !self.previous_words.is_empty() {
             let common_prefix = common_prefix_len(&self.previous_words, &incoming);
+            let mut history_aligned = common_prefix > 0;
             if common_prefix == 0 {
                 let shifted_overlap = longest_word_overlap(&self.previous_words, &incoming);
                 if shifted_overlap >= 3 && shifted_overlap < self.previous_words.len() {
+                    history_aligned = true;
                     let removed_prefix = self.previous_words.len() - shifted_overlap;
-                    self.active_start = self.active_start.saturating_sub(removed_prefix);
+                    if removed_prefix > self.active_start {
+                        // คำที่หลุดจาก source ยังอยู่บนบรรทัดปัจจุบัน จึงรักษาไว้และต่อเฉพาะ suffix ใหม่
+                        let mut stabilized = self.previous_words.clone();
+                        stabilized.extend(incoming[shifted_overlap..].iter().cloned());
+                        incoming = stabilized;
+                    } else {
+                        self.active_start -= removed_prefix;
+                    }
                 }
+            }
+
+            // ผลที่สั้นลงแต่ยังอยู่ในหน้าต่างเดิมต้องไม่ดึงคำที่ผู้ใช้อ่านแล้วออกจากจอ
+            if history_aligned && incoming.len() < self.previous_words.len() {
+                return self.presentation(max_lines);
             }
         }
 
@@ -1038,6 +1052,34 @@ mod tests {
         assert_eq!(
             caption(&mut buffer, "one too three", 2, 7),
             "one two\nthree"
+        );
+    }
+
+    #[test]
+    fn words_trimmed_from_the_source_do_not_shrink_the_visible_line() {
+        let mut buffer = CaptionLineBuffer::default();
+
+        assert_eq!(
+            caption(&mut buffer, "one two three four", 2, 100),
+            "one two three four"
+        );
+        assert_eq!(
+            caption(&mut buffer, "two three four five", 2, 100),
+            "one two three four five"
+        );
+    }
+
+    #[test]
+    fn a_shorter_aligned_partial_keeps_the_visible_words() {
+        let mut buffer = CaptionLineBuffer::default();
+
+        assert_eq!(
+            caption(&mut buffer, "one two three four", 2, 100),
+            "one two three four"
+        );
+        assert_eq!(
+            caption(&mut buffer, "one two three", 2, 100),
+            "one two three four"
         );
     }
 

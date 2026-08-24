@@ -49,6 +49,10 @@ pub struct OverlayPresenter {
     generation: Rc<Cell<u64>>,
     /// callback ล่าสุดที่ต้องตอบหลัง paint โดย frame ใหม่จะแทน frame เก่าเสมอ
     pending_after_paint: PendingPaintCallback,
+    /// ความกว้างข้อความสูงสุดของช่วงที่กำลังแสดง เพื่อให้กล่องโตได้แต่ไม่หด
+    reserved_content_width: Cell<i32>,
+    /// จำนวนบรรทัดสูงสุดของช่วงที่กำลังแสดง เพื่อรักษาความสูงหลังกล่องโตแล้ว
+    reserved_line_count: Cell<usize>,
     /// ป้องกันการสร้าง tick/after-paint handler มากกว่าหนึ่งชุดพร้อมกัน
     after_paint_scheduled: Rc<Cell<bool>>,
     /// ระบุว่า renderer ใช้ X11/XWayland และต้องคง toplevel ไว้เพื่อรักษา stack
@@ -87,6 +91,8 @@ impl OverlayPresenter {
             .justify(gtk::Justification::Left)
             .selectable(false)
             .use_markup(false)
+            .valign(gtk::Align::End)
+            .yalign(1.0)
             .wrap(false)
             .build();
         label.add_css_class("subtitle-live-text");
@@ -165,6 +171,8 @@ impl OverlayPresenter {
             last_text: RefCell::new(String::new()),
             monitors: RefCell::new(Vec::new()),
             root,
+            reserved_content_width: Cell::new(0),
+            reserved_line_count: Cell::new(0),
             surface,
             target_monitor_geometry,
             target_position,
@@ -266,6 +274,7 @@ impl OverlayPresenter {
         self.surface.set_visible(false);
         self.line_buffer.borrow_mut().clear();
         self.last_text.borrow_mut().clear();
+        self.reset_visual_reservation();
         self.window.hide();
     }
 
@@ -309,7 +318,6 @@ impl OverlayPresenter {
         }
         apply_position(&self.surface, &config.position);
         apply_text_alignment(&self.label, &config.text_alignment);
-        // ปล่อยให้พื้นหลังขยายตามข้อความจริง ส่วน width_px ใช้เป็นเพดานตอนตัดบรรทัด
         self.surface.set_width_request(-1);
         self.css_provider.load_from_data(&format!(
             ".subtitle-live-overlay, .subtitle-live-overlay-root {{ background: transparent; }}\n\
@@ -319,6 +327,7 @@ impl OverlayPresenter {
         ));
         if layout_changed {
             self.line_buffer.borrow_mut().clear();
+            self.reset_visual_reservation();
             let source_text = self.last_text.borrow();
             if !source_text.is_empty() {
                 self.label
@@ -400,18 +409,61 @@ impl OverlayPresenter {
         font.set_size(config.font_size as i32 * gtk::pango::SCALE);
         font.set_weight(gtk::pango::Weight::Semibold);
         layout.set_font_description(Some(&font));
-        let available_width = config
-            .width_px
-            .saturating_sub(CAPTION_HORIZONTAL_PADDING_PX)
-            .max(1) as i32;
+        let available_width = caption_content_width(config.width_px);
 
-        self.line_buffer
+        let caption = self
+            .line_buffer
             .borrow_mut()
             .update(text, config.max_lines, |candidate| {
                 layout.set_text(candidate);
                 layout.pixel_size().0 <= available_width
+            });
+        if caption.is_empty() {
+            return caption;
+        }
+
+        let measured_width = caption
+            .lines()
+            .map(|line| {
+                layout.set_text(line);
+                layout.pixel_size().0
             })
+            .max()
+            .unwrap_or(1)
+            .clamp(1, available_width);
+        let reserved_width = self
+            .reserved_content_width
+            .get()
+            .max(measured_width)
+            .min(available_width);
+        self.reserved_content_width.set(reserved_width);
+        self.label.set_width_request(reserved_width);
+
+        let line_count = caption.lines().count().max(1);
+        let reserved_lines = self.reserved_line_count.get().max(line_count);
+        self.reserved_line_count.set(reserved_lines);
+        let missing_lines = reserved_lines.saturating_sub(line_count);
+        if missing_lines == 0 {
+            caption
+        } else {
+            format!("{}{}", "\n".repeat(missing_lines), caption)
+        }
     }
+
+    /// ล้าง high-water mark เมื่อ overlay จบช่วงแสดงหรือเปลี่ยน layout
+    fn reset_visual_reservation(&self) {
+        self.reserved_content_width.set(0);
+        self.reserved_line_count.set(0);
+        self.label.set_width_request(-1);
+    }
+}
+
+/// คืนความกว้างพื้นที่ข้อความหลังหัก padding ของกล่อง โดยไม่ยอมให้เหลือศูนย์
+fn caption_content_width(box_width_px: u32) -> i32 {
+    let width = box_width_px
+        .saturating_sub(CAPTION_HORIZONTAL_PADDING_PX)
+        .max(1);
+    i32::try_from(width).unwrap_or(i32::MAX)
 }
 
 /// ตรวจจอจาก display ของ helper แล้วสร้าง ID ที่คงตาม connector เมื่อมีข้อมูล
