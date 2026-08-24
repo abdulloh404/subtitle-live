@@ -3,4 +3,4 @@
 mod capture;
 mod service;
 
-pub use service::{PipeWireCommandSender, PipeWireService, PipeWireServiceError, spawn_service};
+pub use service::{PipeWireCommandSender, PipeWireService, spawn_service};

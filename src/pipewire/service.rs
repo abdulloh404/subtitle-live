@@ -83,17 +83,17 @@ impl PipeWireService {
         self.commands.clone()
     }
 
-    pub fn set_selected(
-        &self,
-        targets: Vec<CaptureTarget>,
-        audio_generation: u64,
-    ) -> Result<(), PipeWireServiceError> {
-        self.commands.set_selected(targets, audio_generation)
-    }
+    // pub fn set_selected(
+    //     &self,
+    //     targets: Vec<CaptureTarget>,
+    //     audio_generation: u64,
+    // ) -> Result<(), PipeWireServiceError> {
+    //     self.commands.set_selected(targets, audio_generation)
+    // }
 
-    pub fn stop_capture(&self) -> Result<(), PipeWireServiceError> {
-        self.commands.stop_capture()
-    }
+    // pub fn stop_capture(&self) -> Result<(), PipeWireServiceError> {
+    //     self.commands.stop_capture()
+    // }
 
     pub fn shutdown(&self) -> Result<(), PipeWireServiceError> {
         self.commands.shutdown()
