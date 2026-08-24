@@ -23,23 +23,29 @@ use whisper_rs::{
 
 use crate::audio::{LatestQueue, MixedAudioChunk, SAMPLE_RATE_HZ};
 
-// คิวเหตุการณ์มีขอบเขตเพื่อรักษาความสดของคำบรรยายเมื่อ UI รับข้อมูลไม่ทัน
-const EVENT_QUEUE_CAPACITY: usize = 64;
 // คิว debug แยกจากเหตุการณ์หลัก เพื่อไม่ให้การเปิดหน้าดูข้อมูลรบกวน subtitle
 const DEBUG_QUEUE_CAPACITY: usize = 256;
-// สมมติฐานที่ไม่เปลี่ยนติดต่อกันสองรอบถือว่านิ่งพอที่จะยืนยันเป็นผลสุดท้าย
-const STABLE_PASSES_TO_FINAL: u8 = 2;
 // เวิร์กเกอร์พักสั้น ๆ ระหว่างรอบเพื่อรับคำสั่งได้ไวโดยไม่วนใช้ CPU เปล่า
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(10);
+// ปิด utterance เมื่อไม่พบเสียงพูดต่อเนื่อง เพื่อให้ Final ตรงกับปลายช่วงพูดแทนรอบ inference
+const ENDPOINT_SILENCE_DURATION: Duration = Duration::from_millis(500);
+// เก็บเสียงก่อนผ่าน threshold เล็กน้อยเพื่อไม่ตัดพยัญชนะนำหน้าที่มีพลังงานต่ำ
+const SPEECH_PREROLL_DURATION: Duration = Duration::from_millis(160);
+// ไม่ส่งเสียงกระตุกสั้นมากเข้า Whisper และรอให้มีเนื้อเสียงพอสำหรับ partial แรก
+const MINIMUM_SPEECH_DURATION: Duration = Duration::from_millis(240);
+// บังคับปิด utterance ยาวเพื่อจำกัดเวลาประมวลผลรอบ Final และขนาดหน่วยความจำ
+const MAX_UTTERANCE_DURATION: Duration = Duration::from_secs(12);
 // ระดับ RMS ต่ำกว่านี้ถือเป็นความเงียบและไม่ส่งเข้าโมเดล Whisper
 const SILENCE_RMS_THRESHOLD: f32 = 0.001;
 // เมื่อเปิดตัวกรองกิจกรรมเสียง จะใช้เกณฑ์ RMS สูงขึ้นเพื่อกันเสียงพลังงานต่ำก่อนถึง Whisper
 const VAD_RMS_THRESHOLD: f32 = 0.003;
+// หลังเริ่มพูดแล้วใช้เกณฑ์ต่ำลงเพื่อไม่ตัดพยัญชนะเบาหรือท้ายคำเร็วเกินไป
+const VAD_CONTINUE_RMS_THRESHOLD: f32 = 0.0015;
 
 /// ค่าที่เปลี่ยนระหว่างทำงานได้โดยไม่ต้องโหลดโมเดล Whisper ใหม่
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SttStreamingConfig {
-    /// ช่วงเสียงใหม่ขั้นต่ำระหว่างการอนุมานแต่ละรอบ
+    /// ช่วงเสียงใหม่ขั้นต่ำระหว่างผลชั่วคราวแต่ละรอบ
     pub step_ms: u32,
     /// ความยาวเสียงย้อนหลังสูงสุดที่ส่งเข้า Whisper
     pub window_ms: u32,
@@ -54,7 +60,7 @@ pub struct SttStartConfig {
     pub model_path: PathBuf,
     /// รหัสภาษาที่ส่งให้ Whisper โดยระยะแรกรองรับเฉพาะภาษาอังกฤษ
     pub language: String,
-    /// ช่วงเสียงใหม่ขั้นต่ำระหว่างการอนุมานแต่ละรอบ
+    /// ช่วงเสียงใหม่ขั้นต่ำระหว่างผลชั่วคราวแต่ละรอบ
     pub step_ms: u32,
     /// ความยาวเสียงย้อนหลังสูงสุดที่ส่งเข้า Whisper
     pub window_ms: u32,
@@ -175,8 +181,8 @@ pub enum SttEvent {
 pub struct SttService {
     /// ช่องส่งคำสั่งควบคุมไปยังเวิร์กเกอร์
     commands: Sender<WorkerCommand>,
-    /// คิวเหตุการณ์แบบเก็บข้อมูลล่าสุดเพื่อไม่ให้ STT ดันงานค้างไปถึง UI
-    events: LatestQueue<SttEvent>,
+    /// ช่องรับเหตุการณ์ตามลำดับโดยไม่ทิ้ง lifecycle, transcript หรือ metrics
+    events: Receiver<SttEvent>,
     /// คิวข้อมูล debug ที่เปิดใช้ตามคำขอและไม่ปะปนกับเหตุการณ์ subtitle
     debug_records: LatestQueue<SttDebugRecord>,
     /// รุ่นเสียงที่เวิร์กเกอร์ยอมรับและเผยแพร่แล้ว
@@ -243,7 +249,7 @@ impl SttService {
 
     /// ดึงเหตุการณ์ STT ที่รออยู่ทั้งหมดเพื่อให้ตัวทำงานหลักประมวลผลเป็นชุด
     pub fn drain_events(&self) -> Vec<SttEvent> {
-        self.events.drain()
+        self.events.try_iter().collect()
     }
 
     /// ดึงข้อมูล debug ที่รออยู่ทั้งหมดโดยไม่แตะคิวเหตุการณ์ STT หลัก
@@ -267,8 +273,7 @@ impl Drop for SttService {
 /// สร้างเวิร์กเกอร์ STT หนึ่งตัวเพื่อแยกการโหลดโมเดลและอนุมานออกจากเธรด GTK
 pub fn spawn_service(input: LatestQueue<MixedAudioChunk>) -> SttService {
     let (commands, command_receiver) = mpsc::channel();
-    let events = LatestQueue::new(EVENT_QUEUE_CAPACITY);
-    let worker_events = events.clone();
+    let (worker_events, events) = mpsc::channel();
     let debug_records = LatestQueue::new(DEBUG_QUEUE_CAPACITY);
     let worker_debug_records = debug_records.clone();
     let audio_generation = Arc::new(AtomicU64::new(0));
@@ -317,7 +322,7 @@ enum WorkerCommand {
 fn run_worker(
     input: LatestQueue<MixedAudioChunk>,
     commands: Receiver<WorkerCommand>,
-    events: LatestQueue<SttEvent>,
+    events: Sender<SttEvent>,
     debug_records: LatestQueue<SttDebugRecord>,
     audio_generation: Arc<AtomicU64>,
 ) {
@@ -332,15 +337,15 @@ fn run_worker(
                 active = None;
                 audio_paused = true;
                 input.clear_reliable();
-                events.push_latest_reliable(SttEvent::Loading);
+                let _ = events.send(SttEvent::Loading);
                 match ActiveStt::load(config, input.dropped()) {
                     Ok(loaded) => {
                         active = Some(loaded);
-                        events.push_latest_reliable(SttEvent::Ready);
+                        let _ = events.send(SttEvent::Ready);
                     }
                     Err(error) => {
-                        events.push_latest_reliable(SttEvent::Error(error));
-                        events.push_latest_reliable(SttEvent::Stopped);
+                        let _ = events.send(SttEvent::Error(error));
+                        let _ = events.send(SttEvent::Stopped);
                     }
                 }
             }
@@ -348,14 +353,14 @@ fn run_worker(
                 active = None;
                 audio_paused = true;
                 input.clear_reliable();
-                events.push_latest_reliable(SttEvent::Stopped);
+                let _ = events.send(SttEvent::Stopped);
             }
             CommandState::Command(WorkerCommand::UpdateStreaming(config)) => {
                 input.clear_reliable();
                 if let Some(stt) = active.as_mut()
                     && let Err(error) = stt.update_streaming(config)
                 {
-                    events.push_latest_reliable(SttEvent::Error(error));
+                    let _ = events.send(SttEvent::Error(error));
                 }
             }
             CommandState::Command(WorkerCommand::SetDebugEnabled(enabled)) => {
@@ -403,13 +408,13 @@ fn run_worker(
                     debug_records.push_latest(record);
                 }
                 if let Some(update) = result.update {
-                    events.push_latest(SttEvent::Transcript {
+                    let _ = events.send(SttEvent::Transcript {
                         audio_generation: current_audio_generation,
                         audio_origin_at: result.audio_origin_at,
                         update,
                     });
                 }
-                events.push_latest(SttEvent::Metrics {
+                let _ = events.send(SttEvent::Metrics {
                     audio_generation: current_audio_generation,
                     audio_buffer_duration: result.audio_buffer_duration,
                     inference_duration: result.inference_duration,
@@ -419,8 +424,8 @@ fn run_worker(
             Err(error) => {
                 active = None;
                 input.clear_reliable();
-                events.push_latest_reliable(SttEvent::Error(error));
-                events.push_latest_reliable(SttEvent::Stopped);
+                let _ = events.send(SttEvent::Error(error));
+                let _ = events.send(SttEvent::Stopped);
             }
         }
     }
@@ -468,22 +473,32 @@ struct ActiveStt {
     rolling_audio: VecDeque<f32>,
     /// จำนวนตัวอย่างสูงสุดที่ส่งเข้า Whisper ต่อหนึ่งรอบ
     window_samples: usize,
-    /// จำนวนตัวอย่างใหม่ขั้นต่ำก่อนเริ่มการอนุมานครั้งถัดไป
+    /// จำนวนตัวอย่างใหม่ขั้นต่ำก่อนสร้างผลชั่วคราวครั้งถัดไป
     step_samples: usize,
-    /// จำนวนตัวอย่างใหม่ที่สะสมตั้งแต่การอนุมานครั้งก่อน
-    samples_since_inference: usize,
-    /// เวลาเริ่มของเสียงใหม่ที่กำลังสะสมจนครบหนึ่ง audio step
+    /// เสียงทั้ง utterance ปัจจุบันสำหรับอนุมาน Final หลังพบ endpoint
+    utterance_audio: Vec<f32>,
+    /// เสียงก่อนเริ่ม utterance เล็กน้อยเพื่อรักษาต้นคำที่อยู่ก่อน threshold
+    pre_roll_audio: VecDeque<f32>,
+    /// frame หลัง endpoint ที่รอเริ่ม segment ถัดไปโดยไม่ถูกรวมกับ Final ปัจจุบัน
+    deferred_audio: VecDeque<MixedAudioChunk>,
+    /// จำนวนตัวอย่างใหม่ที่สะสมตั้งแต่ผลชั่วคราวครั้งก่อน
+    samples_since_partial: usize,
+    /// จำนวนตัวอย่างที่ผ่านเกณฑ์กิจกรรมเสียงใน utterance ปัจจุบัน
+    speech_samples: usize,
+    /// จำนวนตัวอย่างเงียบต่อเนื่องท้าย utterance
+    trailing_silence_samples: usize,
+    /// เวลาเริ่มของเสียงใหม่ที่กำลังสะสมจนครบหนึ่ง partial interval
     pending_audio_started_at: Option<Instant>,
+    /// เวลา frame ล่าสุดที่ผ่านเกณฑ์กิจกรรมเสียง ใช้ปิดช่วงแม้ mixer หยุดส่ง frame เงียบ
+    last_speech_at: Option<Instant>,
     /// ตัวนับการทิ้งข้อมูลล่าสุดที่เห็น ใช้ตรวจจับช่วงเสียงขาดตอน
     observed_dropped: u64,
     /// รหัสช่วงคำพูดปัจจุบัน เพิ่มเมื่อยืนยันผลหรือเสียงขาดตอน
     segment_id: u64,
-    /// สมมติฐานรอบก่อน ใช้วัดความนิ่งของผลลัพธ์
-    previous_hypothesis: String,
-    /// จำนวนรอบต่อเนื่องที่สมมติฐานไม่เปลี่ยน
-    stable_passes: u8,
-    /// ป้องกันการสร้างขอบเขต segment ซ้ำทุกครั้งที่รับ sample เงียบต่อเนื่อง
-    silence_active: bool,
+    /// ผลชั่วคราวล่าสุด ใช้ไม่ส่งข้อความเดิมซ้ำโดยไม่จำเป็น
+    previous_partial: String,
+    /// ระบุว่ากำลังสะสม utterance ซึ่งยังแก้ไขได้
+    speech_active: bool,
 }
 
 /// ผลจากการอนุมานหนึ่งรอบพร้อมค่าหน่วงเวลาสำหรับหน้า Performance
@@ -535,13 +550,18 @@ impl ActiveStt {
             rolling_audio: VecDeque::with_capacity(window_samples),
             window_samples,
             step_samples,
-            samples_since_inference: 0,
+            utterance_audio: Vec::with_capacity(duration_to_samples(MAX_UTTERANCE_DURATION)),
+            pre_roll_audio: VecDeque::with_capacity(duration_to_samples(SPEECH_PREROLL_DURATION)),
+            deferred_audio: VecDeque::new(),
+            samples_since_partial: 0,
+            speech_samples: 0,
+            trailing_silence_samples: 0,
             pending_audio_started_at: None,
+            last_speech_at: None,
             observed_dropped,
             segment_id: 1,
-            previous_hypothesis: String::new(),
-            stable_passes: 0,
-            silence_active: true,
+            previous_partial: String::new(),
+            speech_active: false,
         })
     }
 
@@ -557,7 +577,7 @@ impl ActiveStt {
         Ok(())
     }
 
-    /// รวมชิ้นเสียงล่าสุดเข้าหน้าต่างแบบเลื่อน และอนุมานเมื่อมีเสียงใหม่ครบหนึ่งระยะก้าว
+    /// สะสม utterance, ส่ง Partial ระหว่างพูด และส่ง Final เมื่อพบช่วงเงียบที่เป็น endpoint
     fn consume_latest(
         &mut self,
         input: &LatestQueue<MixedAudioChunk>,
@@ -570,55 +590,146 @@ impl ActiveStt {
             self.observed_dropped = dropped;
         }
 
-        let chunks: Vec<_> = input
-            .drain()
-            .into_iter()
-            .filter(|chunk| chunk.generation == current_audio_generation)
-            .collect();
+        let mut chunks = std::mem::take(&mut self.deferred_audio);
+        let mut input_drain_succeeded = false;
         if chunks.is_empty() {
-            return Ok(None);
+            let Some(input_chunks) = input.try_drain() else {
+                return Ok(None);
+            };
+            input_drain_succeeded = true;
+            chunks.extend(
+                input_chunks
+                    .into_iter()
+                    .filter(|chunk| chunk.generation == current_audio_generation),
+            );
         }
+        let endpoint_silence_samples = duration_to_samples(ENDPOINT_SILENCE_DURATION);
+        let max_utterance_samples = duration_to_samples(MAX_UTTERANCE_DURATION);
+        let mut heard_speech = false;
+        let mut processed_audio = false;
+        let mut endpoint_reached = false;
+        while let Some(chunk) = chunks.pop_front() {
+            if self.speech_active
+                && self.last_speech_at.is_some_and(|last_speech_at| {
+                    chunk
+                        .captured_at
+                        .saturating_duration_since(last_speech_at)
+                        >= ENDPOINT_SILENCE_DURATION
+                })
+            {
+                endpoint_reached = true;
+                self.deferred_audio.push_back(chunk);
+                self.deferred_audio.append(&mut chunks);
+                break;
+            }
+            processed_audio = true;
 
-        for chunk in chunks {
+            let minimum_rms = if self.config.vad_enabled {
+                if self.speech_active {
+                    VAD_CONTINUE_RMS_THRESHOLD
+                } else {
+                    VAD_RMS_THRESHOLD
+                }
+            } else {
+                SILENCE_RMS_THRESHOLD
+            };
+            let chunk_is_speech = has_audible_signal(&chunk.samples, minimum_rms);
+            if !self.speech_active {
+                self.pre_roll_audio.extend(chunk.samples.iter().copied());
+                let pre_roll_samples = duration_to_samples(SPEECH_PREROLL_DURATION);
+                while self.pre_roll_audio.len() > pre_roll_samples {
+                    self.pre_roll_audio.pop_front();
+                }
+                if !chunk_is_speech {
+                    continue;
+                }
+
+                self.speech_active = true;
+                self.pending_audio_started_at
+                    .get_or_insert(chunk.captured_at);
+                let starting_audio: Vec<_> = self.pre_roll_audio.drain(..).collect();
+                self.samples_since_partial = self
+                    .samples_since_partial
+                    .saturating_add(starting_audio.len());
+                self.rolling_audio.extend(starting_audio.iter().copied());
+                self.utterance_audio.extend_from_slice(&starting_audio);
+                heard_speech = true;
+                self.speech_samples = self.speech_samples.saturating_add(chunk.samples.len());
+                self.last_speech_at = Some(chunk.captured_at);
+                continue;
+            }
+
             self.pending_audio_started_at
                 .get_or_insert(chunk.captured_at);
-            self.samples_since_inference = self
-                .samples_since_inference
+            self.samples_since_partial = self
+                .samples_since_partial
                 .saturating_add(chunk.samples.len());
-            self.rolling_audio.extend(chunk.samples);
+            self.rolling_audio.extend(chunk.samples.iter().copied());
+            self.utterance_audio.extend_from_slice(&chunk.samples);
+            if chunk_is_speech {
+                heard_speech = true;
+                self.speech_samples = self.speech_samples.saturating_add(chunk.samples.len());
+                self.trailing_silence_samples = 0;
+                self.last_speech_at = Some(chunk.captured_at);
+            } else {
+                self.trailing_silence_samples = self
+                    .trailing_silence_samples
+                    .saturating_add(chunk.samples.len());
+            }
+            if self.trailing_silence_samples >= endpoint_silence_samples
+                || self.utterance_audio.len() >= max_utterance_samples
+            {
+                endpoint_reached = true;
+                self.deferred_audio.append(&mut chunks);
+                break;
+            }
         }
         while self.rolling_audio.len() > self.window_samples {
             self.rolling_audio.pop_front();
         }
 
-        if self.samples_since_inference < self.step_samples {
+        if !self.speech_active {
             return Ok(None);
         }
-        let pending_samples = self.samples_since_inference.min(self.rolling_audio.len());
-        self.samples_since_inference = 0;
 
-        let audio = self.rolling_audio.make_contiguous();
-        let pending_start = audio.len().saturating_sub(pending_samples);
-        let minimum_rms = if self.config.vad_enabled {
-            VAD_RMS_THRESHOLD
-        } else {
-            SILENCE_RMS_THRESHOLD
-        };
-        let input_is_silent = !has_audible_signal(&audio[pending_start..], minimum_rms);
-        if input_is_silent {
-            if self.silence_active {
-                self.reset_audio();
-            } else {
-                self.reset_discontinuity();
-            }
+        let silence_deadline_reached = endpoint_reached
+            || self.trailing_silence_samples >= endpoint_silence_samples
+            || (!processed_audio
+                && input_drain_succeeded
+                && self.deferred_audio.is_empty()
+                && self.last_speech_at.is_some_and(|last_speech_at| {
+                    Instant::now().saturating_duration_since(last_speech_at)
+                        >= ENDPOINT_SILENCE_DURATION
+                }));
+        let forced_endpoint = self.utterance_audio.len() >= max_utterance_samples;
+        let final_inference = silence_deadline_reached || forced_endpoint;
+        let enough_speech =
+            self.speech_samples >= duration_to_samples(MINIMUM_SPEECH_DURATION);
+
+        if final_inference && !enough_speech {
+            self.reset_audio();
             return Ok(None);
         }
-        self.silence_active = false;
+        if !final_inference
+            && (!heard_speech || !enough_speech || self.samples_since_partial < self.step_samples)
+        {
+            return Ok(None);
+        }
+
+        let audio: Vec<f32> = if final_inference {
+            self.utterance_audio.clone()
+        } else {
+            self.rolling_audio.iter().copied().collect()
+        };
+        if audio.is_empty() {
+            return Ok(None);
+        }
 
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         params.set_language(Some(&self.config.language));
         params.set_translate(false);
         params.set_no_context(true);
+        params.set_single_segment(!final_inference);
         params.set_print_special(false);
         params.set_print_progress(false);
         params.set_print_realtime(false);
@@ -629,17 +740,23 @@ impl ActiveStt {
         let audio_origin_at = self
             .pending_audio_started_at
             .take()
+            .or(self.last_speech_at)
             .unwrap_or(whisper_model_started);
         let audio_buffer_duration =
             whisper_model_started.saturating_duration_since(audio_origin_at);
         let backend_full_started = Instant::now();
         self.state
-            .full(params, audio)
+            .full(params, &audio)
             .map_err(|error| format!("Whisper inference failed: {error}"))?;
         let backend_full_duration = backend_full_started.elapsed();
         let raw_text = collect_hypothesis(&self.state)?;
-        let processed_text = normalize_hypothesis_text(&raw_text);
-        let update = self.reconcile_hypothesis(processed_text.clone());
+        let normalized_text = normalize_hypothesis_text(&raw_text);
+        let processed_text = if final_inference {
+            normalized_text
+        } else {
+            normalize_partial_hypothesis_text(&normalized_text)
+        };
+        let update = self.make_update(processed_text.clone(), final_inference);
         let whisper_model_duration = whisper_model_started.elapsed();
         let debug_record = debug_enabled.then(|| {
             let (kind, emitted_text) = match update.as_ref() {
@@ -668,6 +785,13 @@ impl ActiveStt {
             }
         });
 
+        if final_inference {
+            self.segment_id = self.segment_id.saturating_add(1);
+            self.reset_audio();
+        } else {
+            self.samples_since_partial = 0;
+        }
+
         Ok(Some(InferenceResult {
             update,
             audio_origin_at,
@@ -677,31 +801,24 @@ impl ActiveStt {
         }))
     }
 
-    /// ส่งสมมติฐานเป็นผลชั่วคราวจนกว่าจะคงเดิมครบจำนวนรอบที่กำหนดจึงยืนยันผล
-    fn reconcile_hypothesis(&mut self, hypothesis: String) -> Option<TranscriptUpdate> {
+    /// สร้างผลตาม endpoint และไม่ใช้ข้อความซ้ำสองรอบเป็นหลักฐานว่าประโยคจบแล้ว
+    fn make_update(
+        &mut self,
+        hypothesis: String,
+        final_inference: bool,
+    ) -> Option<TranscriptUpdate> {
         let hypothesis = hypothesis.trim().to_owned();
-        if hypothesis.is_empty() {
-            return None;
-        }
-
-        if hypothesis == self.previous_hypothesis {
-            self.stable_passes = self.stable_passes.saturating_add(1);
-        } else {
-            self.previous_hypothesis.clone_from(&hypothesis);
-            self.stable_passes = 0;
-        }
-
-        if self.stable_passes >= STABLE_PASSES_TO_FINAL {
-            let update = TranscriptUpdate::Final {
+        if final_inference {
+            let text = final_hypothesis_or_previous(hypothesis, &self.previous_partial)?;
+            return Some(TranscriptUpdate::Final {
                 segment_id: self.segment_id,
-                text: hypothesis,
-            };
-            self.segment_id = self.segment_id.saturating_add(1);
-            self.previous_hypothesis.clear();
-            self.stable_passes = 0;
-            self.reset_audio();
-            Some(update)
+                text,
+            });
+        }
+        if hypothesis.is_empty() || hypothesis == self.previous_partial {
+            None
         } else {
+            self.previous_partial.clone_from(&hypothesis);
             Some(TranscriptUpdate::Partial {
                 segment_id: self.segment_id,
                 text: hypothesis,
@@ -712,17 +829,32 @@ impl ActiveStt {
     /// ล้างเฉพาะบัฟเฟอร์เสียง แต่คงรหัสช่วงและโมเดลที่โหลดไว้
     fn reset_audio(&mut self) {
         self.rolling_audio.clear();
-        self.samples_since_inference = 0;
+        self.utterance_audio.clear();
+        self.pre_roll_audio.clear();
+        self.samples_since_partial = 0;
+        self.speech_samples = 0;
+        self.trailing_silence_samples = 0;
         self.pending_audio_started_at = None;
+        self.last_speech_at = None;
+        self.previous_partial.clear();
+        self.speech_active = false;
     }
 
     /// ล้างทั้งเสียงและสมมติฐานเมื่อแหล่งเสียงหยุด เปลี่ยน หรือมีข้อมูลตกหล่น
     fn reset_discontinuity(&mut self) {
         self.reset_audio();
-        self.previous_hypothesis.clear();
-        self.stable_passes = 0;
+        self.deferred_audio.clear();
         self.segment_id = self.segment_id.saturating_add(1);
-        self.silence_active = true;
+    }
+}
+
+/// ใช้ partial ล่าสุดเมื่อ Whisper คืน Final ว่าง เพื่อไม่ลบข้อความที่เคยแสดงแล้ว
+fn final_hypothesis_or_previous(hypothesis: String, previous_partial: &str) -> Option<String> {
+    if hypothesis.is_empty() {
+        let previous_partial = previous_partial.trim();
+        (!previous_partial.is_empty()).then(|| previous_partial.to_owned())
+    } else {
+        Some(hypothesis)
     }
 }
 
@@ -767,6 +899,11 @@ fn validate_streaming_config(config: SttStreamingConfig) -> Result<(), String> {
 /// แปลงมิลลิวินาทีเป็นจำนวนตัวอย่างตามอัตราตัวอย่างกลางของระบบ
 fn milliseconds_to_samples(milliseconds: u32) -> usize {
     (u64::from(milliseconds) * u64::from(SAMPLE_RATE_HZ) / 1_000) as usize
+}
+
+/// แปลง Duration เป็นจำนวน sample โดยปัดลงตามอัตราตัวอย่างกลางของระบบ
+fn duration_to_samples(duration: Duration) -> usize {
+    (duration.as_secs_f64() * f64::from(SAMPLE_RATE_HZ)) as usize
 }
 
 /// ตรวจว่าช่วง sample ใหม่มีพลังงานพอที่จะคุ้มกับการเรียก Whisper หรือไม่
@@ -836,9 +973,17 @@ pub(crate) fn normalize_hypothesis_text(text: &str) -> String {
         .join(" ")
 }
 
+/// ซ่อนเครื่องหมายจบประโยคจาก draft เพราะ Whisper ยังแก้คำท้ายและวรรคตอนได้
+fn normalize_partial_hypothesis_text(text: &str) -> String {
+    text.trim_end_matches(['.', '!', '?']).trim_end().to_owned()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{normalize_hypothesis_text, spawn_service};
+    use super::{
+        final_hypothesis_or_previous, normalize_hypothesis_text,
+        normalize_partial_hypothesis_text, spawn_service,
+    };
     use crate::audio::LatestQueue;
 
     #[test]
@@ -861,5 +1006,25 @@ mod tests {
 
         assert!(service.finish().is_ok());
         assert!(service.finish().is_ok());
+    }
+
+    #[test]
+    fn terminal_punctuation_is_deferred_until_final() {
+        assert_eq!(normalize_partial_hypothesis_text("Welcome to my."), "Welcome to my");
+        assert_eq!(normalize_partial_hypothesis_text("So?"), "So");
+        assert_eq!(normalize_partial_hypothesis_text("Wait,"), "Wait,");
+    }
+
+    #[test]
+    fn empty_final_uses_previous_partial() {
+        assert_eq!(
+            final_hypothesis_or_previous(String::new(), " previous partial "),
+            Some("previous partial".to_owned())
+        );
+        assert_eq!(
+            final_hypothesis_or_previous("final transcript".to_owned(), "previous partial"),
+            Some("final transcript".to_owned())
+        );
+        assert_eq!(final_hypothesis_or_previous(String::new(), "  "), None);
     }
 }

@@ -70,10 +70,15 @@ impl<T> LatestQueue<T> {
 
     /// นำข้อมูลทั้งหมดที่มีอยู่ออกจากคิวโดยไม่รอข้อมูลใหม่
     pub fn drain(&self) -> Vec<T> {
+        self.try_drain().unwrap_or_default()
+    }
+
+    /// พยายามนำข้อมูลทั้งหมดออกและแยกกรณี mutex ไม่ว่างออกจากกรณีคิวว่างจริง
+    pub fn try_drain(&self) -> Option<Vec<T>> {
         let Ok(mut values) = self.inner.values.try_lock() else {
-            return Vec::new();
+            return None;
         };
-        values.drain(..).collect()
+        Some(values.drain(..).collect())
     }
 
     /// พยายามล้างข้อมูลโดยไม่รอ mutex สำหรับเส้นทาง real-time ที่ห้ามบล็อก

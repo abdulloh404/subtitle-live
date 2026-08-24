@@ -8,26 +8,21 @@ use crate::stt::{TranscriptUpdate, normalize_hypothesis_text};
 const DEFAULT_PRESENTATION_WORDS: usize = 64;
 // เก็บบรรทัดที่ปิดแล้วมากกว่าค่าสูงสุดของ UI เล็กน้อยเพื่อดันบรรทัดได้ต่อเนื่อง
 const MAX_RETAINED_CAPTION_LINES: usize = 8;
-
-/// รวมสมมติฐานที่ Whisper แก้ซ้ำให้เป็นข้อความต่อเนื่องโดยปกป้องคำที่นิ่งแล้ว
+// ต้องมีคำซ้อนกันพอสมควรก่อนถือว่า hypothesis ใหม่เป็นหน้าต่างเดิมที่เลื่อนไปทางขวา
+const MIN_ROLLING_OVERLAP_WORDS: usize = 2;
+/// รวมผลยืนยันกับสมมติฐานล่าสุดที่ Whisper ยังแก้ไขได้
 #[derive(Debug)]
 pub struct TranscriptReconciler {
     /// คำจากช่วงที่ยืนยันแล้วก่อนหน้า ซึ่งจะไม่ถูกแก้โดยผลชั่วคราวใหม่
     finalized: Vec<String>,
-    /// คำนำหน้าของช่วงปัจจุบันที่ตรงกันหลายรอบแล้ว
-    active_committed: Vec<String>,
-    /// ส่วนท้ายล่าสุดที่ Whisper ยังสามารถแก้ได้
-    provisional: Vec<String>,
-    /// สมมติฐานรอบก่อน ใช้หาคำนำหน้าร่วมและช่วงที่เลื่อนซ้อนกัน
-    previous_hypothesis: Vec<String>,
+    /// สมมติฐานล่าสุดของช่วงปัจจุบัน ซึ่งผลชั่วคราวรอบถัดไปแทนที่ได้ทั้งก้อน
+    draft: Vec<String>,
+    /// ประโยคก่อนหน้าของ segment ปัจจุบันที่เลื่อนพ้นหน้าต่างเสียงและไม่ควรหายจากจอ
+    active_prefix: Vec<String>,
     /// รหัสช่วงผลชั่วคราวที่กำลังประมวลผล
     active_segment_id: Option<u64>,
     /// รหัสผลยืนยันล่าสุด ใช้ปฏิเสธเหตุการณ์ซ้ำหรือมาช้า
     last_final_segment_id: Option<u64>,
-    /// จำนวนคำจากต้นสมมติฐานที่เคยยืนยันไว้แล้ว
-    active_prefix_len: usize,
-    /// จำนวนคำที่นิ่งในช่วงปัจจุบันสำหรับรายงานสถานะ UI
-    stable_word_count: usize,
     /// ข้อความรวมที่ตัวทำงานหลักอ่านได้โดยไม่ต้องประกอบใหม่
     presentation: String,
     /// จำนวนคำสูงสุดในประวัติที่ใช้แสดง
@@ -45,13 +40,10 @@ impl TranscriptReconciler {
     pub fn new(max_presentation_words: usize) -> Self {
         Self {
             finalized: Vec::new(),
-            active_committed: Vec::new(),
-            provisional: Vec::new(),
-            previous_hypothesis: Vec::new(),
+            draft: Vec::new(),
+            active_prefix: Vec::new(),
             active_segment_id: None,
             last_final_segment_id: None,
-            active_prefix_len: 0,
-            stable_word_count: 0,
             presentation: String::new(),
             max_presentation_words: max_presentation_words.max(1),
         }
@@ -70,9 +62,6 @@ impl TranscriptReconciler {
             }
             TranscriptUpdate::Final { segment_id, text } => {
                 let incoming = words(text);
-                if incoming.is_empty() {
-                    return false;
-                }
                 self.apply_final(*segment_id, incoming);
             }
         }
@@ -90,29 +79,29 @@ impl TranscriptReconciler {
         self.presentation_text()
     }
 
-    /// คืนจำนวนคำที่ผ่านการยืนยันในช่วงชั่วคราวปัจจุบัน
-    pub const fn stable_word_count(&self) -> usize {
-        self.stable_word_count
+    /// คืนจำนวนคำจากประโยคก่อนหน้าของช่วงปัจจุบันที่รักษาไว้ไม่ให้ rolling window ลบ
+    pub fn stable_word_count(&self) -> usize {
+        self.active_prefix.len()
     }
 
     /// ล้างทุกช่วงข้อความเมื่อหยุดกระบวนการหรือเปลี่ยนแหล่งเสียง
     pub fn clear(&mut self) {
         self.finalized.clear();
-        self.active_committed.clear();
-        self.provisional.clear();
-        self.previous_hypothesis.clear();
+        self.draft.clear();
+        self.active_prefix.clear();
         self.active_segment_id = None;
         self.last_final_segment_id = None;
-        self.active_prefix_len = 0;
-        self.stable_word_count = 0;
         self.presentation.clear();
     }
 
-    /// รวมผลชั่วคราวโดยย้ายเฉพาะคำที่มีหลักฐานว่านิ่งแล้วไปยังส่วนที่ยืนยันภายใน
+    /// เก็บผลชั่วคราวล่าสุดเป็น draft ทั้งก้อนโดยไม่ยืนยันคำนำหน้าก่อนเวลา
     fn apply_partial(&mut self, segment_id: u64, incoming: Vec<String>) {
         if self
             .last_final_segment_id
             .is_some_and(|finalized| segment_id <= finalized)
+            || self
+                .active_segment_id
+                .is_some_and(|active| segment_id < active)
         {
             return;
         }
@@ -120,82 +109,46 @@ impl TranscriptReconciler {
         if self.active_segment_id != Some(segment_id) {
             self.commit_active_without_final();
             self.active_segment_id = Some(segment_id);
-            self.previous_hypothesis = incoming.clone();
-            self.provisional = incoming;
-            self.active_prefix_len = 0;
-            self.stable_word_count = 0;
+            self.set_active_hypothesis(incoming);
             return;
         }
 
-        let common_prefix = common_prefix_len(&self.previous_hypothesis, &incoming);
-        let shifted_overlap = longest_word_overlap(&self.previous_hypothesis, &incoming);
-
-        if common_prefix == 0 && shifted_overlap == 0 {
-            append_without_overlap(&mut self.active_committed, &self.previous_hypothesis);
-            self.active_prefix_len = 0;
-        } else if shifted_overlap > common_prefix
-            && shifted_overlap < self.previous_hypothesis.len()
-        {
-            append_without_overlap(&mut self.active_committed, &self.previous_hypothesis);
-            self.active_prefix_len = shifted_overlap;
-        } else {
-            if common_prefix > self.active_prefix_len {
-                append_without_overlap(
-                    &mut self.active_committed,
-                    &incoming[self.active_prefix_len..common_prefix],
-                );
-            }
-            self.active_prefix_len = self.active_prefix_len.max(common_prefix);
-        }
-        trim_front(&mut self.active_committed, self.max_presentation_words);
-
-        self.provisional = incoming[self.active_prefix_len.min(incoming.len())..].to_vec();
-        self.previous_hypothesis = incoming;
-        self.stable_word_count = self.active_committed.len();
+        let tail = reconcile_mutable_tail(&self.active_prefix, &self.draft, &incoming, true);
+        self.set_active_tail(tail);
     }
 
-    /// ปิดช่วงปัจจุบันและต่อผลยืนยันโดยหลีกเลี่ยงคำซ้ำบริเวณรอยต่อ
+    /// ปิดช่วงปัจจุบันและ commit ผลยืนยันเพียงครั้งเดียวตามรหัส segment
     fn apply_final(&mut self, segment_id: u64, incoming: Vec<String>) {
         if self
             .last_final_segment_id
             .is_some_and(|finalized| segment_id <= finalized)
+            || self
+                .active_segment_id
+                .is_some_and(|active| segment_id < active)
         {
             return;
         }
-        self.last_final_segment_id = Some(segment_id);
-
-        if self.active_segment_id == Some(segment_id) {
-            let mut segment = self.active_committed.clone();
+        if self
+            .active_segment_id
+            .is_some_and(|active| active < segment_id)
+        {
+            self.commit_active_without_final();
+        }
+        let segment = if self.active_segment_id == Some(segment_id) {
             if incoming.is_empty() {
-                segment.extend(self.provisional.iter().cloned());
+                let mut fallback = self.active_prefix.clone();
+                fallback.extend(self.draft.iter().cloned());
+                fallback
             } else {
-                let overlap = longest_word_overlap(&segment, &incoming);
-                if overlap > 0 || segment.is_empty() {
-                    segment.extend(incoming[overlap..].iter().cloned());
-                } else if let Some(tail_start) = aligned_suffix_tail_start(&segment, &incoming) {
-                    append_without_overlap(&mut segment, &incoming[tail_start..]);
-                } else {
-                    let protected_prefix = self.active_prefix_len.min(incoming.len());
-                    append_without_overlap(&mut segment, &incoming[protected_prefix..]);
-                }
+                let mut segment = self.active_prefix.clone();
+                let tail = reconcile_mutable_tail(&self.active_prefix, &self.draft, &incoming, false);
+                segment.extend(tail);
+                segment
             }
-            self.finalized.extend(segment);
-            trim_front(&mut self.finalized, self.max_presentation_words);
-            self.clear_active();
         } else {
-            self.finalized.extend(incoming);
-            trim_front(&mut self.finalized, self.max_presentation_words);
-        }
-    }
-
-    /// เก็บผลชั่วคราวเดิมเมื่อรหัสช่วงเปลี่ยนก่อนมีผลยืนยัน เพื่อไม่ให้คำหาย
-    fn commit_active_without_final(&mut self) {
-        if self.active_segment_id.is_none() {
-            return;
-        }
-
-        let mut segment = self.active_committed.clone();
-        segment.extend(self.provisional.iter().cloned());
+            incoming
+        };
+        self.last_final_segment_id = Some(segment_id);
         self.finalized.extend(segment);
         trim_front(&mut self.finalized, self.max_presentation_words);
         self.clear_active();
@@ -203,20 +156,46 @@ impl TranscriptReconciler {
 
     /// ล้างสถานะเฉพาะช่วงปัจจุบันหลังย้ายคำไปยังประวัติที่ยืนยันแล้ว
     fn clear_active(&mut self) {
-        self.active_committed.clear();
-        self.provisional.clear();
-        self.previous_hypothesis.clear();
+        self.active_prefix.clear();
+        self.draft.clear();
         self.active_segment_id = None;
-        self.active_prefix_len = 0;
-        self.stable_word_count = 0;
     }
 
-    /// ประกอบคำที่ยืนยันแล้ว คำที่นิ่ง และคำที่ยังแก้ได้ใหม่ตามลำดับเวลา
+    /// แยกประโยคที่จบแล้วออกจากส่วนท้ายที่ยังให้ผล Partial รอบถัดไปแก้ไขได้
+    fn set_active_hypothesis(&mut self, hypothesis: Vec<String>) {
+        let stable_end = last_sentence_boundary(&hypothesis);
+        self.active_prefix = hypothesis[..stable_end].to_vec();
+        self.draft = hypothesis[stable_end..].to_vec();
+        trim_front(&mut self.active_prefix, self.max_presentation_words);
+    }
+
+    /// เพิ่มเฉพาะประโยคที่ปิดใหม่จาก mutable tail โดยไม่แก้ active prefix เดิม
+    fn set_active_tail(&mut self, tail: Vec<String>) {
+        let stable_end = last_sentence_boundary(&tail);
+        self.active_prefix
+            .extend(tail[..stable_end].iter().cloned());
+        self.draft = tail[stable_end..].to_vec();
+        trim_front(&mut self.active_prefix, self.max_presentation_words);
+    }
+
+    /// เก็บสมมติฐานที่ดีที่สุดเมื่อ segment เปลี่ยนก่อน Whisper ส่ง Final
+    fn commit_active_without_final(&mut self) {
+        if self.active_segment_id.is_none() {
+            return;
+        }
+
+        let mut segment = self.active_prefix.clone();
+        segment.extend(self.draft.iter().cloned());
+        self.finalized.extend(segment);
+        trim_front(&mut self.finalized, self.max_presentation_words);
+        self.clear_active();
+    }
+
+    /// ประกอบคำที่ยืนยันแล้วกับ draft ล่าสุดตามลำดับเวลา
     fn refresh_presentation(&mut self) {
         let mut combined = self.finalized.clone();
-        let mut active = self.active_committed.clone();
-        active.extend(self.provisional.iter().cloned());
-        combined.extend(active);
+        combined.extend(self.active_prefix.iter().cloned());
+        combined.extend(self.draft.iter().cloned());
         trim_front(&mut combined, self.max_presentation_words);
         self.presentation = combined.join(" ");
     }
@@ -228,6 +207,210 @@ fn words(text: &str) -> Vec<String> {
         .split_whitespace()
         .map(str::to_owned)
         .collect()
+}
+
+/// แยก mutable tail ออกจาก hypothesis ใหม่โดยไม่ให้ประโยคที่ปิดแล้วถูกแก้หรือถูกต่อซ้ำ
+fn reconcile_mutable_tail(
+    stable: &[String],
+    draft: &[String],
+    incoming: &[String],
+    preserve_partial_draft: bool,
+) -> Vec<String> {
+    if !stable.is_empty() {
+        let stable_prefix = common_prefix_len(stable, incoming);
+        if stable_prefix == incoming.len() {
+            // สมมติฐานสั้นที่ย้อนกลับไปมีเพียงประโยคที่ปิดแล้วต้องไม่ลบ draft
+            // ซึ่งยังแสดงอยู่ รอผลที่ต่อเนื่องหรือ Final มาตัดสินแทน
+            return reconciled_partial_tail(draft, &[], preserve_partial_draft);
+        }
+        if stable_prefix == stable.len() {
+            return reconciled_partial_tail(
+                draft,
+                &incoming[stable_prefix..],
+                preserve_partial_draft,
+            );
+        }
+
+        // Rolling window อาจเริ่มกลางประโยคที่อยู่ท้าย stable prefix แล้ว จึงต้อง
+        // ตัดส่วนที่ซ้ำออกแทนการ commit ประโยคเดิมซ้ำอีกครั้ง
+        let stable_overlap = longest_word_overlap(stable, incoming);
+        if meaningful_overlap(stable, incoming, stable_overlap) {
+            return reconciled_partial_tail(
+                draft,
+                &incoming[stable_overlap..],
+                preserve_partial_draft,
+            );
+        }
+
+        // บางรอบ Whisper เติมคำหลงมาหนึ่งคำหน้าประโยคเก่าที่เลื่อนพ้น window
+        // ต้องข้ามคำนั้นก่อนตรวจ suffix เพื่อไม่ให้ประโยคเดิมกลับมาแสดงซ้ำชั่วคราว
+        if let Some(tail_start) = stable_tail_start_after_leading_word(stable, incoming) {
+            return reconciled_partial_tail(
+                draft,
+                &incoming[tail_start..],
+                preserve_partial_draft,
+            );
+        }
+    }
+
+    // Whisper บางรอบย้อนกลับมาเหลือเพียง prefix ของ draft เดิมก่อนจะต่อคำใหม่
+    // การรับผลนั้นทันทีทำให้ subtitle หด ทั้งที่ยังไม่มีคำแก้ไขมาหักล้างข้อความเดิม
+    let draft_prefix = common_prefix_len(draft, incoming);
+    if preserve_partial_draft
+        && incoming.len() < draft.len()
+        && draft_prefix == incoming.len()
+    {
+        return draft.to_vec();
+    }
+
+    let shifted_overlap = longest_word_overlap(draft, incoming);
+    if meaningful_overlap(draft, incoming, shifted_overlap) {
+        let mut merged = draft[..draft.len() - shifted_overlap].to_vec();
+        merged.extend(incoming.iter().cloned());
+        return merged;
+    }
+
+    // Whisper อาจแก้คำสุดท้ายพร้อมกับเลื่อนหน้าต่าง เช่น
+    // `... consistent with creation` -> `consistent with creating` ทำให้ suffix
+    // ไม่ตรงทั้งหมด หา prefix ของผลใหม่ภายใน draft เดิมเพื่อรักษาคำที่เลื่อนพ้นจอ
+    if preserve_partial_draft {
+        if let Some(start) = shifted_window_start(draft, incoming) {
+            let mut merged = draft[..start].to_vec();
+            merged.extend(incoming.iter().cloned());
+            return merged;
+        }
+    }
+
+    if let Some(start) = aligned_draft_start(draft, incoming) {
+        return incoming[start..].to_vec();
+    }
+
+    incoming.to_vec()
+}
+
+/// รักษา draft เดิมเมื่อ Partial ใหม่เป็นเพียง prefix ที่สั้นกว่า แต่ให้ Final ตัดคำได้
+fn reconciled_partial_tail(
+    draft: &[String],
+    incoming_tail: &[String],
+    preserve_partial_draft: bool,
+) -> Vec<String> {
+    if preserve_partial_draft
+        && incoming_tail.len() < draft.len()
+        && common_prefix_len(draft, incoming_tail) == incoming_tail.len()
+    {
+        draft.to_vec()
+    } else {
+        incoming_tail.to_vec()
+    }
+}
+
+/// หาจุดเริ่ม draft เดิมภายใน hypothesis ใหม่เพื่อทิ้งฉบับแก้ของประโยคที่ปิดแล้ว
+fn aligned_draft_start(draft: &[String], incoming: &[String]) -> Option<usize> {
+    let mut best = None;
+    for start in 0..incoming.len() {
+        let overlap = common_prefix_len(draft, &incoming[start..]);
+        if overlap >= MIN_ROLLING_OVERLAP_WORDS
+            || (overlap == 1 && (start == 0 || draft.len() == 1))
+        {
+            if best.map_or(true, |(_, best_overlap)| overlap > best_overlap) {
+                best = Some((start, overlap));
+            }
+        }
+    }
+    best.map(|(start, _)| start)
+}
+
+/// หาจุดที่ต้น hypothesis ใหม่อยู่ภายใน draft เดิม แม้คำท้ายเดิมถูกแก้ในรอบเดียวกับที่ window เลื่อน
+fn shifted_window_start(draft: &[String], incoming: &[String]) -> Option<usize> {
+    let mut best = None;
+    for start in 1..draft.len() {
+        let overlap = common_prefix_len(&draft[start..], incoming);
+        if overlap >= MIN_ROLLING_OVERLAP_WORDS
+            && best.is_none_or(|(best_start, best_overlap)| {
+                overlap > best_overlap || (overlap == best_overlap && start > best_start)
+            })
+        {
+            best = Some((start, overlap));
+        }
+    }
+    best.map(|(start, _)| start)
+}
+
+/// คืนตำแหน่ง tail เมื่อ hypothesis มีคำหลงหนึ่งคำแล้วตามด้วย suffix ของประโยคที่ปิดแล้ว
+fn stable_tail_start_after_leading_word(
+    stable: &[String],
+    incoming: &[String],
+) -> Option<usize> {
+    let overlap = longest_word_overlap(stable, incoming.get(1..)?);
+    (overlap >= 3).then_some(overlap + 1)
+}
+
+/// หาจำนวนคำต้นที่เหมือนกันโดยไม่สนตัวพิมพ์และวรรคตอน
+fn common_prefix_len(previous: &[String], incoming: &[String]) -> usize {
+    previous
+        .iter()
+        .zip(incoming)
+        .take_while(|(left, right)| normalized_word(left) == normalized_word(right))
+        .count()
+}
+
+/// หาจำนวนคำยาวที่สุดที่ท้าย hypothesis เดิมตรงกับต้น hypothesis ใหม่
+fn longest_word_overlap(previous: &[String], incoming: &[String]) -> usize {
+    let maximum = previous.len().min(incoming.len());
+    (1..=maximum)
+        .rev()
+        .find(|&length| {
+            previous[previous.len() - length..]
+                .iter()
+                .zip(&incoming[..length])
+                .all(|(left, right)| normalized_word(left) == normalized_word(right))
+        })
+        .unwrap_or(0)
+}
+
+/// ลดรูปคำสำหรับตรวจหน้าต่างเลื่อนโดยไม่ให้ตัวพิมพ์หรือวรรคตอนท้ายรบกวนการจับคู่
+fn normalized_word(word: &str) -> String {
+    word.trim_matches(|character: char| !character.is_alphanumeric())
+        .to_lowercase()
+}
+
+/// ยอมรับ overlap สองคำขึ้นไป หรือหนึ่งคำเมื่อ hypothesis เดิมยังสั้นหรือจบประโยคชัดเจน
+fn meaningful_overlap(previous: &[String], incoming: &[String], overlap: usize) -> bool {
+    overlap >= MIN_ROLLING_OVERLAP_WORDS
+        || (overlap == 1
+            && ((previous.len() <= MIN_ROLLING_OVERLAP_WORDS && incoming.len() > 1)
+                || previous
+                    .last()
+                    .is_some_and(|word| is_sentence_boundary_word(word))))
+}
+
+/// คืนตำแหน่งหลังคำจบประโยคล่าสุด โดยไม่ย้ายเศษประโยคปัจจุบันไปส่วนคงที่
+fn last_sentence_boundary(words: &[String]) -> usize {
+    let completed = words.get(..words.len().saturating_sub(1)).unwrap_or_default();
+    completed
+        .iter()
+        .rposition(|word| is_sentence_boundary_word(word))
+        .map_or(0, |index| index + 1)
+}
+
+/// แยกเครื่องหมายจบประโยคจริงออกจากตัวย่อทั่วไปและเลขที่มีจุดภายใน
+fn is_sentence_boundary_word(word: &str) -> bool {
+    let word = word.trim_end_matches(|character: char| {
+        matches!(character, '"' | '\'' | '’' | ')' | ']' | '}')
+    });
+    if word.ends_with(['!', '?']) {
+        return true;
+    }
+    if !word.ends_with('.') {
+        return false;
+    }
+
+    let stem = word.trim_end_matches('.').to_ascii_lowercase();
+    !stem.contains('.')
+        && !matches!(
+            stem.as_str(),
+            "mr" | "mrs" | "ms" | "dr" | "prof" | "sr" | "jr" | "st" | "vs" | "etc"
+        )
 }
 
 /// คิวบรรทัดคำบรรยายที่ปิดบรรทัดเดิมทันทีเมื่อคำถัดไปเกินความกว้างจริง
@@ -334,64 +517,6 @@ where
     lines
 }
 
-/// ต่อคำใหม่โดยลบเฉพาะส่วนที่ซ้อนกับท้ายรายการเดิม
-fn append_without_overlap(base: &mut Vec<String>, incoming: &[String]) {
-    let overlap = longest_word_overlap(base, incoming);
-    base.extend(incoming[overlap..].iter().cloned());
-}
-
-/// หาจำนวนคำยาวที่สุดที่ท้ายรายการเดิมตรงกับต้นรายการใหม่
-fn longest_word_overlap(base: &[String], incoming: &[String]) -> usize {
-    let maximum = base.len().min(incoming.len());
-    (1..=maximum)
-        .rev()
-        .find(|&length| {
-            base[base.len() - length..]
-                .iter()
-                .zip(&incoming[..length])
-                .all(|(left, right)| normalized_word(left) == normalized_word(right))
-        })
-        .unwrap_or(0)
-}
-
-/// หาจำนวนคำจากต้นที่เหมือนกันโดยไม่สนตัวพิมพ์เล็กใหญ่
-fn common_prefix_len(left: &[String], right: &[String]) -> usize {
-    left.iter()
-        .zip(right)
-        .take_while(|(left, right)| left.eq_ignore_ascii_case(right))
-        .count()
-}
-
-/// จัดแนวคำท้ายของข้อความเดิมกับสมมติฐานใหม่แม้ Whisper จะแทรกคำระหว่างกลาง
-fn aligned_suffix_tail_start(base: &[String], incoming: &[String]) -> Option<usize> {
-    for suffix_start in 0..base.len() {
-        let mut incoming_start = 0;
-        let mut last_match = None;
-        let mut complete = true;
-        for expected in &base[suffix_start..] {
-            let Some(offset) = incoming[incoming_start..]
-                .iter()
-                .position(|word| normalized_word(word) == normalized_word(expected))
-            else {
-                complete = false;
-                break;
-            };
-            incoming_start += offset + 1;
-            last_match = Some(incoming_start);
-        }
-        if complete {
-            return last_match;
-        }
-    }
-    None
-}
-
-/// ลดรูปคำเพื่อเปรียบเทียบโดยตัดวรรคตอนรอบนอกและไม่สนตัวพิมพ์
-fn normalized_word(word: &str) -> String {
-    word.trim_matches(|character: char| !character.is_alphanumeric())
-        .to_lowercase()
-}
-
 /// ทิ้งคำเก่าสุดจากด้านหน้าเมื่อประวัติยาวเกินขีดจำกัด
 fn trim_front(words: &mut Vec<String>, maximum: usize) {
     if words.len() > maximum {
@@ -405,19 +530,19 @@ mod tests {
     use crate::stt::TranscriptUpdate;
 
     #[test]
-    fn stable_prefix_does_not_regress() {
+    fn each_partial_replaces_the_entire_draft() {
         let mut reconciler = TranscriptReconciler::default();
 
         partial(&mut reconciler, 1, "I think we should");
         partial(&mut reconciler, 1, "I think we should go");
         partial(&mut reconciler, 1, "I think they might stay");
 
-        assert_eq!(reconciler.presentation_text(), "I think we should stay");
-        assert_eq!(reconciler.stable_word_count(), 4);
+        assert_eq!(reconciler.presentation_text(), "I think they might stay");
+        assert_eq!(reconciler.stable_word_count(), 0);
     }
 
     #[test]
-    fn shifted_partial_retains_words_that_fell_off_the_window() {
+    fn two_word_overlap_keeps_the_text_that_left_the_window() {
         let mut reconciler = TranscriptReconciler::default();
 
         partial(&mut reconciler, 1, "one two three four");
@@ -426,6 +551,267 @@ mod tests {
         assert_eq!(
             reconciler.presentation_text(),
             "one two three four five six"
+        );
+    }
+
+    #[test]
+    fn one_word_overlap_keeps_the_text_that_left_the_window() {
+        let mut reconciler = TranscriptReconciler::default();
+
+        partial(&mut reconciler, 1, "one two");
+        partial(&mut reconciler, 1, "two three");
+
+        assert_eq!(reconciler.presentation_text(), "one two three");
+    }
+
+    #[test]
+    fn coincidental_one_word_overlap_replaces_a_longer_hypothesis() {
+        let mut reconciler = TranscriptReconciler::default();
+
+        partial(&mut reconciler, 1, "we should go now");
+        partial(&mut reconciler, 1, "now this is different");
+
+        assert_eq!(reconciler.presentation_text(), "now this is different");
+    }
+
+    #[test]
+    fn rolling_shift_with_a_revised_last_word_keeps_the_earlier_phrase() {
+        let mut reconciler = TranscriptReconciler::default();
+
+        partial(
+            &mut reconciler,
+            1,
+            "I'm going to get better at this. My goal is to be more regular and consistent with creation",
+        );
+        partial(
+            &mut reconciler,
+            1,
+            "more regular and consistent with creating",
+        );
+
+        assert_eq!(
+            reconciler.presentation_text(),
+            "I'm going to get better at this. My goal is to be more regular and consistent with creating"
+        );
+    }
+
+    #[test]
+    fn short_partial_from_the_stable_prefix_does_not_clear_the_live_draft() {
+        let mut reconciler = TranscriptReconciler::default();
+
+        partial(
+            &mut reconciler,
+            1,
+            "First sentence. still speaking clearly",
+        );
+        partial(&mut reconciler, 1, "First sentence. still");
+        assert_eq!(
+            reconciler.presentation_text(),
+            "First sentence. still speaking clearly"
+        );
+
+        partial(&mut reconciler, 1, "First sentence");
+
+        assert_eq!(
+            reconciler.presentation_text(),
+            "First sentence. still speaking clearly"
+        );
+    }
+
+    #[test]
+    fn final_after_a_revised_window_shift_does_not_restore_a_missing_prefix_in_a_burst() {
+        let mut reconciler = TranscriptReconciler::default();
+
+        partial(
+            &mut reconciler,
+            1,
+            "So today I wanted to share with you what I do to practice and",
+        );
+        partial(
+            &mut reconciler,
+            1,
+            "with you what I do to practice English",
+        );
+        assert_eq!(
+            reconciler.presentation_text(),
+            "So today I wanted to share with you what I do to practice English"
+        );
+
+        final_update(
+            &mut reconciler,
+            1,
+            "So today I wanted to share with you what I do to practice English.",
+        );
+        assert_eq!(
+            reconciler.presentation_text(),
+            "So today I wanted to share with you what I do to practice English."
+        );
+    }
+
+    #[test]
+    fn shorter_final_removes_the_obsolete_partial_word() {
+        let mut reconciler = TranscriptReconciler::default();
+
+        partial(&mut reconciler, 1, "we should go home");
+        final_update(&mut reconciler, 1, "we should go");
+
+        assert_eq!(reconciler.presentation_text(), "we should go");
+    }
+
+    #[test]
+    fn final_revision_does_not_keep_an_internal_partial_prefix() {
+        let mut reconciler = TranscriptReconciler::default();
+
+        partial(
+            &mut reconciler,
+            1,
+            "we should go because I really should stay",
+        );
+        final_update(&mut reconciler, 1, "I really should leave");
+
+        assert_eq!(reconciler.presentation_text(), "I really should leave");
+    }
+
+    #[test]
+    fn suffix_overlap_wins_over_a_coincidental_first_word_match() {
+        let mut reconciler = TranscriptReconciler::default();
+
+        partial(&mut reconciler, 1, "I was there and I think");
+        partial(&mut reconciler, 1, "I think we should continue");
+
+        assert_eq!(
+            reconciler.presentation_text(),
+            "I was there and I think we should continue"
+        );
+    }
+
+    #[test]
+    fn completed_sentence_stays_visible_when_the_window_shifts() {
+        let mut reconciler = TranscriptReconciler::default();
+
+        partial(
+            &mut reconciler,
+            1,
+            "First sentence ends here. current words keep moving",
+        );
+        partial(
+            &mut reconciler,
+            1,
+            "current words keep moving forward",
+        );
+
+        assert_eq!(
+            reconciler.presentation_text(),
+            "First sentence ends here. current words keep moving forward"
+        );
+        assert_eq!(reconciler.stable_word_count(), 4);
+    }
+
+    #[test]
+    fn revision_inside_a_stable_sentence_updates_only_the_mutable_tail() {
+        let mut reconciler = TranscriptReconciler::default();
+
+        partial(&mut reconciler, 1, "I like blue cars. Next");
+        partial(&mut reconciler, 1, "I like red cars. Next word");
+
+        assert_eq!(reconciler.presentation_text(), "I like blue cars. Next word");
+    }
+
+    #[test]
+    fn revised_final_does_not_append_a_second_version_of_the_stable_sentence() {
+        let mut reconciler = TranscriptReconciler::default();
+
+        partial(&mut reconciler, 1, "I like blue cars. Next");
+        final_update(&mut reconciler, 1, "I like red cars.");
+
+        assert_eq!(reconciler.presentation_text(), "I like blue cars.");
+    }
+
+    #[test]
+    fn unfinished_words_before_the_overlap_remain_in_the_live_draft() {
+        let mut reconciler = TranscriptReconciler::default();
+
+        partial(
+            &mut reconciler,
+            1,
+            "A complete thought. this phrase keeps moving slowly",
+        );
+        partial(
+            &mut reconciler,
+            1,
+            "phrase keeps moving slowly forward",
+        );
+
+        assert_eq!(
+            reconciler.presentation_text(),
+            "A complete thought. this phrase keeps moving slowly forward"
+        );
+        assert_eq!(reconciler.stable_word_count(), 3);
+    }
+
+    #[test]
+    fn one_word_sentence_overlap_does_not_repeat_the_boundary() {
+        let mut reconciler = TranscriptReconciler::default();
+
+        partial(&mut reconciler, 1, "Practice, right? You have to speak");
+        partial(&mut reconciler, 1, "Right? You have to speak now");
+
+        assert_eq!(
+            reconciler.presentation_text(),
+            "Practice, right? You have to speak now"
+        );
+    }
+
+    #[test]
+    fn stable_sentence_suffix_is_not_committed_twice_after_a_transient_partial() {
+        let mut reconciler = TranscriptReconciler::default();
+
+        partial(
+            &mut reconciler,
+            1,
+            "Hi everyone. Long time no see, right? I know I",
+        );
+        partial(&mut reconciler, 1, "a long time no see, right");
+        assert_eq!(
+            reconciler.presentation_text(),
+            "Hi everyone. Long time no see, right? I know I"
+        );
+
+        partial(
+            &mut reconciler,
+            1,
+            "Long time no see, right? I know I haven't",
+        );
+
+        assert_eq!(
+            reconciler.presentation_text(),
+            "Hi everyone. Long time no see, right? I know I haven't"
+        );
+    }
+
+    #[test]
+    fn segment_change_without_final_keeps_the_best_draft() {
+        let mut reconciler = TranscriptReconciler::default();
+
+        partial(&mut reconciler, 1, "listening to English alone will");
+        partial(&mut reconciler, 2, "That will improve your speaking");
+
+        assert_eq!(
+            reconciler.presentation_text(),
+            "listening to English alone will That will improve your speaking"
+        );
+    }
+
+    #[test]
+    fn distinct_segments_preserve_repeated_words_at_the_boundary() {
+        let mut reconciler = TranscriptReconciler::default();
+
+        partial(&mut reconciler, 1, "we need to go now");
+        partial(&mut reconciler, 2, "to go now please");
+
+        assert_eq!(
+            reconciler.presentation_text(),
+            "we need to go now to go now please"
         );
     }
 
@@ -440,7 +826,7 @@ mod tests {
     }
 
     #[test]
-    fn final_after_committed_partial_does_not_duplicate_words() {
+    fn final_replaces_the_draft_and_commits_once() {
         let mut reconciler = TranscriptReconciler::default();
 
         partial(&mut reconciler, 1, "we should go now");
@@ -451,14 +837,74 @@ mod tests {
     }
 
     #[test]
-    fn revised_final_aligns_with_committed_words_without_duplication() {
+    fn revised_final_replaces_the_partial_wording() {
         let mut reconciler = TranscriptReconciler::default();
 
         partial(&mut reconciler, 1, "we should go");
         partial(&mut reconciler, 1, "we should go now");
         final_update(&mut reconciler, 1, "we really should go home");
 
-        assert_eq!(reconciler.presentation_text(), "we should go home");
+        assert_eq!(reconciler.presentation_text(), "we really should go home");
+    }
+
+    #[test]
+    fn final_keeps_a_stable_sentence_that_left_the_final_window() {
+        let mut reconciler = TranscriptReconciler::default();
+
+        partial(&mut reconciler, 1, "First sentence. still speaking");
+        final_update(&mut reconciler, 1, "still speaking clearly.");
+
+        assert_eq!(
+            reconciler.presentation_text(),
+            "First sentence. still speaking clearly."
+        );
+    }
+
+    #[test]
+    fn ambiguous_final_preserves_all_incoming_sentences_after_the_stable_prefix() {
+        let mut reconciler = TranscriptReconciler::default();
+
+        partial(&mut reconciler, 1, "Old sentence. draft");
+        final_update(
+            &mut reconciler,
+            1,
+            "Revised sentence. Brand new sentence.",
+        );
+
+        assert_eq!(
+            reconciler.presentation_text(),
+            "Old sentence. Revised sentence. Brand new sentence."
+        );
+    }
+
+    #[test]
+    fn ambiguous_final_keeps_a_brand_new_sentence_after_unfinished_draft() {
+        let mut reconciler = TranscriptReconciler::default();
+
+        partial(&mut reconciler, 1, "Old sentence. unfinished words");
+        final_update(&mut reconciler, 1, "Brand new sentence.");
+
+        assert_eq!(
+            reconciler.presentation_text(),
+            "Old sentence. Brand new sentence."
+        );
+    }
+
+    #[test]
+    fn shorter_final_does_not_truncate_the_stable_prefix() {
+        let mut reconciler = TranscriptReconciler::default();
+
+        partial(
+            &mut reconciler,
+            1,
+            "First sentence. Second sentence. still speaking",
+        );
+        final_update(&mut reconciler, 1, "First sentence.");
+
+        assert_eq!(
+            reconciler.presentation_text(),
+            "First sentence. Second sentence."
+        );
     }
 
     #[test]
@@ -488,6 +934,29 @@ mod tests {
     }
 
     #[test]
+    fn a_partial_phrase_repeated_across_real_final_boundaries_is_preserved() {
+        let mut reconciler = TranscriptReconciler::default();
+
+        final_update(&mut reconciler, 1, "hello there everyone");
+        final_update(&mut reconciler, 2, "there everyone welcome back");
+
+        assert_eq!(
+            reconciler.presentation_text(),
+            "hello there everyone there everyone welcome back"
+        );
+    }
+
+    #[test]
+    fn repeated_sentence_in_a_new_segment_is_preserved() {
+        let mut reconciler = TranscriptReconciler::default();
+
+        final_update(&mut reconciler, 1, "Hello there.");
+        final_update(&mut reconciler, 2, "Hello there.");
+
+        assert_eq!(reconciler.presentation_text(), "Hello there. Hello there.");
+    }
+
+    #[test]
     fn presentation_trims_only_the_oldest_committed_words() {
         let mut reconciler = TranscriptReconciler::new(5);
 
@@ -498,17 +967,14 @@ mod tests {
     }
 
     #[test]
-    fn a_replaced_hypothesis_does_not_drop_its_new_prefix() {
+    fn a_replaced_hypothesis_drops_the_obsolete_draft() {
         let mut reconciler = TranscriptReconciler::default();
 
         partial(&mut reconciler, 1, "one two");
         partial(&mut reconciler, 1, "one two three");
         partial(&mut reconciler, 1, "new phrase starts");
 
-        assert_eq!(
-            reconciler.presentation_text(),
-            "one two three new phrase starts"
-        );
+        assert_eq!(reconciler.presentation_text(), "new phrase starts");
     }
 
     #[test]
@@ -549,6 +1015,16 @@ mod tests {
             "Speech [BLANK_AUDIO] remains visible now",
         );
         assert_eq!(reconciler.presentation_text(), "Speech remains visible now");
+    }
+
+    #[test]
+    fn empty_final_keeps_the_best_available_draft() {
+        let mut reconciler = TranscriptReconciler::default();
+
+        partial(&mut reconciler, 1, "Maybe this was speech");
+        final_update(&mut reconciler, 1, "[BLANK_AUDIO]");
+
+        assert_eq!(reconciler.presentation_text(), "Maybe this was speech");
     }
 
     #[test]

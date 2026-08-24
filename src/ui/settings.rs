@@ -603,7 +603,7 @@ fn speech_recognition_page(
 
     let streaming_group = adw::PreferencesGroup::builder().title("Streaming").build();
     let (step_row, step) = spin_row(
-        "Audio Step",
+        "Partial Update Interval",
         snapshot.audio_step_ms,
         50,
         1_000,

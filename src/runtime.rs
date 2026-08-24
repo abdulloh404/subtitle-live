@@ -30,7 +30,7 @@ const MIX_FRAME_DURATION_MS: usize = 20;
 // เผื่อพื้นที่เพิ่มเพื่อให้ STT มีช่วงรับความผันผวนโดยไม่ทำให้คิวโตแบบไม่จำกัด
 const INFERENCE_HEADROOM_MS: usize = 2_000;
 // เมื่อไม่มีผลถอดเสียงใหม่เกินช่วงนี้ ให้ล้างบริบทเก่าและซ่อน overlay
-const SUBTITLE_IDLE_TIMEOUT: Duration = Duration::from_secs(3);
+const SUBTITLE_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 // จำกัด correlation ที่รอ overlay ตอบกลับ เพราะ frame เก่าอาจถูก mailbox แทนที่และไม่มี acknowledgment
 const MAX_PENDING_OVERLAY_FRAMES: usize = 64;
 
@@ -687,11 +687,20 @@ impl ApplicationRuntime {
                     && self.accepted_audio_generation == Some(audio_generation) =>
                 {
                     let is_final = matches!(&transcript, TranscriptUpdate::Final { .. });
+                    let final_is_empty = matches!(
+                        &transcript,
+                        TranscriptUpdate::Final { text, .. } if text.trim().is_empty()
+                    );
                     let presentation_changed = self.transcript.apply(&transcript);
                     self.last_subtitle_update = Some(Instant::now());
-                    if presentation_changed || is_final {
+                    let presentation = self.transcript.presentation_text();
+                    if final_is_empty && presentation.is_empty() {
+                        update.subtitle = None;
+                        update.hide_overlay = true;
+                        self.last_subtitle_update = None;
+                    } else if presentation_changed || is_final {
                         update.subtitle = Some(SubtitleFrame {
-                            text: self.transcript.presentation_text().to_owned(),
+                            text: presentation.to_owned(),
                             is_final,
                             audio_origin_at,
                         });
@@ -890,7 +899,7 @@ impl ApplicationRuntime {
         self.last_persisted_config = config;
     }
 
-    /// ปิด cue ที่เงียบเกินกำหนดและเริ่ม generation ใหม่เพื่อไม่ให้บริบทเก่าปนกับคำถัดไป
+    /// ปิด cue ที่เงียบเกินกำหนดโดยไม่ restart สายเสียงทั้งชุด
     fn clear_stale_subtitle(&mut self, update: &mut RuntimeUpdate) {
         let Some(last_update) = self.last_subtitle_update else {
             return;
@@ -898,14 +907,9 @@ impl ApplicationRuntime {
         if !subtitle_idle_timed_out(last_update, Instant::now()) {
             return;
         }
-        self.begin_capture_transition(update);
-        if !self.applied_targets.is_empty()
-            && let Err(error) = self
-                .pipewire
-                .set_selected(self.applied_targets.clone(), self.pipeline_audio_generation)
-        {
-            self.pipeline_error = Some(error.to_string());
-        }
+        self.transcript.clear();
+        self.last_subtitle_update = None;
+        update.hide_overlay = true;
     }
 
     /// ส่งสถานะไป tray เมื่อค่าที่แสดงต้องเปลี่ยนเท่านั้น
@@ -961,16 +965,16 @@ mod tests {
     use super::{monotonic_duration, subtitle_idle_timed_out};
 
     #[test]
-    fn subtitle_hides_when_idle_reaches_three_seconds() {
+    fn subtitle_hides_when_idle_reaches_five_seconds() {
         let last_update = Instant::now();
 
         assert!(!subtitle_idle_timed_out(
             last_update,
-            last_update + Duration::from_millis(2_999)
+            last_update + Duration::from_millis(4_999)
         ));
         assert!(subtitle_idle_timed_out(
             last_update,
-            last_update + Duration::from_secs(3)
+            last_update + Duration::from_secs(5)
         ));
     }
 
