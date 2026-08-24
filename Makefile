@@ -7,6 +7,7 @@ ROCM_ENV = $(DEV_ENV) && . ./scripts/rocm-env.sh
 COMPUTE_BACKEND ?= $(shell bash ./scripts/detect-compute-backend.sh)
 COMPUTE_ENV = $(DEV_ENV)
 COMPUTE_FEATURES =
+MODEL ?= small.en
 
 ifeq ($(COMPUTE_BACKEND),cuda)
 COMPUTE_FEATURES = --features cuda
@@ -42,6 +43,6 @@ lint:
 test:
 	$(COMPUTE_ENV) && cargo test --all-targets $(COMPUTE_FEATURES)
 
-# ดาวน์โหลดและตรวจ checksum ของโมเดล small.en เริ่มต้น
+# ดาวน์โหลดและตรวจ checksum ของ model ที่เลือก
 model:
-	./scripts/download-model.sh
+	./scripts/download-model.sh "$(MODEL)"

@@ -141,11 +141,16 @@ pub fn default_path() -> Result<PathBuf, ConfigError> {
         .ok_or(ConfigError::ConfigDirectoryUnavailable)
 }
 
-/// คืน path โมเดล `small.en` ภายใต้ home directory ของผู้ใช้
-pub fn default_model_path() -> Result<PathBuf, ConfigError> {
+/// คืน directory มาตรฐานสำหรับเก็บ Whisper model ภายใต้ home directory ของผู้ใช้
+pub fn default_model_directory() -> Result<PathBuf, ConfigError> {
     absolute_environment_path("HOME")
-        .map(|home| home.join(".subtitle-live/models/ggml-small.en.bin"))
+        .map(|home| home.join(".subtitle-live/models"))
         .ok_or(ConfigError::DataDirectoryUnavailable)
+}
+
+/// คืน path เริ่มต้นของ model `small.en`
+pub fn default_model_path() -> Result<PathBuf, ConfigError> {
+    default_model_directory().map(|directory| directory.join("ggml-small.en.bin"))
 }
 
 /// คืน path ไฟล์ debug transcript ใต้ home directory โดยยังไม่สร้าง directory

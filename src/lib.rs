@@ -19,6 +19,8 @@ pub mod error;
 pub mod logging;
 /// การวัด latency และสถานะของคิว
 pub mod metrics;
+/// Catalog และ download service สำหรับ Whisper model ภายในเครื่อง
+pub mod model;
 /// การแสดงหน้าต่างคำบรรยายแบบไม่รับอินพุต
 pub mod overlay;
 /// implementation ของ native PipeWire ซึ่งเข้าถึงผ่าน `audio_source` เท่านั้น

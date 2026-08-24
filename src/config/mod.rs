@@ -12,7 +12,7 @@ pub use schema::{
     SttConfig, SubtitleConfig,
 };
 pub use storage::{
-    ConfigError, ConfigLoadWarning, LoadedConfig, default_debug_log_path, default_model_path,
-    default_path, load_config, load_or_default, save_config,
+    ConfigError, ConfigLoadWarning, LoadedConfig, default_debug_log_path, default_model_directory,
+    default_model_path, default_path, load_config, load_or_default, save_config,
 };
 pub use writer::ConfigWriter;

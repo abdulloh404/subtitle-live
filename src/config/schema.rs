@@ -4,7 +4,7 @@ use std::{error::Error, fmt, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::audio_source::AudioSourceBackend;
+use crate::{audio_source::AudioSourceBackend, model::whisper_model};
 
 use super::ComputeRequest;
 
@@ -89,6 +89,12 @@ impl AppConfig {
         }
         if self.stt.model.trim().is_empty() {
             return Err(ConfigValidationError::new("stt.model", "must not be empty"));
+        }
+        if self.stt.model_path.is_none() && whisper_model(&self.stt.model).is_none() {
+            return Err(ConfigValidationError::new(
+                "stt.model",
+                "must be small.en, medium.en, or large-v3-turbo when stt.model_path is not configured",
+            ));
         }
         if self
             .stt

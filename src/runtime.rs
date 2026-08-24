@@ -18,6 +18,10 @@ use crate::{
     config::{AppConfig, ConfigWriter, default_debug_log_path},
     debug_log::{DebugLogStatus, DebugLogWriter},
     metrics::{LatencyTracker, MetricsSnapshot},
+    model::{
+        ModelDownloadEvent, ModelDownloadService, WhisperModelStatus, whisper_model,
+        whisper_model_path,
+    },
     stt::{
         SttDebugRecord, SttEvent, SttService, SttStartConfig, SttStreamingConfig, TranscriptUpdate,
         spawn_service as spawn_stt,
@@ -55,6 +59,8 @@ pub struct RuntimeUpdate {
     pub debug_log_status: Option<DebugLogStatus>,
     /// จำนวน debug record สะสมที่ถูกทิ้ง เมื่อค่าเปลี่ยนจากรอบก่อน
     pub debug_drop_counts: Option<DebugDropCounts>,
+    /// สถานะ model เปลี่ยนจากการเลือก ดาวน์โหลด หรือติดตั้ง
+    pub model_status: Option<WhisperModelStatus>,
 }
 
 /// จำนวน debug record สะสมที่แต่ละคิวทิ้งตลอดอายุโปรเซส
@@ -97,8 +103,18 @@ pub struct ApplicationRuntime {
     config_writer: Option<ConfigWriter>,
     /// Writer debug แยก thread และไม่สร้างไฟล์จนกว่าผู้ใช้เปิดในเซสชันนี้
     debug_log_writer: DebugLogWriter,
-    default_model_path: PathBuf,
-    model_ready: bool,
+    /// Worker ดาวน์โหลดและตรวจ checksum โดยไม่ block GTK thread
+    model_download: ModelDownloadService,
+    /// Directory กลางสำหรับ model ที่ catalog จัดการ
+    models_directory: PathBuf,
+    /// Config model ล่าสุดที่ runtime ส่งสถานะให้ UI แล้ว
+    observed_model_config: (String, Option<PathBuf>),
+    /// เลขคำขอดาวน์โหลดล่าสุดที่ runtime ประมวลผลแล้ว
+    observed_model_download_generation: u64,
+    /// Model ที่ worker กำลังดาวน์โหลด
+    downloading_model: Option<String>,
+    /// ข้อผิดพลาดล่าสุดจาก download worker
+    model_download_error: Option<String>,
     last_persisted_config: AppConfig,
     /// เปรียบเทียบเป้าหมายที่ต้องการกับ capture ที่ audio backend ยืนยันว่าเริ่มแล้ว
     applied_targets: Vec<CaptureTarget>,
@@ -143,13 +159,17 @@ impl ApplicationRuntime {
     pub fn new(
         controller: Rc<RefCell<ApplicationController>>,
         config_path: PathBuf,
-        default_model_path: PathBuf,
-        model_ready: bool,
+        models_directory: PathBuf,
         persistence_enabled: bool,
         mut startup_warning: Option<String>,
     ) -> Self {
         let last_persisted_config = controller.borrow().config_snapshot();
         let observed_retry_generation = controller.borrow().retry_generation();
+        let observed_model_download_generation = controller.borrow().model_download_generation();
+        let observed_model_config = (
+            last_persisted_config.stt.model.clone(),
+            last_persisted_config.stt.model_path.clone(),
+        );
         let source_audio = LatestQueue::new(SOURCE_QUEUE_CAPACITY);
         let mixed_audio =
             LatestQueue::new(mixed_queue_capacity(last_persisted_config.stt.window_ms));
@@ -173,13 +193,13 @@ impl ApplicationRuntime {
         };
         let config_writer = persistence_enabled.then(|| ConfigWriter::spawn(config_path));
         let debug_log_path = default_debug_log_path().unwrap_or_else(|_| {
-            default_model_path
+            models_directory
                 .parent()
-                .and_then(|models| models.parent())
                 .map(|data| data.join("logs/transcript-debug.jsonl"))
                 .unwrap_or_else(|| PathBuf::from("transcript-debug.jsonl"))
         });
         let debug_log_writer = DebugLogWriter::spawn(debug_log_path);
+        let model_download = ModelDownloadService::spawn();
 
         Self {
             controller,
@@ -193,8 +213,12 @@ impl ApplicationRuntime {
             tray_commands,
             config_writer,
             debug_log_writer,
-            default_model_path,
-            model_ready,
+            model_download,
+            models_directory,
+            observed_model_config,
+            observed_model_download_generation,
+            downloading_model: None,
+            model_download_error: None,
             last_persisted_config,
             applied_targets: Vec::new(),
             desired_capture_ids: HashSet::new(),
@@ -234,6 +258,9 @@ impl ApplicationRuntime {
         self.reap_retired_audio_sources();
         self.handle_tray_commands(&mut update);
         self.sync_audio_source_backend(&mut update);
+        self.sync_model_selection(&mut update);
+        self.sync_model_download_request(&mut update);
+        self.handle_model_download_events(&mut update);
         self.sync_retry_intent(&mut update);
         self.sync_live_intent(&mut update);
         self.sync_debug_session(&mut update);
@@ -330,20 +357,18 @@ impl ApplicationRuntime {
         self.pending_overlay_frames.clear();
     }
 
-    /// คืน model path ที่ผู้ใช้กำหนด หรือ path เริ่มต้นเมื่อไม่ได้ override
-    pub fn model_path(&self) -> PathBuf {
-        self.controller
-            .borrow()
-            .config()
-            .stt
-            .model_path
-            .clone()
-            .unwrap_or_else(|| self.default_model_path.clone())
-    }
-
-    /// ระบุว่า model ที่ resolve ตอน startup มีอยู่จริงหรือไม่
-    pub const fn model_exists(&self) -> bool {
-        self.model_ready
+    /// สร้างสถานะ model ปัจจุบันสำหรับหน้า Settings
+    pub fn model_status(&self) -> WhisperModelStatus {
+        let config = self.controller.borrow();
+        let selected_model = config.config().stt.model.clone();
+        let selected_path = self.resolve_model_path(config.config());
+        WhisperModelStatus {
+            installed: selected_path.is_file(),
+            selected_model,
+            selected_path,
+            downloading_model: self.downloading_model.clone(),
+            download_error: self.model_download_error.clone(),
+        }
     }
 
     /// ส่งคำสั่งหยุดไปยังทุก worker เพียงครั้งเดียว โดยไม่รอ inference บน GTK thread
@@ -361,6 +386,7 @@ impl ApplicationRuntime {
         self.stt.stop();
         self.stt.shutdown();
         self.mixer.stop();
+        self.model_download.request_shutdown();
         if let Some(tray) = &self.tray {
             tray.shutdown();
         }
@@ -387,6 +413,9 @@ impl ApplicationRuntime {
         }
         if let Err(error) = self.stt.finish() {
             tracing::error!(error = %error, "Whisper worker did not shut down cleanly");
+        }
+        if let Err(error) = self.model_download.finish() {
+            tracing::error!(error = %error, "Model download worker did not shut down cleanly");
         }
         let debug_tail = self.stt.drain_debug_records();
         if desired_debug_session.file_logging_enabled {
@@ -435,6 +464,94 @@ impl ApplicationRuntime {
                 TrayCommand::ShowSettings => update.show_settings = true,
                 TrayCommand::Quit => update.quit_requested = true,
             }
+        }
+    }
+
+    /// ส่งสถานะใหม่เมื่อผู้ใช้เปลี่ยน model หรือ custom path
+    fn sync_model_selection(&mut self, update: &mut RuntimeUpdate) {
+        let current = {
+            let controller = self.controller.borrow();
+            (
+                controller.config().stt.model.clone(),
+                controller.config().stt.model_path.clone(),
+            )
+        };
+        if current == self.observed_model_config {
+            return;
+        }
+        self.observed_model_config = current;
+        self.model_download_error = None;
+        update.model_status = Some(self.model_status());
+    }
+
+    /// ส่งคำขอดาวน์โหลดใหม่จาก controller ไปยัง worker เพียงครั้งเดียว
+    fn sync_model_download_request(&mut self, update: &mut RuntimeUpdate) {
+        let (generation, model_id) = {
+            let controller = self.controller.borrow();
+            (
+                controller.model_download_generation(),
+                controller.model_download_request().map(str::to_owned),
+            )
+        };
+        if generation == self.observed_model_download_generation {
+            return;
+        }
+        self.observed_model_download_generation = generation;
+        let Some(model_id) = model_id else {
+            return;
+        };
+        if let Some(active) = &self.downloading_model {
+            self.model_download_error = Some(format!(
+                "Wait for {active} to finish downloading before starting {model_id}"
+            ));
+            update.model_status = Some(self.model_status());
+            return;
+        }
+        let Some(model) = whisper_model(&model_id) else {
+            self.model_download_error = Some(format!("Unsupported Whisper model: {model_id}"));
+            update.model_status = Some(self.model_status());
+            return;
+        };
+        match self
+            .model_download
+            .download(model, self.models_directory.clone())
+        {
+            Ok(()) => {
+                self.downloading_model = Some(model_id);
+                self.model_download_error = None;
+            }
+            Err(error) => self.model_download_error = Some(error),
+        }
+        update.model_status = Some(self.model_status());
+    }
+
+    /// รับผล download และ retry pipeline เมื่อ model ที่เลือกติดตั้งเสร็จ
+    fn handle_model_download_events(&mut self, update: &mut RuntimeUpdate) {
+        for event in self.model_download.drain_events() {
+            match event {
+                ModelDownloadEvent::Started { model_id } => {
+                    tracing::info!(model = model_id, "Whisper model download started");
+                }
+                ModelDownloadEvent::Installed { model_id, path } => {
+                    tracing::info!(model = model_id, model_path = %path.display(), "Whisper model installed");
+                    self.downloading_model = None;
+                    self.model_download_error = None;
+                    let selected = self.controller.borrow().config().stt.model == model_id;
+                    let live = self.controller.borrow().config().general.live_subtitles;
+                    if selected && live {
+                        let _ = self
+                            .controller
+                            .borrow_mut()
+                            .handle_command(AppCommand::RetryPipeline);
+                    }
+                }
+                ModelDownloadEvent::Failed { model_id, error } => {
+                    tracing::warn!(model = model_id, error = %error, "Whisper model download failed");
+                    self.downloading_model = None;
+                    self.model_download_error = Some(error);
+                }
+            }
+            update.model_status = Some(self.model_status());
         }
     }
 
@@ -532,11 +649,9 @@ impl ApplicationRuntime {
         self.last_subtitle_update = None;
         self.applied_stt_streaming = Some(streaming);
         let _ = self.audio_source.stop_capture();
+        let model_path = self.resolve_model_path(&config);
         self.stt.start(SttStartConfig {
-            model_path: config
-                .stt
-                .model_path
-                .unwrap_or_else(|| self.default_model_path.clone()),
+            model_path,
             language: config.stt.language,
             compute_backend: config.stt.backend,
             step_ms: streaming.step_ms,
@@ -961,6 +1076,15 @@ impl ApplicationRuntime {
     /// เปลี่ยนสถานะ controller
     fn set_state(&self, state: ApplicationState) {
         self.controller.borrow_mut().set_state(state);
+    }
+
+    /// คืน custom path หรือ path จาก catalog สำหรับ model ที่เลือก
+    fn resolve_model_path(&self, config: &AppConfig) -> PathBuf {
+        config.stt.model_path.clone().unwrap_or_else(|| {
+            whisper_model(&config.stt.model)
+                .map(|model| whisper_model_path(&self.models_directory, model))
+                .unwrap_or_else(|| self.models_directory.join("unsupported-model.bin"))
+        })
     }
 }
 

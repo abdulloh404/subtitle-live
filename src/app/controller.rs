@@ -7,6 +7,7 @@ use crate::{
     config::{
         AppConfig, ApplicationRule, SUBTITLE_POSITIONS, SUBTITLE_TEXT_ALIGNMENTS, StreamRule,
     },
+    model::whisper_model,
 };
 
 use super::{AppCommand, AppEvent, ApplicationState};
@@ -30,6 +31,10 @@ pub struct ApplicationController {
     streams: Vec<StreamInfo>,
     /// เลขลำดับคำขอ retry เพื่อให้ runtime เห็นคำสั่งจากผู้เรียกทุกช่องทาง
     retry_generation: u64,
+    /// เลขลำดับคำขอดาวน์โหลด model เพื่อให้ runtime ประมวลผลเพียงครั้งเดียว
+    model_download_generation: u64,
+    /// identifier ของ model ที่ผู้ใช้ขอดาวน์โหลดล่าสุด
+    model_download_request: Option<String>,
     /// สถานะ debug ชั่วคราว ซึ่งเริ่มปิดใหม่ทุกครั้งที่เปิดโปรแกรม
     debug_session: DebugSessionState,
 }
@@ -49,6 +54,8 @@ impl ApplicationController {
             state,
             streams: Vec::new(),
             retry_generation: 0,
+            model_download_generation: 0,
+            model_download_request: None,
             debug_session: DebugSessionState::default(),
         }
     }
@@ -61,6 +68,16 @@ impl ApplicationController {
     /// คืนเลขลำดับคำขอ retry ล่าสุดสำหรับให้ runtime ตรวจจับแบบไม่บล็อก
     pub const fn retry_generation(&self) -> u64 {
         self.retry_generation
+    }
+
+    /// คืนเลขลำดับคำขอดาวน์โหลด model ล่าสุด
+    pub const fn model_download_generation(&self) -> u64 {
+        self.model_download_generation
+    }
+
+    /// คืน identifier ของ model ที่ผู้ใช้ขอดาวน์โหลดล่าสุด
+    pub fn model_download_request(&self) -> Option<&str> {
+        self.model_download_request.as_deref()
     }
 
     /// คืนสถานะ debug ของเซสชันปัจจุบัน
@@ -308,6 +325,25 @@ impl ApplicationController {
                 }
                 self.config.stt.window_ms = window_ms;
                 AppEvent::ConfigChanged("stt.window_ms")
+            }
+            AppCommand::SetSttModel(model) => {
+                if whisper_model(&model).is_none() {
+                    return AppEvent::Error(format!("Unsupported Whisper model: {model}"));
+                }
+                if self.config.stt.model != model || self.config.stt.model_path.is_some() {
+                    self.config.stt.model = model;
+                    self.config.stt.model_path = None;
+                    self.request_pipeline_restart_if_running();
+                }
+                AppEvent::ConfigChanged("stt.model")
+            }
+            AppCommand::DownloadSttModel(model) => {
+                if whisper_model(&model).is_none() {
+                    return AppEvent::Error(format!("Unsupported Whisper model: {model}"));
+                }
+                self.model_download_request = Some(model);
+                self.model_download_generation = self.model_download_generation.saturating_add(1);
+                AppEvent::SessionChanged
             }
             AppCommand::SetSttComputeBackend(backend) => {
                 if self.config.stt.backend != backend {

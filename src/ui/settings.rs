@@ -3,7 +3,6 @@
 use std::{
     cell::{Cell, RefCell},
     collections::VecDeque,
-    path::Path,
     rc::Rc,
     time::Duration,
 };
@@ -17,6 +16,7 @@ use crate::{
     config::{AppConfig, ComputeRequest, SUBTITLE_POSITIONS, SUBTITLE_TEXT_ALIGNMENTS},
     debug_log::DebugLogStatus,
     metrics::MetricsSnapshot,
+    model::{WHISPER_MODELS, WhisperModelStatus, whisper_model},
     overlay::{
         DesktopBackendInfo, DesktopSession, DisplayBackend, OverlayClientStatus,
         OverlayMonitorInfo, OverlayRuntimeBackend,
@@ -54,7 +54,8 @@ pub struct SettingsPresenter {
     /// label สถานะและข้อมูล diagnostics ที่ runtime อัปเดตเป็นระยะ
     status_label: gtk::Label,
     error_label: gtk::Label,
-    model_path_label: gtk::Label,
+    /// ตัวเลือก model พร้อมสถานะไฟล์และปุ่มดาวน์โหลด
+    model_selector: ModelSelector,
     /// สถานะการเชื่อมต่อ audio backend ที่แสดงในหน้า About
     audio_source_status_label: gtk::Label,
     /// Backend ของ helper ที่อัปเดตตาม lifecycle จริง
@@ -100,7 +101,8 @@ impl SettingsPresenter {
         let snapshot = UiSnapshot::from_controller(&controller.borrow());
         let status_label = value_label(&snapshot.status);
         let error_label = value_label("None");
-        let model_path_label = value_label("Not configured");
+        let performance_model_label = value_label(&snapshot.model);
+        let about_model_label = value_label(&snapshot.model);
         let audio_buffer_label = value_label("Not available");
         let whisper_label = value_label("Not available");
         let end_to_end_label = value_label("Not available");
@@ -159,15 +161,16 @@ impl SettingsPresenter {
             &applications_group,
             Rc::clone(&controller),
         ));
-        window.add(&speech_recognition_page(
+        let (speech_recognition, model_selector) = speech_recognition_page(
             &snapshot,
-            &model_path_label,
             Rc::clone(&controller),
+            vec![performance_model_label.clone(), about_model_label.clone()],
             vec![
                 performance_compute_label.clone(),
                 about_compute_label.clone(),
             ],
-        ));
+        );
+        window.add(&speech_recognition);
         let (subtitle_page, monitor_selector) = subtitle_page(&snapshot, Rc::clone(&controller));
         window.add(&subtitle_page);
         window.add(&performance_page(
@@ -178,6 +181,7 @@ impl SettingsPresenter {
             &whisper_label,
             &end_to_end_label,
             &dropped_frames_label,
+            &performance_model_label,
             &performance_compute_label,
         ));
         let (debug_page, debug_panel) = debug_page(Rc::clone(&controller));
@@ -186,6 +190,7 @@ impl SettingsPresenter {
             &snapshot,
             backend_info,
             &audio_source_status_label,
+            &about_model_label,
             &about_compute_label,
             &subtitle_backend_label,
             &xwayland_available_label,
@@ -218,7 +223,7 @@ impl SettingsPresenter {
             live_switch,
             status_label,
             error_label,
-            model_path_label,
+            model_selector,
             audio_source_status_label,
             subtitle_backend_label,
             xwayland_available_label,
@@ -275,15 +280,9 @@ impl SettingsPresenter {
         ));
     }
 
-    /// แสดง path โมเดลและผลการตรวจว่ามีไฟล์อยู่จริงหรือไม่
-    pub fn update_model_status(&self, path: &Path, exists: bool) {
-        let status = if exists {
-            "Ready"
-        } else {
-            "Missing; run make model"
-        };
-        self.model_path_label
-            .set_label(&format!("{} ({status})", path.display()));
+    /// แสดง path สถานะติดตั้ง และสถานะดาวน์โหลดของ model ที่เลือก
+    pub fn update_model_status(&self, status: &WhisperModelStatus) {
+        self.model_selector.update(status);
     }
 
     /// แสดงสถานะ audio backend ล่าสุดในหน้า About
@@ -595,20 +594,192 @@ fn audio_sources_page(
     page
 }
 
-/// สร้างหน้าข้อมูลโมเดลและตัวควบคุมการส่งเสียงแบบ streaming
+#[derive(Clone)]
+/// widget และ state สำหรับเลือก ติดตั้ง และติดตาม Whisper model
+struct ModelSelector {
+    dropdown: gtk::DropDown,
+    download_button: gtk::Button,
+    path_label: gtk::Label,
+    model_ids: Rc<Vec<String>>,
+    updating: Rc<Cell<bool>>,
+    controller: Rc<RefCell<ApplicationController>>,
+    linked_labels: Vec<gtk::Label>,
+}
+
+impl ModelSelector {
+    /// สร้างแถวเลือก model และแถวสถานะไฟล์พร้อมปุ่มดาวน์โหลด
+    fn new(
+        snapshot: &UiSnapshot,
+        controller: Rc<RefCell<ApplicationController>>,
+        linked_labels: Vec<gtk::Label>,
+    ) -> (adw::ActionRow, adw::ActionRow, Self) {
+        let mut model_ids = WHISPER_MODELS
+            .iter()
+            .map(|model| model.id.to_owned())
+            .collect::<Vec<_>>();
+        if !model_ids.contains(&snapshot.model) {
+            model_ids.push(snapshot.model.clone());
+        }
+        let labels = model_ids
+            .iter()
+            .map(|model_id| {
+                whisper_model(model_id).map_or_else(
+                    || format!("{model_id} (custom)"),
+                    |model| format!("{} ({})", model.id, model.size_label),
+                )
+            })
+            .collect::<Vec<_>>();
+        let label_refs = labels.iter().map(String::as_str).collect::<Vec<_>>();
+        let dropdown = gtk::DropDown::from_strings(&label_refs);
+        let selected = model_ids
+            .iter()
+            .position(|model_id| model_id == &snapshot.model)
+            .unwrap_or(0) as u32;
+        dropdown.set_selected(selected);
+        dropdown.set_valign(gtk::Align::Center);
+        let model_row = adw::ActionRow::builder()
+            .activatable_widget(&dropdown)
+            .subtitle(
+                "Larger models may improve accuracy but require more memory and inference time",
+            )
+            .title("Model")
+            .build();
+        model_row.add_suffix(&dropdown);
+
+        let path_label = value_label("Checking model file");
+        let download_button = gtk::Button::builder()
+            .label("Download")
+            .sensitive(false)
+            .valign(gtk::Align::Center)
+            .build();
+        let file_row = adw::ActionRow::builder().title("Model File").build();
+        file_row.add_suffix(&path_label);
+        file_row.add_suffix(&download_button);
+
+        let selector = Self {
+            dropdown,
+            download_button,
+            path_label,
+            model_ids: Rc::new(model_ids),
+            updating: Rc::new(Cell::new(false)),
+            controller,
+            linked_labels,
+        };
+        let selection_selector = selector.clone();
+        selector.dropdown.connect_selected_notify(move |dropdown| {
+            if selection_selector.updating.get() {
+                return;
+            }
+            let Some(model_id) = selection_selector
+                .model_ids
+                .get(dropdown.selected() as usize)
+                .cloned()
+            else {
+                return;
+            };
+            if whisper_model(&model_id).is_none() {
+                return;
+            }
+            let _ = selection_selector
+                .controller
+                .borrow_mut()
+                .handle_command(AppCommand::SetSttModel(model_id.clone()));
+            for label in &selection_selector.linked_labels {
+                label.set_label(&model_id);
+            }
+            selection_selector
+                .path_label
+                .set_label("Checking model file");
+            selection_selector.download_button.set_sensitive(false);
+        });
+        let download_selector = selector.clone();
+        selector.download_button.connect_clicked(move |_| {
+            let model_id = download_selector
+                .controller
+                .borrow()
+                .config()
+                .stt
+                .model
+                .clone();
+            let _ = download_selector
+                .controller
+                .borrow_mut()
+                .handle_command(AppCommand::DownloadSttModel(model_id));
+            download_selector.download_button.set_label("Starting…");
+            download_selector.download_button.set_sensitive(false);
+        });
+        (model_row, file_row, selector)
+    }
+
+    /// Sync model ที่เลือก path และปุ่มดาวน์โหลดจากสถานะของ runtime
+    fn update(&self, status: &WhisperModelStatus) {
+        self.updating.set(true);
+        if let Some(position) = self
+            .model_ids
+            .iter()
+            .position(|model_id| model_id == &status.selected_model)
+        {
+            self.dropdown.set_selected(position as u32);
+        }
+        self.updating.set(false);
+        for label in &self.linked_labels {
+            label.set_label(&status.selected_model);
+        }
+
+        let status_text = if let Some(active) = &status.downloading_model {
+            if active == &status.selected_model {
+                let size = whisper_model(active)
+                    .map(|model| model.size_label)
+                    .unwrap_or("unknown size");
+                format!("Downloading {active} ({size})")
+            } else {
+                format!("Downloading {active}; selected model is waiting")
+            }
+        } else if status.installed {
+            "Ready".to_owned()
+        } else if let Some(error) = &status.download_error {
+            format!("Download failed: {error}")
+        } else {
+            "Not installed".to_owned()
+        };
+        self.path_label.set_label(&format!(
+            "{} ({status_text})",
+            status.selected_path.display()
+        ));
+
+        let supported = whisper_model(&status.selected_model).is_some();
+        if status.downloading_model.is_some() {
+            self.download_button.set_label("Downloading…");
+            self.download_button.set_sensitive(false);
+        } else if status.installed {
+            self.download_button.set_label("Installed");
+            self.download_button.set_sensitive(false);
+        } else if status.download_error.is_some() && supported {
+            self.download_button.set_label("Retry");
+            self.download_button.set_sensitive(true);
+        } else {
+            self.download_button.set_label("Download");
+            self.download_button.set_sensitive(supported);
+        }
+    }
+}
+
+/// สร้างหน้าข้อมูล model และตัวควบคุมการส่งเสียงแบบ streaming
 fn speech_recognition_page(
     snapshot: &UiSnapshot,
-    model_path_label: &gtk::Label,
     controller: Rc<RefCell<ApplicationController>>,
+    model_labels: Vec<gtk::Label>,
     compute_request_labels: Vec<gtk::Label>,
-) -> adw::PreferencesPage {
+) -> (adw::PreferencesPage, ModelSelector) {
     let page = preferences_page("Speech Recognition", "audio-input-microphone-symbolic");
     let recognition_group = adw::PreferencesGroup::builder()
         .title("Recognition")
         .build();
     recognition_group.add(&value_row("Language", &snapshot.language));
-    recognition_group.add(&value_row("Model", &snapshot.model));
-    recognition_group.add(&value_row_with_label("Model File", model_path_label));
+    let (model_row, model_file_row, model_selector) =
+        ModelSelector::new(snapshot, Rc::clone(&controller), model_labels);
+    recognition_group.add(&model_row);
+    recognition_group.add(&model_file_row);
     recognition_group.add(&compute_backend_row(
         snapshot,
         Rc::clone(&controller),
@@ -667,7 +838,7 @@ fn speech_recognition_page(
     });
     streaming_group.add(&vad_row);
     page.add(&streaming_group);
-    page
+    (page, model_selector)
 }
 
 /// สร้างหน้าปรับ overlay และส่งทุกการเปลี่ยนผ่าน controller
@@ -896,13 +1067,14 @@ fn performance_page(
     whisper_label: &gtk::Label,
     end_to_end_label: &gtk::Label,
     dropped_frames_label: &gtk::Label,
+    model_label: &gtk::Label,
     compute_request_label: &gtk::Label,
 ) -> adw::PreferencesPage {
     let page = preferences_page("Performance", "utilities-system-monitor-symbolic");
     let status_group = adw::PreferencesGroup::builder().title("Pipeline").build();
     status_group.add(&value_row_with_label("Status", status_label));
     status_group.add(&value_row_with_label("Last Error", error_label));
-    status_group.add(&value_row("Model", &snapshot.model));
+    status_group.add(&value_row_with_label("Model", model_label));
     status_group.add(&value_row_with_label(
         "Requested Backend",
         compute_request_label,
@@ -1180,6 +1352,7 @@ fn about_page(
     snapshot: &UiSnapshot,
     backend_info: DesktopBackendInfo,
     audio_source_status_label: &gtk::Label,
+    model_label: &gtk::Label,
     compute_request_label: &gtk::Label,
     subtitle_backend_label: &gtk::Label,
     xwayland_available_label: &gtk::Label,
@@ -1220,7 +1393,7 @@ fn about_page(
     let recognition_group = adw::PreferencesGroup::builder()
         .title("Speech Recognition")
         .build();
-    recognition_group.add(&value_row("Model", &snapshot.model));
+    recognition_group.add(&value_row_with_label("Model", model_label));
     recognition_group.add(&value_row_with_label(
         "Requested Backend",
         compute_request_label,

@@ -186,16 +186,8 @@ fn main() -> Result<(), AppError> {
         );
     }
     loaded.config.stt.backend = selected_compute_request;
-    let default_model_path = config::default_model_path()?;
+    let models_directory = config::default_model_directory()?;
     let controller = Rc::new(RefCell::new(ApplicationController::new(loaded.config)));
-    let model_path = controller
-        .borrow()
-        .config()
-        .stt
-        .model_path
-        .clone()
-        .unwrap_or_else(|| default_model_path.clone());
-    let model_ready = model_path.is_file();
     let runtime = Rc::new(RefCell::new(None::<ApplicationRuntime>));
     let desktop_session = DesktopSession::detect();
     let overlay_backend = OverlayRuntimeBackend::detect(desktop_session);
@@ -247,8 +239,7 @@ fn main() -> Result<(), AppError> {
             *startup_runtime.borrow_mut() = Some(ApplicationRuntime::new(
                 Rc::clone(&startup_controller),
                 startup_config_path.clone(),
-                default_model_path.clone(),
-                model_ready,
+                models_directory.clone(),
                 persistence_enabled,
                 startup_warning.clone(),
             ));
@@ -283,14 +274,14 @@ fn main() -> Result<(), AppError> {
                 OverlayRuntimeBackend::Unavailable => DesktopOverlay::Unavailable,
             };
 
-            let (model_path, model_exists) = {
+            let model_status = {
                 let runtime = activate_runtime.borrow();
                 let runtime = runtime
                     .as_ref()
                     .expect("primary application runtime was not initialized");
-                (runtime.model_path(), runtime.model_exists())
+                runtime.model_status()
             };
-            settings.update_model_status(&model_path, model_exists);
+            settings.update_model_status(&model_status);
             *activate_desktop.borrow_mut() = Some(DesktopUi { settings, overlay });
 
             install_runtime_poll(
@@ -381,6 +372,9 @@ fn install_runtime_poll(
             }
             if let Some(counts) = update.debug_drop_counts.as_ref() {
                 desktop.settings.update_debug_drop_counts(counts);
+            }
+            if let Some(status) = update.model_status.as_ref() {
+                desktop.settings.update_model_status(status);
             }
             let overlay_events = desktop.overlay.poll_events();
             for event in &overlay_events {

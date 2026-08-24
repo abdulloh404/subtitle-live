@@ -19,6 +19,10 @@ pub enum AppCommand {
     SetSttStepMs(u32),
     /// เปลี่ยนความยาวเสียงย้อนหลังที่ส่งเป็นบริบทให้ Whisper
     SetSttWindowMs(u32),
+    /// เปลี่ยน Whisper model และโหลด session ใหม่เมื่อ pipeline ทำงานอยู่
+    SetSttModel(String),
+    /// ขอให้ runtime ดาวน์โหลด Whisper model บน worker thread
+    DownloadSttModel(String),
     /// เปลี่ยน compute backend และโหลด Whisper session ใหม่เมื่อ pipeline ทำงานอยู่
     SetSttComputeBackend(ComputeRequest),
     /// เปิดหรือปิดตัวกรองเสียงพลังงานต่ำก่อนเรียก Whisper
