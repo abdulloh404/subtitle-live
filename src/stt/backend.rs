@@ -10,16 +10,16 @@ compile_error!("features `cuda` and `rocm` are mutually exclusive; enable only o
 // compute backend ที่ใช้งานจริงสำหรับ Whisper session ภายในเครื่อง
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ComputeBackend {
-    // ใช้ CPU สำหรับ inference
+    /// ใช้ CPU สำหรับ inference
     Cpu,
-    // ใช้ NVIDIA CUDA สำหรับ inference
+    /// ใช้ NVIDIA CUDA สำหรับ inference
     Cuda,
-    // ใช้ AMD ROCm/HIP สำหรับ inference
+    /// ใช้ AMD ROCm/HIP สำหรับ inference
     Rocm,
 }
 
 impl ComputeBackend {
-    // label ที่อ่านเข้าใจง่ายสำหรับหน้า Settings และส่วนแสดงสถานะ
+    /// label ที่อ่านเข้าใจง่ายสำหรับหน้า Settings และส่วนแสดงสถานะ
     pub const fn display_name(self) -> &'static str {
         match self {
             Self::Cpu => "CPU",
@@ -28,7 +28,7 @@ impl ComputeBackend {
         }
     }
 
-    // ระบุว่า Whisper context ต้องร้องขอให้ประมวลผลด้วย GPU หรือไม่
+    /// ระบุว่า Whisper context ต้องร้องขอให้ประมวลผลด้วย GPU หรือไม่
     pub const fn uses_gpu(self) -> bool {
         !matches!(self, Self::Cpu)
     }

@@ -8,17 +8,17 @@ use serde::{Deserialize, Deserializer, Serialize, de};
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ComputeRequest {
-    // ใช้ CPU สำหรับ inference แม้ binary จะรองรับ GPU แล้วก็ตาม
+    /// ใช้ CPU สำหรับ inference แม้ binary จะรองรับ GPU แล้วก็ตาม
     #[default]
     Cpu,
-    // ใช้ NVIDIA CUDA สำหรับ inference
+    /// ใช้ NVIDIA CUDA สำหรับ inference
     Cuda,
-    // ใช้ AMD ROCm/HIP สำหรับ inference
+    /// ใช้ AMD ROCm/HIP สำหรับ inference
     Rocm,
 }
 
 impl ComputeRequest {
-    // คืนค่าคงที่สำหรับบันทึกในไฟล์ config
+    /// คืนค่าคงที่สำหรับบันทึกในไฟล์ config
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Cpu => "cpu",
@@ -27,7 +27,7 @@ impl ComputeRequest {
         }
     }
 
-    // label ที่อ่านเข้าใจง่ายสำหรับหน้า Settings และส่วนแสดงสถานะ
+    /// label ที่อ่านเข้าใจง่ายสำหรับหน้า Settings และส่วนแสดงสถานะ
     pub const fn display_name(self) -> &'static str {
         match self {
             Self::Cpu => "CPU",

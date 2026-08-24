@@ -79,61 +79,61 @@ pub struct SubtitleFrame {
 
 /// เจ้าของ lifecycle ของบริการเสียง, STT, tray, config และสถานะ transcript
 pub struct ApplicationRuntime {
-    // Controller อยู่บน GTK thread และเป็นแหล่งสถานะ/config กลางของ UI
+    /// Controller อยู่บน GTK thread และเป็นแหล่งสถานะ/config กลางของ UI
     controller: Rc<RefCell<ApplicationController>>,
-    // คิวทั้งสองเป็นคิวแบบเก็บข้อมูลล่าสุด เพื่อรักษา latency เมื่อ producer เร็วกว่า consumer
+    /// คิวทั้งสองเป็นคิวแบบเก็บข้อมูลล่าสุด เพื่อรักษา latency เมื่อ producer เร็วกว่า consumer
     source_audio: LatestQueue<SourceAudioChunk>,
     mixed_audio: LatestQueue<MixedAudioChunk>,
-    // Handle ของ worker/service ใช้ส่งคำสั่งเท่านั้น งานหนักไม่เกิดบน GTK thread
+    /// Handle ของ worker/service ใช้ส่งคำสั่งเท่านั้น งานหนักไม่เกิดบน GTK thread
     mixer: MixerHandle,
     audio_source: AudioSourceService,
-    // Service รุ่นเก่าจาก Retry ถูกสั่งปิดแล้วและรอ join หลัง GTK event loop จบ
+    /// Service รุ่นเก่าจาก Retry ถูกสั่งปิดแล้วและรอ join หลัง GTK event loop จบ
     retired_audio_sources: Vec<AudioSourceService>,
     stt: SttService,
-    // Tray เป็น optional เพราะบาง desktop ไม่มี StatusNotifier host
+    /// Tray เป็น optional เพราะบาง desktop ไม่มี StatusNotifier host
     tray: Option<TrayIndicator>,
     tray_commands: Option<Receiver<TrayCommand>>,
-    // Writer บันทึก config บน thread แยกเพื่อไม่บล็อก UI
+    /// Writer บันทึก config บน thread แยกเพื่อไม่บล็อก UI
     config_writer: Option<ConfigWriter>,
-    // Writer debug แยก thread และไม่สร้างไฟล์จนกว่าผู้ใช้เปิดในเซสชันนี้
+    /// Writer debug แยก thread และไม่สร้างไฟล์จนกว่าผู้ใช้เปิดในเซสชันนี้
     debug_log_writer: DebugLogWriter,
     default_model_path: PathBuf,
     model_ready: bool,
     last_persisted_config: AppConfig,
-    // เปรียบเทียบเป้าหมายที่ต้องการกับ capture ที่ audio backend ยืนยันว่าเริ่มแล้ว
+    /// เปรียบเทียบเป้าหมายที่ต้องการกับ capture ที่ audio backend ยืนยันว่าเริ่มแล้ว
     applied_targets: Vec<CaptureTarget>,
     desired_capture_ids: HashSet<u32>,
     active_captures: HashSet<u32>,
     capture_errors: HashMap<u32, String>,
-    // ระหว่างเปลี่ยน capture จะหยุดรับ transcript จน STT ยืนยัน audio generation ใหม่
+    /// ระหว่างเปลี่ยน capture จะหยุดรับ transcript จน STT ยืนยัน audio generation ใหม่
     capture_transition_pending: bool,
-    // รุ่นเดียวที่ส่งผ่าน audio source, mixer และ STT เพื่อกันเสียงจาก transition เก่า
+    /// รุ่นเดียวที่ส่งผ่าน audio source, mixer และ STT เพื่อกันเสียงจาก transition เก่า
     pipeline_audio_generation: u64,
     stt_resume_generation: Option<u64>,
     accepted_audio_generation: Option<u64>,
-    // Reconciler ป้องกัน partial/final ซ้ำและรักษาคำที่ commit แล้ว
+    /// Reconciler ป้องกัน partial/final ซ้ำและรักษาคำที่ commit แล้ว
     transcript: TranscriptReconciler,
     last_subtitle_update: Option<Instant>,
     metrics: LatencyTracker,
-    // จับคู่ frame id ของ IPC กับต้นทางเสียง โดยเก็บจำนวนคงที่เพื่อรองรับ frame ที่ถูก coalesce
+    /// จับคู่ frame id ของ IPC กับต้นทางเสียง โดยเก็บจำนวนคงที่เพื่อรองรับ frame ที่ถูก coalesce
     pending_overlay_frames: VecDeque<(u64, i64)>,
     running_requested: bool,
     stt_ready: bool,
-    // เลขคำขอ retry ที่ runtime ประมวลผลแล้ว ป้องกันการเริ่มซ้ำในแต่ละรอบ poll
+    /// เลขคำขอ retry ที่ runtime ประมวลผลแล้ว ป้องกันการเริ่มซ้ำในแต่ละรอบ poll
     observed_retry_generation: u64,
-    // ใช้ข้าม Stopped ที่เกิดจากคำสั่งหยุดโดยตั้งใจก่อนเริ่ม retry เท่านั้น
+    /// ใช้ข้าม Stopped ที่เกิดจากคำสั่งหยุดโดยตั้งใจก่อนเริ่ม retry เท่านั้น
     retry_stop_pending: bool,
     pipeline_error: Option<String>,
-    // เป็น true หลัง registry ส่ง snapshot ครั้งแรก จึงไม่รายงาน Connected ก่อนเชื่อมจริง
+    /// เป็น true หลัง registry ส่ง snapshot ครั้งแรก จึงไม่รายงาน Connected ก่อนเชื่อมจริง
     audio_source_connected: bool,
     audio_source_error: Option<String>,
     startup_warning: Option<String>,
     last_tray_state: Option<TrayState>,
-    // ค่า streaming ล่าสุดที่ส่งให้ STT ใช้ตรวจว่าต้องอัปเดต worker หรือไม่
+    /// ค่า streaming ล่าสุดที่ส่งให้ STT ใช้ตรวจว่าต้องอัปเดต worker หรือไม่
     applied_stt_streaming: Option<SttStreamingConfig>,
-    // สถานะ debug ล่าสุดที่ runtime ส่งให้ STT และ file writer แล้ว
+    /// สถานะ debug ล่าสุดที่ runtime ส่งให้ STT และ file writer แล้ว
     applied_debug_session: DebugSessionState,
-    // snapshot ตัวนับ debug ที่ส่งให้ UI ล่าสุด เริ่มที่ศูนย์ทุกโปรเซส
+    /// snapshot ตัวนับ debug ที่ส่งให้ UI ล่าสุด เริ่มที่ศูนย์ทุกโปรเซส
     last_debug_drop_counts: DebugDropCounts,
     shutdown_requested: bool,
 }
