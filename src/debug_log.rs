@@ -3,8 +3,8 @@
 use std::{
     fs::{self, DirBuilder, File, OpenOptions, Permissions},
     io::{BufWriter, Write},
-    path::PathBuf,
     os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -207,17 +207,18 @@ fn open_output(path: &PathBuf) -> Result<File, String> {
     directory_builder.recursive(true).mode(0o700);
     directory_builder
         .create(parent)
-        .map_err(|error| format!("สร้าง directory debug log ไม่สำเร็จ: {error}"))?;
-    fs::set_permissions(parent, Permissions::from_mode(0o700))
-        .map_err(|error| format!("กำหนดสิทธิ์ directory debug log เป็น 0700 ไม่สำเร็จ: {error}"))?;
+        .map_err(|error| format!("failed to create debug log directory: {error}"))?;
+    fs::set_permissions(parent, Permissions::from_mode(0o700)).map_err(|error| {
+        format!("failed to set debug log directory permissions to 0700: {error}")
+    })?;
     let file = OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
         .open(path)
-        .map_err(|error| format!("เปิดไฟล์ debug log ไม่สำเร็จ: {error}"))?;
+        .map_err(|error| format!("failed to open debug log file: {error}"))?;
     file.set_permissions(Permissions::from_mode(0o600))
-        .map_err(|error| format!("กำหนดสิทธิ์ไฟล์ debug log เป็น 0600 ไม่สำเร็จ: {error}"))?;
+        .map_err(|error| format!("failed to set debug log file permissions to 0600: {error}"))?;
     Ok(file)
 }
 
@@ -228,14 +229,14 @@ fn write_pending(
     for record in records.drain() {
         let line = JsonRecord::from(&record);
         serde_json::to_writer(&mut *writer, &line)
-            .map_err(|error| format!("เขียน JSON debug log ไม่สำเร็จ: {error}"))?;
+            .map_err(|error| format!("failed to serialize a debug log record: {error}"))?;
         writer
             .write_all(b"\n")
-            .map_err(|error| format!("เขียนบรรทัด debug log ไม่สำเร็จ: {error}"))?;
+            .map_err(|error| format!("failed to write a debug log line: {error}"))?;
     }
     writer
         .flush()
-        .map_err(|error| format!("flush debug log ไม่สำเร็จ: {error}"))
+        .map_err(|error| format!("failed to flush the debug log: {error}"))
 }
 
 #[derive(Serialize)]

@@ -16,25 +16,28 @@ use x11rb::{
 const SCREEN_EDGE_GAP_PX: i64 = 32;
 
 /// ตรวจว่า GTK window นี้ถูกสร้างบน X11 backend
-pub(super) fn is_x11_window(window: &gtk::Window) -> bool {
+pub(in crate::overlay) fn is_x11_window(window: &gtk::Window) -> bool {
     window
         .surface()
         .is_some_and(|surface| surface.is::<X11Surface>())
 }
 
 /// กำหนด type, focus และ EWMH state เฉพาะ XID ของ subtitle overlay
-pub(super) fn configure_overlay_window(window: &gtk::Window, mapped: bool) -> Result<(), String> {
+pub(in crate::overlay) fn configure_overlay_window(
+    window: &gtk::Window,
+    mapped: bool,
+) -> Result<(), String> {
     let surface = window
         .surface()
-        .ok_or_else(|| "GTK overlay ยังไม่มี GDK surface".to_owned())?;
+        .ok_or_else(|| "the GTK overlay does not have a GDK surface yet".to_owned())?;
     let x11_surface = surface
         .downcast_ref::<X11Surface>()
-        .ok_or_else(|| "subtitle overlay ไม่ได้ใช้ X11 backend".to_owned())?;
-    let xid =
-        u32::try_from(x11_surface.xid()).map_err(|_| "X11 window id มีขนาดเกิน 32 บิต".to_owned())?;
+        .ok_or_else(|| "the subtitle overlay is not using the X11 backend".to_owned())?;
+    let xid = u32::try_from(x11_surface.xid())
+        .map_err(|_| "the X11 window ID exceeds 32 bits".to_owned())?;
 
-    let (connection, _) =
-        x11rb::connect(None).map_err(|error| format!("เชื่อมต่อ X11 display ไม่สำเร็จ: {error}"))?;
+    let (connection, _) = x11rb::connect(None)
+        .map_err(|error| format!("failed to connect to the X11 display: {error}"))?;
     let atoms = Atoms::load(&connection)?;
 
     if !mapped {
@@ -51,9 +54,9 @@ pub(super) fn configure_overlay_window(window: &gtk::Window, mapped: bool) -> Re
             AtomEnum::ATOM,
             &[atoms.net_wm_window_type_notification],
         )
-        .map_err(|error| format!("ส่งชนิดหน้าต่าง X11 ไม่สำเร็จ: {error}"))?
+        .map_err(|error| format!("failed to send the X11 window type: {error}"))?
         .check()
-        .map_err(|error| format!("ตั้งชนิดหน้าต่าง X11 ไม่สำเร็จ: {error}"))?;
+        .map_err(|error| format!("failed to set the X11 window type: {error}"))?;
 
     if !mapped {
         // เก็บ intent เดิมไว้ให้เครื่องมือตรวจสอบ แม้ override-redirect ไม่ถูก WM จัดการ
@@ -70,20 +73,20 @@ pub(super) fn configure_overlay_window(window: &gtk::Window, mapped: bool) -> Re
                     atoms.net_wm_state_skip_pager,
                 ],
             )
-            .map_err(|error| format!("ส่ง X11 window states ไม่สำเร็จ: {error}"))?
+            .map_err(|error| format!("failed to send the X11 window states: {error}"))?
             .check()
-            .map_err(|error| format!("ตั้ง X11 window states ไม่สำเร็จ: {error}"))?;
+            .map_err(|error| format!("failed to set the X11 window states: {error}"))?;
     } else {
         raise_overlay_window(&connection, xid)?;
     }
 
     connection
         .flush()
-        .map_err(|error| format!("flush คำสั่ง X11 ไม่สำเร็จ: {error}"))
+        .map_err(|error| format!("failed to flush X11 commands: {error}"))
 }
 
 /// ย้ายหน้าต่าง override-redirect ไปยัง work area โดยไม่ผ่าน window manager
-pub(super) fn move_overlay_window(
+pub(in crate::overlay) fn move_overlay_window(
     window: &gtk::Window,
     monitor_x: i32,
     monitor_y: i32,
@@ -96,26 +99,26 @@ pub(super) fn move_overlay_window(
     let monitor_width = u32::try_from(monitor_width)
         .ok()
         .filter(|width| *width > 0)
-        .ok_or_else(|| format!("ความกว้างจอไม่ถูกต้อง: {monitor_width}"))?;
+        .ok_or_else(|| format!("invalid monitor width: {monitor_width}"))?;
     let monitor_height = u32::try_from(monitor_height)
         .ok()
         .filter(|height| *height > 0)
-        .ok_or_else(|| format!("ความสูงจอไม่ถูกต้อง: {monitor_height}"))?;
+        .ok_or_else(|| format!("invalid monitor height: {monitor_height}"))?;
     let surface = window
         .surface()
-        .ok_or_else(|| "GTK overlay ยังไม่มี GDK surface".to_owned())?;
+        .ok_or_else(|| "the GTK overlay does not have a GDK surface yet".to_owned())?;
     let x11_surface = surface
         .downcast_ref::<X11Surface>()
-        .ok_or_else(|| "subtitle overlay ไม่ได้ใช้ X11 backend".to_owned())?;
-    let xid =
-        u32::try_from(x11_surface.xid()).map_err(|_| "X11 window id มีขนาดเกิน 32 บิต".to_owned())?;
-    let (connection, screen_index) =
-        x11rb::connect(None).map_err(|error| format!("เชื่อมต่อ X11 display ไม่สำเร็จ: {error}"))?;
+        .ok_or_else(|| "the subtitle overlay is not using the X11 backend".to_owned())?;
+    let xid = u32::try_from(x11_surface.xid())
+        .map_err(|_| "the X11 window ID exceeds 32 bits".to_owned())?;
+    let (connection, screen_index) = x11rb::connect(None)
+        .map_err(|error| format!("failed to connect to the X11 display: {error}"))?;
     let root = connection
         .setup()
         .roots
         .get(screen_index)
-        .ok_or_else(|| format!("ไม่พบ X11 screen index {screen_index}"))?
+        .ok_or_else(|| format!("X11 screen index {screen_index} was not found"))?
         .root;
     let atoms = Atoms::load(&connection)?;
     let monitor = (monitor_x, monitor_y, monitor_width, monitor_height);
@@ -149,12 +152,12 @@ pub(super) fn move_overlay_window(
                 .height(overlay_height)
                 .stack_mode(StackMode::ABOVE),
         )
-        .map_err(|error| format!("ส่งคำขอย้าย X11 overlay ไม่สำเร็จ: {error}"))?
+        .map_err(|error| format!("failed to send the X11 overlay move request: {error}"))?
         .check()
-        .map_err(|error| format!("ย้าย X11 overlay ไม่สำเร็จ: {error}"))?;
+        .map_err(|error| format!("failed to move the X11 overlay: {error}"))?;
     connection
         .flush()
-        .map_err(|error| format!("flush คำสั่งย้าย X11 overlay ไม่สำเร็จ: {error}"))
+        .map_err(|error| format!("failed to flush the X11 overlay move: {error}"))
 }
 
 /// คำนวณมุมของหน้าต่างขนาดจริงตามตำแหน่ง 9 จุดภายใน work area ที่เลือก
@@ -199,9 +202,9 @@ fn set_override_redirect<C: Connection>(connection: &C, window: Window) -> Resul
             window,
             &ChangeWindowAttributesAux::new().override_redirect(1_u32),
         )
-        .map_err(|error| format!("ส่งค่า X11 override-redirect ไม่สำเร็จ: {error}"))?
+        .map_err(|error| format!("failed to send the X11 override-redirect value: {error}"))?
         .check()
-        .map_err(|error| format!("ตั้ง X11 override-redirect ไม่สำเร็จ: {error}"))
+        .map_err(|error| format!("failed to set X11 override-redirect: {error}"))
 }
 
 /// ยก subtitle overlay ขึ้นบนสุดโดยไม่ activate หรือเปลี่ยน input focus
@@ -211,9 +214,9 @@ fn raise_overlay_window<C: Connection>(connection: &C, window: Window) -> Result
             window,
             &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
         )
-        .map_err(|error| format!("ส่งคำขอยก X11 overlay ไม่สำเร็จ: {error}"))?
+        .map_err(|error| format!("failed to send the X11 overlay raise request: {error}"))?
         .check()
-        .map_err(|error| format!("ยก X11 overlay ไม่สำเร็จ: {error}"))
+        .map_err(|error| format!("failed to raise the X11 overlay: {error}"))
 }
 
 /// อ่าน `_GTK_WORKAREAS_D<n>` ของ Mutter แล้วเลือกพื้นที่ที่ทับกับ monitor เป้าหมายมากที่สุด
@@ -283,16 +286,16 @@ fn intersect_rectangles(
 /// ปิด ICCCM input hint โดยรักษา hint อื่นที่ GTK ใส่มาแล้ว
 fn set_input_focus_disabled<C: Connection>(connection: &C, window: Window) -> Result<(), String> {
     let mut hints = WmHints::get(connection, window)
-        .map_err(|error| format!("ส่งคำขออ่าน WM_HINTS ไม่สำเร็จ: {error}"))?
+        .map_err(|error| format!("failed to request WM_HINTS: {error}"))?
         .reply()
-        .map_err(|error| format!("อ่าน WM_HINTS ไม่สำเร็จ: {error}"))?
+        .map_err(|error| format!("failed to read WM_HINTS: {error}"))?
         .unwrap_or_default();
     hints.input = Some(false);
     hints
         .set(connection, window)
-        .map_err(|error| format!("ส่ง WM_HINTS ไม่รับ focus ไม่สำเร็จ: {error}"))?
+        .map_err(|error| format!("failed to send non-focusable WM_HINTS: {error}"))?
         .check()
-        .map_err(|error| format!("ตั้ง WM_HINTS ไม่รับ focus ไม่สำเร็จ: {error}"))
+        .map_err(|error| format!("failed to set non-focusable WM_HINTS: {error}"))
 }
 
 /// ป้องกัน window manager มองการ map overlay ว่าเป็น user action แล้วแย่ง active window
@@ -304,14 +307,16 @@ fn set_focus_activation_disabled<C: Connection>(
     // บังคับให้ Mutter อ่านเวลาจาก toplevel นี้แทน GDK user-time window ที่อาจมีค่าเก่า
     connection
         .delete_property(window, atoms.net_wm_user_time_window)
-        .map_err(|error| format!("ส่งคำขอล้าง X11 user-time window ไม่สำเร็จ: {error}"))?
+        .map_err(|error| {
+            format!("failed to request deletion of the X11 user-time window: {error}")
+        })?
         .check()
-        .map_err(|error| format!("ล้าง X11 user-time window ไม่สำเร็จ: {error}"))?;
+        .map_err(|error| format!("failed to delete the X11 user-time window: {error}"))?;
     connection
         .delete_property(window, atoms.net_startup_id)
-        .map_err(|error| format!("ส่งคำขอล้าง X11 startup id ไม่สำเร็จ: {error}"))?
+        .map_err(|error| format!("failed to request deletion of the X11 startup ID: {error}"))?
         .check()
-        .map_err(|error| format!("ล้าง X11 startup id ไม่สำเร็จ: {error}"))?;
+        .map_err(|error| format!("failed to delete the X11 startup ID: {error}"))?;
     // EWMH กำหนดค่า 0 เพื่อขอไม่ให้หน้าต่างใหม่รับ focus ตอน map
     connection
         .change_property32(
@@ -321,9 +326,9 @@ fn set_focus_activation_disabled<C: Connection>(
             AtomEnum::CARDINAL,
             &[0],
         )
-        .map_err(|error| format!("ส่ง X11 user time แบบไม่รับ focus ไม่สำเร็จ: {error}"))?
+        .map_err(|error| format!("failed to send the non-focusable X11 user time: {error}"))?
         .check()
-        .map_err(|error| format!("ตั้ง X11 user time แบบไม่รับ focus ไม่สำเร็จ: {error}"))
+        .map_err(|error| format!("failed to set the non-focusable X11 user time: {error}"))
 }
 
 /// ทำให้ ICCCM input model เป็น No Input โดยไม่ลบ protocol ปิดหน้าต่างหรือ ping ของ GTK
@@ -341,9 +346,9 @@ fn remove_take_focus_protocol<C: Connection>(
             0,
             u32::MAX,
         )
-        .map_err(|error| format!("ส่งคำขออ่าน WM_PROTOCOLS ไม่สำเร็จ: {error}"))?
+        .map_err(|error| format!("failed to request WM_PROTOCOLS: {error}"))?
         .reply()
-        .map_err(|error| format!("อ่าน WM_PROTOCOLS ไม่สำเร็จ: {error}"))?;
+        .map_err(|error| format!("failed to read WM_PROTOCOLS: {error}"))?;
     let Some(protocols) = reply.value32() else {
         return Ok(());
     };
@@ -358,9 +363,9 @@ fn remove_take_focus_protocol<C: Connection>(
             AtomEnum::ATOM,
             &protocols,
         )
-        .map_err(|error| format!("ส่ง WM_PROTOCOLS แบบไม่รับ focus ไม่สำเร็จ: {error}"))?
+        .map_err(|error| format!("failed to send non-focusable WM_PROTOCOLS: {error}"))?
         .check()
-        .map_err(|error| format!("ตั้ง WM_PROTOCOLS แบบไม่รับ focus ไม่สำเร็จ: {error}"))
+        .map_err(|error| format!("failed to set non-focusable WM_PROTOCOLS: {error}"))
 }
 
 /// Atom ที่ใช้กำหนด type, layer, workspace และรายการหน้าต่าง
@@ -408,8 +413,8 @@ impl Atoms {
 fn intern_atom<C: Connection>(connection: &C, name: &[u8]) -> Result<Atom, String> {
     connection
         .intern_atom(false, name)
-        .map_err(|error| format!("ส่งคำขอ X11 atom ไม่สำเร็จ: {error}"))?
+        .map_err(|error| format!("failed to request an X11 atom: {error}"))?
         .reply()
         .map(|reply| reply.atom)
-        .map_err(|error| format!("อ่านค่า X11 atom ไม่สำเร็จ: {error}"))
+        .map_err(|error| format!("failed to read an X11 atom: {error}"))
 }

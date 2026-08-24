@@ -1,39 +1,22 @@
 #!/usr/bin/env bash
 
-# ใช้ไฟล์นี้ด้วย `source scripts/dev-env.sh` เฉพาะเครื่องพัฒนาที่ต้องกำหนด
-# ตำแหน่ง ROCm, libclang และ GCC toolchain ให้ hipcc เพิ่มเติม
+# ใช้ไฟล์นี้ด้วย `source scripts/dev-env.sh` เพื่อกำหนดค่า build ทั่วไป
 if [ -n "${BASH_VERSION:-}" ]; then
   if [ "${BASH_SOURCE[0]}" = "$0" ]; then
-    echo "กรุณารัน: source scripts/dev-env.sh" >&2
+    echo "Run this script with: source scripts/dev-env.sh" >&2
     exit 1
   fi
 elif [ -n "${ZSH_VERSION:-}" ]; then
   case "${ZSH_EVAL_CONTEXT:-}" in
     *:file) ;;
     *)
-      echo "กรุณารัน: source scripts/dev-env.sh" >&2
+      echo "Run this script with: source scripts/dev-env.sh" >&2
       exit 1
       ;;
   esac
 fi
 
-subtitle_live_rocm_core="${SUBTITLE_LIVE_ROCM_CORE:-/opt/rocm/core}"
-subtitle_live_hip_gcc_dir="${SUBTITLE_LIVE_HIP_GCC_DIR:-/usr/lib/gcc/x86_64-linux-gnu/11}"
-
-case ":${CMAKE_PREFIX_PATH:-}:" in
-  *":${subtitle_live_rocm_core}:"*) ;;
-  *) export CMAKE_PREFIX_PATH="${subtitle_live_rocm_core}${CMAKE_PREFIX_PATH:+:${CMAKE_PREFIX_PATH}}" ;;
-esac
-
-subtitle_live_hip_gcc_flag="--gcc-install-dir=${subtitle_live_hip_gcc_dir}"
-case " ${HIPCC_COMPILE_FLAGS_APPEND:-} " in
-  *" --gcc-install-dir="*) ;;
-  *) export HIPCC_COMPILE_FLAGS_APPEND="${HIPCC_COMPILE_FLAGS_APPEND:+${HIPCC_COMPILE_FLAGS_APPEND} }${subtitle_live_hip_gcc_flag}" ;;
-esac
-case " ${HIPCC_LINK_FLAGS_APPEND:-} " in
-  *" --gcc-install-dir="*) ;;
-  *) export HIPCC_LINK_FLAGS_APPEND="${HIPCC_LINK_FLAGS_APPEND:+${HIPCC_LINK_FLAGS_APPEND} }${subtitle_live_hip_gcc_flag}" ;;
-esac
-export LIBCLANG_PATH="${LIBCLANG_PATH:-${SUBTITLE_LIVE_LIBCLANG_PATH:-${subtitle_live_rocm_core}/llvm/lib}}"
-
-unset subtitle_live_rocm_core subtitle_live_hip_gcc_dir subtitle_live_hip_gcc_flag
+# ปล่อยให้ bindgen ค้นหา libclang ของระบบ เว้นแต่ผู้ใช้กำหนด path อย่างชัดเจน
+if [ -n "${SUBTITLE_LIVE_LIBCLANG_PATH:-}" ]; then
+  export LIBCLANG_PATH="${LIBCLANG_PATH:-${SUBTITLE_LIVE_LIBCLANG_PATH}}"
+fi

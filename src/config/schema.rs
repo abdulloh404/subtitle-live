@@ -4,6 +4,10 @@ use std::{error::Error, fmt, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::audio_source::AudioSourceBackend;
+
+use super::ComputeRequest;
+
 /// เวอร์ชัน schema ที่โปรแกรมรุ่นนี้อ่านและเขียนได้
 pub const CURRENT_CONFIG_VERSION: u32 = 1;
 /// ตำแหน่ง anchor ของ overlay ที่ UI และ controller รองรับ
@@ -95,12 +99,6 @@ impl AppConfig {
             return Err(ConfigValidationError::new(
                 "stt.model_path",
                 "must not be empty when configured",
-            ));
-        }
-        if self.stt.backend.trim().is_empty() {
-            return Err(ConfigValidationError::new(
-                "stt.backend",
-                "must not be empty",
             ));
         }
         if self.stt.step_ms == 0 {
@@ -231,6 +229,8 @@ impl Default for GeneralConfig {
 #[serde(default)]
 /// รูปแบบเสียงกลางและกฎเลือก application/stream
 pub struct AudioConfig {
+    /// backend ที่ใช้ค้นหาและจับเสียง โดย PipeWire เป็นค่าเริ่มต้น
+    pub backend: AudioSourceBackend,
     /// โหมดการจับเสียง ซึ่ง Phase 1 อนุญาตเฉพาะ `selected`
     pub capture_mode: String,
     /// sample rate ที่ส่งเข้า Whisper
@@ -244,6 +244,7 @@ pub struct AudioConfig {
 impl Default for AudioConfig {
     fn default() -> Self {
         Self {
+            backend: AudioSourceBackend::PipeWire,
             capture_mode: "selected".to_owned(),
             target_sample_rate: 16_000,
             target_channels: 1,
@@ -290,8 +291,8 @@ pub struct SttConfig {
     pub model: String,
     /// path โมเดลแบบกำหนดเอง หรือ `None` เพื่อใช้ตำแหน่งมาตรฐาน
     pub model_path: Option<PathBuf>,
-    /// backend ประมวลผลที่ร้องขอ เช่น `auto`
-    pub backend: String,
+    /// backend ประมวลผลที่ร้องขอสำหรับ Whisper
+    pub backend: ComputeRequest,
     /// ระยะห่างระหว่างผลถอดเสียงชั่วคราวระหว่างที่กำลังพูด
     pub step_ms: u32,
     /// ความยาวเสียงย้อนหลังสูงสุดที่ใช้เป็น context
@@ -306,7 +307,7 @@ impl Default for SttConfig {
             language: "en".to_owned(),
             model: "small.en".to_owned(),
             model_path: None,
-            backend: "auto".to_owned(),
+            backend: ComputeRequest::Cpu,
             step_ms: 450,
             window_ms: 3_000,
             vad_enabled: true,
@@ -375,12 +376,29 @@ fn has_text(value: &Option<String>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::SubtitleConfig;
+    use super::{AudioConfig, SttConfig, SubtitleConfig};
+    use crate::{audio_source::AudioSourceBackend, config::ComputeRequest};
+
+    #[test]
+    fn legacy_audio_config_defaults_to_pipewire() {
+        let config: AudioConfig = serde_json::from_str(r#"{"capture_mode":"selected"}"#)
+            .expect("legacy audio config should be readable");
+
+        assert_eq!(config.backend, AudioSourceBackend::PipeWire);
+    }
+
+    #[test]
+    fn legacy_auto_backend_migrates_to_cpu() {
+        let config: SttConfig = serde_json::from_str(r#"{"backend":"auto"}"#)
+            .expect("legacy STT config should be readable");
+
+        assert_eq!(config.backend, ComputeRequest::Cpu);
+    }
 
     #[test]
     fn subtitle_config_without_monitor_id_uses_automatic_display() {
         let config: SubtitleConfig =
-            serde_json::from_str(r#"{"visible":false}"#).expect("config รุ่นเก่าต้องอ่านได้");
+            serde_json::from_str(r#"{"visible":false}"#).expect("legacy config should be readable");
 
         assert!(config.monitor_id.is_empty());
     }

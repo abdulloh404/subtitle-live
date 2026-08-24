@@ -1,20 +1,20 @@
-//! ชนิดข้อมูลกลางสำหรับแยกตัวตน application, กฎการเลือก และ PipeWire event
+//! โมดูลนี้กำหนด audio source identity, selection rule และ runtime event โดยไม่ขึ้นกับ backend
 
 use serde::{Deserialize, Serialize};
 
-/// metadata ของ application ที่ค่อนข้างคงที่ เรียงจากตัวตนที่แข็งแรงไปอ่อนที่สุด
+/// application metadata คงที่ที่เรียงตามความน่าเชื่อถือของ identity จากมากไปน้อย
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ApplicationIdentity {
-    /// ID ที่ application ประกาศ เช่น desktop application ID
+    /// desktop application ID ที่ source รายงาน หากมี
     pub application_id: Option<String>,
-    /// ชื่อ binary ของ process ใช้เมื่อไม่มี application ID
+    /// process binary ที่ใช้เมื่อไม่มี application ID
     pub process_binary: Option<String>,
-    /// ชื่อสำหรับแสดงผลและเป็น fallback ลำดับสุดท้าย
+    /// ชื่อ application ที่อ่านง่าย และใช้เป็น identity fallback ลำดับสุดท้าย
     pub application_name: Option<String>,
 }
 
 impl ApplicationIdentity {
-    /// เลือก key ที่แข็งแรงที่สุดซึ่งสามารถเก็บข้ามการเปิด application ใหม่ได้
+    /// คืน identity ที่เหมาะสำหรับ persistence ข้าม session มากที่สุด
     pub fn stable_key(&self) -> Option<ApplicationKey> {
         if let Some(value) = non_empty(&self.application_id) {
             return Some(ApplicationKey::ApplicationId(value.to_owned()));
@@ -26,7 +26,7 @@ impl ApplicationIdentity {
             .map(|value| ApplicationKey::ApplicationName(value.to_owned()))
     }
 
-    /// เลือกชื่อที่เหมาะสำหรับ UI จาก metadata ที่มีอยู่
+    /// คืนชื่อ application ที่เหมาะที่สุดสำหรับแสดงผล
     pub fn display_name(&self) -> Option<&str> {
         non_empty(&self.application_name)
             .or_else(|| non_empty(&self.application_id))
@@ -34,19 +34,16 @@ impl ApplicationIdentity {
     }
 }
 
-/// key แบบคงทนที่แข็งแรงที่สุดสำหรับจัดกลุ่ม stream ของ application
+/// persistent key ที่น่าเชื่อถือที่สุดของ application
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ApplicationKey {
-    /// จับคู่ด้วย application ID
     ApplicationId(String),
-    /// จับคู่ด้วยชื่อ process binary
     ProcessBinary(String),
-    /// จับคู่ด้วยชื่อ application
     ApplicationName(String),
 }
 
 impl ApplicationKey {
-    /// คืนข้อความดิบของ key โดยไม่สนใจชนิด discriminator
+    /// คืนค่า key ดิบโดยไม่มี discriminator
     pub fn value(&self) -> &str {
         match self {
             Self::ApplicationId(value)
@@ -56,28 +53,26 @@ impl ApplicationKey {
     }
 }
 
-/// PipeWire playback stream ที่ normalize แล้ว โดย runtime ID ไม่ใช่ตัวตนถาวร
+/// playback stream ที่ normalized จาก audio source backend ใดก็ได้
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamInfo {
-    /// node ID ที่ใช้ได้เฉพาะระหว่าง PipeWire session ปัจจุบัน
+    /// backend-local ID ที่ใช้ได้เฉพาะ service session ปัจจุบัน
     pub runtime_id: u32,
-    /// serial ของ PipeWire object เมื่อ node ประกาศค่าไว้
+    /// object serial คงที่ เมื่อ backend มีให้
     pub object_serial: Option<String>,
-    /// ชื่อทางเทคนิคของ PipeWire node
+    /// ชื่อเชิงเทคนิคของ source หรือ node
     pub node_name: Option<String>,
-    /// ชื่อสื่อหรือ session ที่ application ประกาศ
+    /// ชื่อ media หรือ session ที่อ่านง่าย
     pub media_name: Option<String>,
-    /// ตัวตน application ที่ normalize แล้วสำหรับจัดกลุ่มและจับคู่
+    /// application identity ที่ normalized สำหรับ grouping และ persistence
     pub application: ApplicationIdentity,
 }
 
 impl StreamInfo {
-    /// คืน application key ที่แข็งแรงที่สุดของ stream นี้
     pub fn application_key(&self) -> Option<ApplicationKey> {
         self.application.stable_key()
     }
 
-    /// คืนชื่อ stream ที่อ่านง่ายที่สุด หรือข้อความ fallback เมื่อไม่มี metadata
     pub fn display_name(&self) -> &str {
         self.media_name
             .as_deref()
@@ -88,32 +83,25 @@ impl StreamInfo {
     }
 }
 
-/// กฎ application แบบคงทน พร้อม discriminator สำหรับเลือก stream เดียวเมื่อมีค่า
+/// selection rule แบบถาวรสำหรับ application หรือ stream
 ///
-/// `runtime_id` เป็นเพียง fallback ของ session ปัจจุบันเมื่อไม่มี metadata ที่คงทน
+/// `runtime_id` เป็น fallback ระดับ session เมื่อไม่มี metadata ที่คงที่
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CaptureTarget {
-    /// metadata ของ application ที่ต้องตรงกัน
     pub application: ApplicationIdentity,
-    /// metadata เพิ่มเติมเมื่อเลือก stream เดียวแทนทั้ง application
     pub stream_match: Option<StreamDiscriminator>,
-    /// fallback ชั่วคราวเมื่อสร้าง discriminator แบบคงทนไม่ได้
     pub runtime_id: Option<u32>,
 }
 
-/// metadata เฉพาะ stream ที่ใช้แยกหลาย playback stream ของ application เดียวกัน
+/// metadata ที่ backend ให้มาเพื่อเลือก stream จาก application
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum StreamDiscriminator {
-    /// จับคู่ด้วย PipeWire object serial
     ObjectSerial(String),
-    /// จับคู่ด้วยชื่อ node
     NodeName(String),
-    /// จับคู่ด้วยชื่อ media
     MediaName(String),
 }
 
 impl CaptureTarget {
-    /// สร้างกฎที่เลือกทุก stream ซึ่งตรงกับ application นี้
     pub fn application(application: ApplicationIdentity) -> Self {
         Self {
             application,
@@ -122,7 +110,6 @@ impl CaptureTarget {
         }
     }
 
-    /// สร้างกฎที่เจาะจง stream เดียวโดยเลือก metadata ที่เหมาะสมที่สุด
     pub fn stream(info: &StreamInfo) -> Self {
         let stream_match = info
             .node_name
@@ -143,7 +130,6 @@ impl CaptureTarget {
         }
     }
 
-    /// ตรวจว่า stream ปัจจุบันตรงกับ application และ discriminator ของกฎหรือไม่
     pub fn matches(&self, stream: &StreamInfo) -> bool {
         if let Some(runtime_id) = self.runtime_id
             && runtime_id != stream.runtime_id
@@ -151,9 +137,7 @@ impl CaptureTarget {
             return false;
         }
 
-        let application_matches =
-            strongest_common_identity_matches(&self.application, &stream.application);
-        if !application_matches {
+        if !strongest_common_identity_matches(&self.application, &stream.application) {
             return false;
         }
 
@@ -175,37 +159,30 @@ impl CaptureTarget {
     }
 }
 
-/// event ที่ PipeWire service ส่งกลับไปให้ application runtime
+/// event ที่ audio source backend ทุกตัวส่งออก
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PipeWireEvent {
-    /// snapshot ใหม่ของ playback stream ทั้งหมดที่ค้นพบ
+pub enum AudioSourceEvent {
     StreamsChanged(Vec<StreamInfo>),
-    /// capture ของ runtime node เริ่มส่งเสียงในรุ่นที่ระบุแล้ว
     CaptureStarted {
         runtime_id: u32,
         audio_generation: u64,
     },
-    /// capture ของ runtime node ในรุ่นที่ระบุถูกหยุดหรือตัดการเชื่อมต่อแล้ว
     CaptureStopped {
         runtime_id: u32,
         audio_generation: u64,
     },
-    /// capture ของ node เดียวล้มเหลว แต่ service อาจยังทำงานต่อได้
     CaptureError {
         runtime_id: u32,
         audio_generation: u64,
         message: String,
     },
-    /// ข้อผิดพลาดระดับ PipeWire service หรือ core
     Error(String),
 }
 
-/// คืน string slice เฉพาะเมื่อ option มีข้อความที่ไม่ว่าง
 fn non_empty(value: &Option<String>) -> Option<&str> {
     value.as_deref().filter(|value| !value.is_empty())
 }
 
-/// เปรียบเทียบ metadata ที่แข็งแรงที่สุดซึ่งทั้งสองฝั่งมีร่วมกัน
 fn strongest_common_identity_matches(
     expected: &ApplicationIdentity,
     actual: &ApplicationIdentity,

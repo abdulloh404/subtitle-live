@@ -13,7 +13,7 @@ use crate::{config::SubtitleConfig, subtitle::CaptionLineBuffer};
 
 use super::{
     OverlayMonitorInfo,
-    x11::{configure_overlay_window, is_x11_window, move_overlay_window},
+    platform::x11::{configure_overlay_window, is_x11_window, move_overlay_window},
 };
 
 /// ระยะเวลาคงข้อความ final ไว้ก่อนซ่อนเมื่อไม่มีข้อความรุ่นใหม่
@@ -377,7 +377,7 @@ impl OverlayPresenter {
                 geometry,
                 self.target_position.borrow().as_str(),
             ) {
-                eprintln!("ไม่สามารถย้าย subtitle overlay ไปจอที่เลือกได้: {error}");
+                eprintln!("Failed to move the subtitle overlay to the selected monitor: {error}");
             }
         }
     }
@@ -557,14 +557,10 @@ fn schedule_monitor_move(
     glib::timeout_add_local_once(delay, move || {
         if let Some(geometry) = target_monitor_geometry.get()
             && window.is_mapped()
-            && let Err(error) = move_measured_overlay(
-                &window,
-                &root,
-                geometry,
-                target_position.borrow().as_str(),
-            )
+            && let Err(error) =
+                move_measured_overlay(&window, &root, geometry, target_position.borrow().as_str())
         {
-            eprintln!("ไม่สามารถย้ำตำแหน่ง subtitle overlay หลัง map ได้: {error}");
+            eprintln!("Failed to reapply the subtitle overlay position after mapping: {error}");
         }
     });
 }
@@ -593,6 +589,6 @@ fn move_measured_overlay(
 /// แสดงเฉพาะข้อผิดพลาดของการตั้งค่า window โดยไม่บันทึกข้อความ subtitle
 fn configure_x11_or_report(window: &gtk::Window, mapped: bool) {
     if let Err(error) = configure_overlay_window(window, mapped) {
-        eprintln!("ไม่สามารถกำหนด X11 subtitle overlay ได้: {error}");
+        eprintln!("Failed to configure the X11 subtitle overlay: {error}");
     }
 }

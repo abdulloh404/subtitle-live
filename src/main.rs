@@ -335,7 +335,7 @@ fn install_runtime_poll(
             }
         }
 
-        let (state, last_error, metrics, pipewire_status) = {
+        let (state, last_error, metrics, audio_source_status) = {
             let runtime = runtime.borrow();
             let runtime = runtime
                 .as_ref()
@@ -344,7 +344,7 @@ fn install_runtime_poll(
                 runtime.state(),
                 runtime.last_error().map(str::to_owned),
                 runtime.metrics_snapshot(),
-                runtime.pipewire_status(),
+                runtime.audio_source_status(),
             )
         };
         let subtitle_config = controller.borrow().config().subtitle.clone();
@@ -352,10 +352,10 @@ fn install_runtime_poll(
             // งานส่วนนี้มีเฉพาะการอัปเดต widget; model load และ inference อยู่บน worker ทั้งหมด
             desktop.settings.update_state(state, last_error.as_deref());
             desktop.settings.update_metrics(metrics);
-            desktop.settings.update_pipewire_status(pipewire_status);
             desktop
                 .settings
-                .append_debug_records(&update.debug_records);
+                .update_audio_source_status(&audio_source_status);
+            desktop.settings.append_debug_records(&update.debug_records);
             if let Some(status) = update.debug_log_status.as_ref() {
                 desktop.settings.update_debug_log_status(status);
             }

@@ -163,7 +163,7 @@ pub fn load_or_default(path: impl AsRef<Path>) -> Result<AppConfig, ConfigError>
         tracing::warn!(
             config_path = %path.display(),
             warning = %warning,
-            "โหลดไฟล์การตั้งค่าไม่ได้ จึงใช้ค่าเริ่มต้นที่ปลอดภัย"
+            "Failed to load configuration; using safe defaults"
         );
     }
     Ok(loaded.config)

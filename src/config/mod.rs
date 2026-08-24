@@ -1,9 +1,11 @@
 //! การตั้งค่าผู้ใช้แบบมีเวอร์ชัน พร้อมการโหลดและบันทึกอย่างปลอดภัย
 
+mod compute;
 mod schema;
 mod storage;
 mod writer;
 
+pub use compute::ComputeRequest;
 pub use schema::{
     AppConfig, ApplicationRule, AudioConfig, CURRENT_CONFIG_VERSION, ConfigValidationError,
     GeneralConfig, PerformanceConfig, SUBTITLE_POSITIONS, SUBTITLE_TEXT_ALIGNMENTS, StreamRule,

@@ -4,12 +4,14 @@ use std::env;
 
 use gtk::gdk::{self, prelude::DisplayExtManual};
 
+use super::platform::OverlayRuntimeBackend;
+
 /// Backend ที่ GTK Settings ใช้งานจริงหลัง GDK เปิด display แล้ว
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisplayBackend {
-    /// Native Wayland display
+    /// Wayland display แบบ native
     Wayland,
-    /// Native X11 display
+    /// X11 display แบบ native
     X11,
     /// Backend อื่นหรือยังไม่มี display
     Unknown,
@@ -92,54 +94,6 @@ impl DesktopSession {
     }
 }
 
-/// Backend X11 ที่ subtitle overlay helper สามารถเปิดได้ใน session ปัจจุบัน
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OverlayRuntimeBackend {
-    /// X11 ผ่าน XWayland ภายใน Wayland session
-    XWayland,
-    /// X11 โดยตรงภายใน X11 session
-    X11,
-    /// ไม่มี X11 display ที่ overlay helper ใช้งานได้
-    Unavailable,
-}
-
-impl OverlayRuntimeBackend {
-    /// ตรวจ backend จากชนิด session และการมีอยู่ของ `DISPLAY`
-    pub fn detect(session: DesktopSession) -> Self {
-        Self::from_display(
-            session,
-            env::var_os("DISPLAY").is_some_and(|value| !value.is_empty()),
-        )
-    }
-
-    /// คืนชื่อสั้นสำหรับ UI และ structured logging
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::XWayland => "xwayland",
-            Self::X11 => "x11",
-            Self::Unavailable => "unavailable",
-        }
-    }
-
-    /// คืนชื่อที่อ่านง่ายสำหรับหน้า About
-    pub const fn display_name(self) -> &'static str {
-        match self {
-            Self::XWayland => "XWayland",
-            Self::X11 => "X11",
-            Self::Unavailable => "Unavailable",
-        }
-    }
-
-    /// เลือก backend เฉพาะเมื่อ session ชัดเจนและมี X11 display
-    const fn from_display(session: DesktopSession, display_available: bool) -> Self {
-        match (session, display_available) {
-            (DesktopSession::Wayland, true) => Self::XWayland,
-            (DesktopSession::X11, true) => Self::X11,
-            _ => Self::Unavailable,
-        }
-    }
-}
-
 /// Snapshot เดียวสำหรับแสดงและวินิจฉัย desktop/overlay backend
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DesktopBackendInfo {
@@ -173,48 +127,19 @@ impl DesktopBackendInfo {
 
 #[cfg(test)]
 mod tests {
-    use super::{DesktopSession, OverlayRuntimeBackend};
+    use super::DesktopSession;
 
     #[test]
-    fn detects_wayland_session_with_xwayland_overlay() {
+    fn detects_wayland_session() {
         let session = DesktopSession::from_session_type(Some("wayland"));
 
         assert_eq!(session, DesktopSession::Wayland);
-        assert_eq!(
-            OverlayRuntimeBackend::from_display(session, true),
-            OverlayRuntimeBackend::XWayland
-        );
     }
 
     #[test]
-    fn detects_x11_session_with_native_x11_overlay() {
+    fn detects_x11_session() {
         let session = DesktopSession::from_session_type(Some("x11"));
 
         assert_eq!(session, DesktopSession::X11);
-        assert_eq!(
-            OverlayRuntimeBackend::from_display(session, true),
-            OverlayRuntimeBackend::X11
-        );
-    }
-
-    #[test]
-    fn marks_wayland_without_x11_display_as_unavailable() {
-        let session = DesktopSession::from_session_type(Some("WAYLAND"));
-
-        assert_eq!(
-            OverlayRuntimeBackend::from_display(session, false),
-            OverlayRuntimeBackend::Unavailable
-        );
-    }
-
-    #[test]
-    fn does_not_guess_unknown_session_from_display() {
-        let session = DesktopSession::from_session_type(None);
-
-        assert_eq!(session, DesktopSession::Unknown);
-        assert_eq!(
-            OverlayRuntimeBackend::from_display(session, true),
-            OverlayRuntimeBackend::Unavailable
-        );
     }
 }

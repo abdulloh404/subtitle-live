@@ -1,4 +1,4 @@
-//! ประสานสถานะแอปบน GTK กับบริการเบื้องหลัง โดยไม่ให้ UI เรียก PipeWire หรือ Whisper โดยตรง
+//! ประสานสถานะแอปบน GTK กับบริการเบื้องหลัง โดยไม่ให้ UI เรียก audio backend หรือ Whisper โดยตรง
 
 use std::{
     cell::RefCell,
@@ -12,10 +12,12 @@ use std::{
 use crate::{
     app::{AppCommand, ApplicationController, ApplicationState, DebugSessionState},
     audio::{LatestQueue, MixedAudioChunk, MixerHandle, SourceAudioChunk, spawn_mixer},
+    audio_source::{
+        AudioSourceEvent, AudioSourceService, CaptureTarget, spawn_service as spawn_audio_source,
+    },
     config::{AppConfig, ConfigWriter, default_debug_log_path},
     debug_log::{DebugLogStatus, DebugLogWriter},
     metrics::{LatencyTracker, MetricsSnapshot},
-    pipewire::{CaptureTarget, PipeWireEvent, PipeWireService, spawn_service as spawn_pipewire},
     stt::{
         SttDebugRecord, SttEvent, SttService, SttStartConfig, SttStreamingConfig, TranscriptUpdate,
         spawn_service as spawn_stt,
@@ -84,9 +86,9 @@ pub struct ApplicationRuntime {
     mixed_audio: LatestQueue<MixedAudioChunk>,
     // Handle ของ worker/service ใช้ส่งคำสั่งเท่านั้น งานหนักไม่เกิดบน GTK thread
     mixer: MixerHandle,
-    pipewire: PipeWireService,
+    audio_source: AudioSourceService,
     // Service รุ่นเก่าจาก Retry ถูกสั่งปิดแล้วและรอ join หลัง GTK event loop จบ
-    retired_pipewire: Vec<PipeWireService>,
+    retired_audio_sources: Vec<AudioSourceService>,
     stt: SttService,
     // Tray เป็น optional เพราะบาง desktop ไม่มี StatusNotifier host
     tray: Option<TrayIndicator>,
@@ -98,14 +100,14 @@ pub struct ApplicationRuntime {
     default_model_path: PathBuf,
     model_ready: bool,
     last_persisted_config: AppConfig,
-    // เปรียบเทียบเป้าหมายที่ต้องการกับ capture ที่ PipeWire ยืนยันว่าเริ่มแล้ว
+    // เปรียบเทียบเป้าหมายที่ต้องการกับ capture ที่ audio backend ยืนยันว่าเริ่มแล้ว
     applied_targets: Vec<CaptureTarget>,
     desired_capture_ids: HashSet<u32>,
     active_captures: HashSet<u32>,
     capture_errors: HashMap<u32, String>,
     // ระหว่างเปลี่ยน capture จะหยุดรับ transcript จน STT ยืนยัน audio generation ใหม่
     capture_transition_pending: bool,
-    // รุ่นเดียวที่ส่งผ่าน PipeWire, mixer และ STT เพื่อกันเสียงจาก transition เก่า
+    // รุ่นเดียวที่ส่งผ่าน audio source, mixer และ STT เพื่อกันเสียงจาก transition เก่า
     pipeline_audio_generation: u64,
     stt_resume_generation: Option<u64>,
     accepted_audio_generation: Option<u64>,
@@ -123,8 +125,8 @@ pub struct ApplicationRuntime {
     retry_stop_pending: bool,
     pipeline_error: Option<String>,
     // เป็น true หลัง registry ส่ง snapshot ครั้งแรก จึงไม่รายงาน Connected ก่อนเชื่อมจริง
-    pipewire_connected: bool,
-    pipewire_error: Option<String>,
+    audio_source_connected: bool,
+    audio_source_error: Option<String>,
     startup_warning: Option<String>,
     last_tray_state: Option<TrayState>,
     // ค่า streaming ล่าสุดที่ส่งให้ STT ใช้ตรวจว่าต้องอัปเดต worker หรือไม่
@@ -152,7 +154,8 @@ impl ApplicationRuntime {
         let mixed_audio =
             LatestQueue::new(mixed_queue_capacity(last_persisted_config.stt.window_ms));
         let mixer = spawn_mixer(source_audio.clone(), mixed_audio.clone());
-        let pipewire = spawn_pipewire(source_audio.clone());
+        let audio_source =
+            spawn_audio_source(last_persisted_config.audio.backend, source_audio.clone());
         let stt = spawn_stt(mixed_audio.clone());
         let (tray, tray_commands) = match TrayIndicator::spawn(TrayState::Paused) {
             Ok((tray, commands)) => (Some(tray), Some(commands)),
@@ -183,8 +186,8 @@ impl ApplicationRuntime {
             source_audio,
             mixed_audio,
             mixer,
-            pipewire,
-            retired_pipewire: Vec::new(),
+            audio_source,
+            retired_audio_sources: Vec::new(),
             stt,
             tray,
             tray_commands,
@@ -210,8 +213,8 @@ impl ApplicationRuntime {
             observed_retry_generation,
             retry_stop_pending: false,
             pipeline_error: None,
-            pipewire_connected: false,
-            pipewire_error: None,
+            audio_source_connected: false,
+            audio_source_error: None,
             startup_warning,
             last_tray_state: None,
             applied_stt_streaming: None,
@@ -228,14 +231,15 @@ impl ApplicationRuntime {
             return update;
         }
 
-        self.reap_retired_pipewire();
+        self.reap_retired_audio_sources();
         self.handle_tray_commands(&mut update);
+        self.sync_audio_source_backend(&mut update);
         self.sync_retry_intent(&mut update);
         self.sync_live_intent(&mut update);
         self.sync_debug_session(&mut update);
         self.sync_stt_streaming_settings(&mut update);
         self.sync_capture_targets(&mut update);
-        self.handle_pipewire_events(&mut update);
+        self.handle_audio_source_events(&mut update);
         self.sync_capture_targets(&mut update);
         self.handle_stt_events(&mut update);
         self.handle_stt_debug_records(&mut update);
@@ -248,17 +252,17 @@ impl ApplicationRuntime {
         update
     }
 
-    /// join เฉพาะ PipeWire worker รุ่นเก่าที่จบแล้ว จึงไม่รอ native main loop บน GTK thread
-    fn reap_retired_pipewire(&mut self) {
+    /// join เฉพาะ audio worker รุ่นเก่าที่จบแล้ว จึงไม่รอ backend loop บน GTK thread
+    fn reap_retired_audio_sources(&mut self) {
         let mut index = 0;
-        while index < self.retired_pipewire.len() {
-            if !self.retired_pipewire[index].is_finished() {
+        while index < self.retired_audio_sources.len() {
+            if !self.retired_audio_sources[index].is_finished() {
                 index += 1;
                 continue;
             }
-            let mut service = self.retired_pipewire.swap_remove(index);
+            let mut service = self.retired_audio_sources.swap_remove(index);
             if let Err(error) = service.finish() {
-                tracing::error!(error = %error, "PipeWire worker รุ่นเก่าปิดไม่สมบูรณ์");
+                tracing::error!(error = %error, "Retired audio source worker did not shut down cleanly");
             }
         }
     }
@@ -268,24 +272,25 @@ impl ApplicationRuntime {
         self.controller.borrow().state()
     }
 
-    /// เลือกข้อผิดพลาดที่สำคัญที่สุดตามลำดับ pipeline → capture → PipeWire → startup
+    /// เลือกข้อผิดพลาดที่สำคัญที่สุดตามลำดับ pipeline → capture → audio source → startup
     pub fn last_error(&self) -> Option<&str> {
         self.pipeline_error
             .as_deref()
             .or_else(|| self.capture_errors.values().next().map(String::as_str))
-            .or(self.pipewire_error.as_deref())
+            .or(self.audio_source_error.as_deref())
             .or(self.startup_warning.as_deref())
     }
 
-    /// คืนสถานะการเชื่อมต่อ PipeWire สำหรับหน้า About
-    pub fn pipewire_status(&self) -> &'static str {
-        if self.pipewire_error.is_some() {
+    /// คืนสถานะการเชื่อมต่อ audio backend สำหรับหน้า About
+    pub fn audio_source_status(&self) -> String {
+        let status = if self.audio_source_error.is_some() {
             "Error"
-        } else if self.pipewire_connected {
+        } else if self.audio_source_connected {
             "Connected"
         } else {
             "Starting"
-        }
+        };
+        format!("{} · {status}", self.audio_source.backend().display_name())
     }
 
     /// สร้าง snapshot latency พร้อมจำนวนข้อมูลที่ bounded queues จำเป็นต้องทิ้ง
@@ -348,11 +353,11 @@ impl ApplicationRuntime {
         }
         self.shutdown_requested = true;
         self.persist_if_changed();
-        let _ = self.pipewire.stop_capture();
+        let _ = self.audio_source.stop_capture();
         self.source_audio.clear_reliable();
         self.mixed_audio.clear_reliable();
         self.pending_overlay_frames.clear();
-        let _ = self.pipewire.shutdown();
+        let _ = self.audio_source.shutdown();
         self.stt.stop();
         self.stt.shutdown();
         self.mixer.stop();
@@ -368,20 +373,20 @@ impl ApplicationRuntime {
         let desired_debug_session = self.controller.borrow().debug_session_state();
         self.debug_log_writer
             .set_enabled(desired_debug_session.file_logging_enabled);
-        if let Err(error) = self.pipewire.finish() {
-            tracing::error!(error = %error, "PipeWire worker ปิดไม่สมบูรณ์");
+        if let Err(error) = self.audio_source.finish() {
+            tracing::error!(error = %error, "Audio source worker did not shut down cleanly");
         }
-        for service in &mut self.retired_pipewire {
+        for service in &mut self.retired_audio_sources {
             if let Err(error) = service.finish() {
-                tracing::error!(error = %error, "PipeWire worker รุ่นเก่าปิดไม่สมบูรณ์");
+                tracing::error!(error = %error, "Retired audio source worker did not shut down cleanly");
             }
         }
-        self.retired_pipewire.clear();
+        self.retired_audio_sources.clear();
         if let Err(error) = self.mixer.finish() {
-            tracing::error!(error = %error, "audio mixer worker ปิดไม่สมบูรณ์");
+            tracing::error!(error = %error, "Audio mixer worker did not shut down cleanly");
         }
         if let Err(error) = self.stt.finish() {
-            tracing::error!(error = %error, "Whisper worker ปิดไม่สมบูรณ์");
+            tracing::error!(error = %error, "Whisper worker did not shut down cleanly");
         }
         let debug_tail = self.stt.drain_debug_records();
         if desired_debug_session.file_logging_enabled {
@@ -390,13 +395,13 @@ impl ApplicationRuntime {
         if let Some(tray) = &mut self.tray
             && let Err(error) = tray.finish()
         {
-            tracing::error!(error = %error, "tray worker ปิดไม่สมบูรณ์");
+            tracing::error!(error = %error, "Tray worker did not shut down cleanly");
         }
         if let Some(writer) = &mut self.config_writer {
             writer.finish();
         }
         if let Err(error) = self.debug_log_writer.finish() {
-            tracing::error!(error = %error, "ตัวเขียน transcript debug ปิดไม่สมบูรณ์");
+            tracing::error!(error = %error, "Transcript debug writer did not shut down cleanly");
         }
     }
 
@@ -431,6 +436,28 @@ impl ApplicationRuntime {
                 TrayCommand::Quit => update.quit_requested = true,
             }
         }
+    }
+
+    /// เปลี่ยน service เมื่อผู้ใช้เลือก backend ใหม่ โดยไม่ให้ UI แตะ implementation โดยตรง
+    fn sync_audio_source_backend(&mut self, update: &mut RuntimeUpdate) {
+        let desired_backend = self.controller.borrow().config().audio.backend;
+        if self.audio_source.backend() == desired_backend {
+            return;
+        }
+
+        let replacement = spawn_audio_source(desired_backend, self.source_audio.clone());
+        let previous = std::mem::replace(&mut self.audio_source, replacement);
+        let _ = previous.shutdown();
+        self.retired_audio_sources.push(previous);
+        self.audio_source_connected = false;
+        self.audio_source_error = None;
+        self.applied_targets.clear();
+        self.desired_capture_ids.clear();
+        self.active_captures.clear();
+        self.capture_errors.clear();
+        self.controller.borrow_mut().set_streams(Vec::new());
+        update.streams_changed = true;
+        update.hide_overlay = true;
     }
 
     /// ประมวลผลคำขอ retry จาก controller เพียงครั้งเดียวไม่ว่าจะมาจาก UI หรือ tray
@@ -469,9 +496,7 @@ impl ApplicationRuntime {
             if capture_enabled != previous_capture_enabled {
                 self.stt.set_debug_enabled(capture_enabled);
             }
-            if desired.file_logging_enabled
-                != self.applied_debug_session.file_logging_enabled
-            {
+            if desired.file_logging_enabled != self.applied_debug_session.file_logging_enabled {
                 self.debug_log_writer
                     .set_enabled(desired.file_logging_enabled);
             }
@@ -506,18 +531,19 @@ impl ApplicationRuntime {
         self.transcript.clear();
         self.last_subtitle_update = None;
         self.applied_stt_streaming = Some(streaming);
-        let _ = self.pipewire.stop_capture();
+        let _ = self.audio_source.stop_capture();
         self.stt.start(SttStartConfig {
             model_path: config
                 .stt
                 .model_path
                 .unwrap_or_else(|| self.default_model_path.clone()),
             language: config.stt.language,
+            compute_backend: config.stt.backend,
             step_ms: streaming.step_ms,
             window_ms: streaming.window_ms,
             vad_enabled: streaming.vad_enabled,
         });
-        self.set_state(if self.pipewire_error.is_some() {
+        self.set_state(if self.audio_source_error.is_some() {
             ApplicationState::Error
         } else {
             ApplicationState::Starting
@@ -527,16 +553,17 @@ impl ApplicationRuntime {
     /// ทิ้ง session ที่เสีย เริ่ม generation ใหม่ แล้วเข้าทางเริ่ม pipeline ปกติอีกครั้ง
     fn retry_pipeline(&mut self, update: &mut RuntimeUpdate) {
         // ถ้า service หลักเสีย ให้เปลี่ยน handle ก่อนเริ่มใหม่แทนการส่งกลับไปยัง channel ที่ตายแล้ว
-        if self.pipewire_error.is_some() {
-            let replacement = spawn_pipewire(self.source_audio.clone());
-            let previous = std::mem::replace(&mut self.pipewire, replacement);
+        if self.audio_source_error.is_some() {
+            let backend = self.controller.borrow().config().audio.backend;
+            let replacement = spawn_audio_source(backend, self.source_audio.clone());
+            let previous = std::mem::replace(&mut self.audio_source, replacement);
             let _ = previous.shutdown();
-            self.retired_pipewire.push(previous);
-            self.pipewire_connected = false;
+            self.retired_audio_sources.push(previous);
+            self.audio_source_connected = false;
         }
         // ทิ้งผล STT เก่าก่อนส่ง Stop เพื่อไม่ลบ Stopped ที่ใช้ยืนยันคำสั่ง retry รอบนี้
         let _ = self.stt.drain_events();
-        let _ = self.pipewire.stop_capture();
+        let _ = self.audio_source.stop_capture();
         self.stt.stop();
         self.retry_stop_pending = true;
         self.source_audio.clear_reliable();
@@ -544,14 +571,14 @@ impl ApplicationRuntime {
         self.pipeline_audio_generation = self.pipeline_audio_generation.saturating_add(1).max(1);
         self.mixer.reset(self.pipeline_audio_generation);
         self.running_requested = true;
-        self.pipewire_error = None;
+        self.audio_source_error = None;
         self.start_pipeline();
         update.hide_overlay = true;
     }
 
     /// หยุด capture/STT และล้างเสียงกับ transcript ที่อาจค้างจาก session เดิม
     fn stop_pipeline(&mut self) {
-        let _ = self.pipewire.stop_capture();
+        let _ = self.audio_source.stop_capture();
         self.stt.stop();
         self.stt_ready = false;
         self.desired_capture_ids.clear();
@@ -568,7 +595,7 @@ impl ApplicationRuntime {
         self.last_subtitle_update = None;
         self.applied_stt_streaming = None;
         self.pipeline_error = None;
-        self.set_state(if self.pipewire_error.is_some() {
+        self.set_state(if self.audio_source_error.is_some() {
             ApplicationState::Error
         } else {
             ApplicationState::Stopped
@@ -594,7 +621,7 @@ impl ApplicationRuntime {
         self.stt.update_streaming(desired);
         if !self.applied_targets.is_empty()
             && let Err(error) = self
-                .pipewire
+                .audio_source
                 .set_selected(self.applied_targets.clone(), self.pipeline_audio_generation)
         {
             self.pipeline_error = Some(error.to_string());
@@ -602,17 +629,17 @@ impl ApplicationRuntime {
         self.applied_stt_streaming = Some(desired);
     }
 
-    /// รับเหตุการณ์ graph/capture จาก PipeWire แล้วสะท้อนกลับไปยัง controller
-    fn handle_pipewire_events(&mut self, update: &mut RuntimeUpdate) {
-        for event in self.pipewire.drain_events() {
+    /// รับเหตุการณ์ graph/capture จาก backend ที่เลือกแล้วสะท้อนกลับไปยัง controller
+    fn handle_audio_source_events(&mut self, update: &mut RuntimeUpdate) {
+        for event in self.audio_source.drain_events() {
             match event {
-                PipeWireEvent::StreamsChanged(streams) => {
-                    self.pipewire_connected = true;
-                    self.pipewire_error = None;
+                AudioSourceEvent::StreamsChanged(streams) => {
+                    self.audio_source_connected = true;
+                    self.audio_source_error = None;
                     self.controller.borrow_mut().set_streams(streams);
                     update.streams_changed = true;
                 }
-                PipeWireEvent::CaptureStarted {
+                AudioSourceEvent::CaptureStarted {
                     runtime_id,
                     audio_generation,
                 } if self.running_requested
@@ -630,14 +657,14 @@ impl ApplicationRuntime {
                     self.active_captures.insert(runtime_id);
                     self.capture_errors.remove(&runtime_id);
                 }
-                PipeWireEvent::CaptureStopped {
+                AudioSourceEvent::CaptureStopped {
                     runtime_id,
                     audio_generation,
                 } if audio_generation == self.pipeline_audio_generation => {
                     self.active_captures.remove(&runtime_id);
                     self.capture_errors.remove(&runtime_id);
                 }
-                PipeWireEvent::CaptureError {
+                AudioSourceEvent::CaptureError {
                     runtime_id,
                     audio_generation,
                     message,
@@ -650,13 +677,14 @@ impl ApplicationRuntime {
                         self.capture_errors.insert(runtime_id, message);
                     }
                 }
-                PipeWireEvent::Error(error) => {
-                    self.pipewire_connected = false;
-                    self.pipewire_error = Some(error);
+                AudioSourceEvent::Error(error) => {
+                    self.audio_source_connected = false;
+                    self.audio_source_error = Some(error);
                     self.set_state(ApplicationState::Error);
                     update.hide_overlay = true;
                 }
-                PipeWireEvent::CaptureStarted { .. } | PipeWireEvent::CaptureStopped { .. } => {}
+                AudioSourceEvent::CaptureStarted { .. }
+                | AudioSourceEvent::CaptureStopped { .. } => {}
             }
         }
     }
@@ -667,7 +695,7 @@ impl ApplicationRuntime {
             match event {
                 SttEvent::Loading if self.running_requested => {
                     self.stt_ready = false;
-                    self.set_state(if self.pipewire_error.is_some() {
+                    self.set_state(if self.audio_source_error.is_some() {
                         ApplicationState::Error
                     } else {
                         ApplicationState::Starting
@@ -723,7 +751,7 @@ impl ApplicationRuntime {
                     self.capture_transition_pending = false;
                     self.stt_resume_generation = None;
                     self.accepted_audio_generation = None;
-                    let _ = self.pipewire.stop_capture();
+                    let _ = self.audio_source.stop_capture();
                     self.pipeline_error = Some(error);
                     self.set_state(ApplicationState::Error);
                     update.hide_overlay = true;
@@ -814,7 +842,7 @@ impl ApplicationRuntime {
             self.desired_capture_ids = desired_capture_ids;
             self.pipeline_error = None;
             if let Err(error) = self
-                .pipewire
+                .audio_source
                 .set_selected(targets, self.pipeline_audio_generation)
             {
                 self.pipeline_error = Some(error.to_string());
@@ -828,7 +856,7 @@ impl ApplicationRuntime {
 
     /// สร้างเส้นแบ่ง session เพื่อไม่ให้เสียงหรือ transcript จาก source เดิมรั่วเข้า source ใหม่
     fn begin_capture_transition(&mut self, update: &mut RuntimeUpdate) {
-        let _ = self.pipewire.stop_capture();
+        let _ = self.audio_source.stop_capture();
         self.stt.pause_audio();
         self.source_audio.clear_reliable();
         self.mixed_audio.clear_reliable();
@@ -847,7 +875,7 @@ impl ApplicationRuntime {
     /// สรุป readiness ของ STT และ capture เป็นสถานะระดับแอป
     fn update_capture_state(&self) {
         let state = if self.pipeline_error.is_some()
-            || self.pipewire_error.is_some()
+            || self.audio_source_error.is_some()
             || !self.capture_errors.is_empty()
         {
             ApplicationState::Error

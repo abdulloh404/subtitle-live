@@ -13,16 +13,16 @@ use gtk::glib;
 
 use crate::{
     app::{AppCommand, AppEvent, ApplicationController, ApplicationState},
-    config::{AppConfig, SUBTITLE_POSITIONS, SUBTITLE_TEXT_ALIGNMENTS},
+    audio_source::{ApplicationIdentity, ApplicationKey, AudioSourceBackend, StreamInfo},
+    config::{AppConfig, ComputeRequest, SUBTITLE_POSITIONS, SUBTITLE_TEXT_ALIGNMENTS},
     debug_log::DebugLogStatus,
     metrics::MetricsSnapshot,
     overlay::{
         DesktopBackendInfo, DesktopSession, DisplayBackend, OverlayClientStatus,
         OverlayMonitorInfo, OverlayRuntimeBackend,
     },
-    pipewire::{ApplicationIdentity, ApplicationKey, StreamInfo},
     runtime::DebugDropCounts,
-    stt::{SttDebugRecord, compiled_compute_backend},
+    stt::{SttDebugRecord, available_compute_requests, compiled_compute_backend},
 };
 
 const SETTINGS_WINDOW_NAME: &str = "subtitle-live-settings";
@@ -47,7 +47,7 @@ pub struct SettingsPresenter {
     window: adw::PreferencesWindow,
     /// controller ร่วมภายใน GTK main thread เท่านั้น จึงใช้ `Rc<RefCell<_>>`
     controller: Rc<RefCell<ApplicationController>>,
-    /// รายการ application ที่สร้างใหม่เมื่อ PipeWire graph เปลี่ยน
+    /// รายการ application ที่สร้างใหม่เมื่อ audio source graph เปลี่ยน
     applications: DynamicApplications,
     /// switch ที่ต้อง sync เมื่อ runtime เปลี่ยนสถานะ pipeline
     live_switch: gtk::Switch,
@@ -55,8 +55,8 @@ pub struct SettingsPresenter {
     status_label: gtk::Label,
     error_label: gtk::Label,
     model_path_label: gtk::Label,
-    /// สถานะการเชื่อมต่อ PipeWire ที่แสดงในหน้า About
-    pipewire_status_label: gtk::Label,
+    /// สถานะการเชื่อมต่อ audio backend ที่แสดงในหน้า About
+    audio_source_status_label: gtk::Label,
     /// Backend ของ helper ที่อัปเดตตาม lifecycle จริง
     subtitle_backend_label: gtk::Label,
     /// สถานะ XWayland ที่ไม่อ้างเพียง environment
@@ -105,7 +105,9 @@ impl SettingsPresenter {
         let whisper_label = value_label("Not available");
         let end_to_end_label = value_label("Not available");
         let dropped_frames_label = value_label("Source 0 · Mixed 0");
-        let pipewire_status_label = value_label("Starting");
+        let performance_compute_label = value_label(snapshot.compute_request.display_name());
+        let about_compute_label = value_label(snapshot.compute_request.display_name());
+        let audio_source_status_label = value_label("Starting");
         let overlay_starting = backend_info.overlay_backend != OverlayRuntimeBackend::Unavailable;
         let subtitle_backend_label = value_label(if overlay_starting {
             "Starting"
@@ -155,11 +157,16 @@ impl SettingsPresenter {
             &snapshot,
             &configured_label,
             &applications_group,
+            Rc::clone(&controller),
         ));
         window.add(&speech_recognition_page(
             &snapshot,
             &model_path_label,
             Rc::clone(&controller),
+            vec![
+                performance_compute_label.clone(),
+                about_compute_label.clone(),
+            ],
         ));
         let (subtitle_page, monitor_selector) = subtitle_page(&snapshot, Rc::clone(&controller));
         window.add(&subtitle_page);
@@ -171,13 +178,15 @@ impl SettingsPresenter {
             &whisper_label,
             &end_to_end_label,
             &dropped_frames_label,
+            &performance_compute_label,
         ));
         let (debug_page, debug_panel) = debug_page(Rc::clone(&controller));
         window.add(&debug_page);
         window.add(&about_page(
             &snapshot,
             backend_info,
-            &pipewire_status_label,
+            &audio_source_status_label,
+            &about_compute_label,
             &subtitle_backend_label,
             &xwayland_available_label,
             &overlay_status_label,
@@ -210,7 +219,7 @@ impl SettingsPresenter {
             status_label,
             error_label,
             model_path_label,
-            pipewire_status_label,
+            audio_source_status_label,
             subtitle_backend_label,
             xwayland_available_label,
             overlay_status_label,
@@ -277,9 +286,9 @@ impl SettingsPresenter {
             .set_label(&format!("{} ({status})", path.display()));
     }
 
-    /// แสดงสถานะ PipeWire ล่าสุดในหน้า About
-    pub fn update_pipewire_status(&self, status: &str) {
-        self.pipewire_status_label.set_label(status);
+    /// แสดงสถานะ audio backend ล่าสุดในหน้า About
+    pub fn update_audio_source_status(&self, status: &str) {
+        self.audio_source_status_label.set_label(status);
     }
 
     /// แสดง backend เฉพาะเมื่อ helper ยืนยัน Ready และแสดง Unavailable เมื่อ IPC ล้มเหลว
@@ -572,10 +581,11 @@ fn audio_sources_page(
     snapshot: &UiSnapshot,
     configured_label: &gtk::Label,
     applications_group: &adw::PreferencesGroup,
+    controller: Rc<RefCell<ApplicationController>>,
 ) -> adw::PreferencesPage {
     let page = preferences_page("Audio Sources", "audio-speakers-symbolic");
     let capture_group = adw::PreferencesGroup::builder().title("Capture").build();
-    capture_group.add(&value_row("Capture Mode", &snapshot.capture_mode));
+    capture_group.add(&audio_backend_row(snapshot, controller));
     capture_group.add(&value_row_with_label(
         "Configured Applications",
         configured_label,
@@ -590,6 +600,7 @@ fn speech_recognition_page(
     snapshot: &UiSnapshot,
     model_path_label: &gtk::Label,
     controller: Rc<RefCell<ApplicationController>>,
+    compute_request_labels: Vec<gtk::Label>,
 ) -> adw::PreferencesPage {
     let page = preferences_page("Speech Recognition", "audio-input-microphone-symbolic");
     let recognition_group = adw::PreferencesGroup::builder()
@@ -598,7 +609,15 @@ fn speech_recognition_page(
     recognition_group.add(&value_row("Language", &snapshot.language));
     recognition_group.add(&value_row("Model", &snapshot.model));
     recognition_group.add(&value_row_with_label("Model File", model_path_label));
-    recognition_group.add(&value_row("Compute Backend", &snapshot.backend));
+    recognition_group.add(&compute_backend_row(
+        snapshot,
+        Rc::clone(&controller),
+        compute_request_labels,
+    ));
+    recognition_group.add(&value_row(
+        "Binary Acceleration",
+        &snapshot.compiled_backend,
+    ));
     page.add(&recognition_group);
 
     let streaming_group = adw::PreferencesGroup::builder().title("Streaming").build();
@@ -877,13 +896,21 @@ fn performance_page(
     whisper_label: &gtk::Label,
     end_to_end_label: &gtk::Label,
     dropped_frames_label: &gtk::Label,
+    compute_request_label: &gtk::Label,
 ) -> adw::PreferencesPage {
     let page = preferences_page("Performance", "utilities-system-monitor-symbolic");
     let status_group = adw::PreferencesGroup::builder().title("Pipeline").build();
     status_group.add(&value_row_with_label("Status", status_label));
     status_group.add(&value_row_with_label("Last Error", error_label));
     status_group.add(&value_row("Model", &snapshot.model));
-    status_group.add(&value_row("Backend", &snapshot.backend));
+    status_group.add(&value_row_with_label(
+        "Requested Backend",
+        compute_request_label,
+    ));
+    status_group.add(&value_row(
+        "Binary Acceleration",
+        &snapshot.compiled_backend,
+    ));
     page.add(&status_group);
 
     let metrics_group = adw::PreferencesGroup::builder().title("Latency").build();
@@ -965,7 +992,8 @@ impl DebugPanel {
                 self.file_path_label.set_label(&path.display().to_string());
             }
             DebugLogStatus::Error { path, message } => {
-                self.file_status_label.set_label(&format!("Error: {message}"));
+                self.file_status_label
+                    .set_label(&format!("Error: {message}"));
                 self.file_path_label.set_label(&path.display().to_string());
             }
         }
@@ -1009,9 +1037,7 @@ fn debug_page(
     let file_status_label = value_label("Disabled");
     let file_path_label = value_label("Waiting for runtime");
     let dropped_records_label = value_label("STT 0 · File 0");
-    let file_group = adw::PreferencesGroup::builder()
-        .title("Log File")
-        .build();
+    let file_group = adw::PreferencesGroup::builder().title("Log File").build();
     file_group.add(&value_row_with_label("Status", &file_status_label));
     file_group.add(&value_row_with_label("Path", &file_path_label));
     file_group.add(&value_row_with_label(
@@ -1153,7 +1179,8 @@ fn escape_debug_text(text: &str) -> String {
 fn about_page(
     snapshot: &UiSnapshot,
     backend_info: DesktopBackendInfo,
-    pipewire_status_label: &gtk::Label,
+    audio_source_status_label: &gtk::Label,
+    compute_request_label: &gtk::Label,
     subtitle_backend_label: &gtk::Label,
     xwayland_available_label: &gtk::Label,
     overlay_status_label: &gtk::Label,
@@ -1164,7 +1191,7 @@ fn about_page(
         .build();
     application_group.add(&message_row(
         "Local English Live Subtitles",
-        "Captures selected application audio and processes it locally.",
+        "Captures the selected audio source and processes it locally.",
     ));
     application_group.add(&value_row("Version", env!("CARGO_PKG_VERSION")));
     application_group.add(&value_row("Privacy", "Local-first"));
@@ -1194,11 +1221,21 @@ fn about_page(
         .title("Speech Recognition")
         .build();
     recognition_group.add(&value_row("Model", &snapshot.model));
-    recognition_group.add(&value_row("Compute Backend", &snapshot.backend));
+    recognition_group.add(&value_row_with_label(
+        "Requested Backend",
+        compute_request_label,
+    ));
+    recognition_group.add(&value_row(
+        "Binary Acceleration",
+        &snapshot.compiled_backend,
+    ));
     page.add(&recognition_group);
 
     let audio_group = adw::PreferencesGroup::builder().title("Audio").build();
-    audio_group.add(&value_row_with_label("PipeWire", pipewire_status_label));
+    audio_group.add(&value_row_with_label(
+        "Backend Status",
+        audio_source_status_label,
+    ));
     page.add(&audio_group);
     page
 }
@@ -1253,6 +1290,99 @@ fn value_label(value: &str) -> gtk::Label {
 fn value_row_with_label(title: &str, value_label: &gtk::Label) -> adw::ActionRow {
     let row = adw::ActionRow::builder().title(title).build();
     row.add_suffix(value_label);
+    row
+}
+
+/// สร้างตัวเลือก compute เฉพาะ backend ที่ไบนารีปัจจุบันรองรับจริง
+fn compute_backend_row(
+    snapshot: &UiSnapshot,
+    controller: Rc<RefCell<ApplicationController>>,
+    request_labels: Vec<gtk::Label>,
+) -> adw::ActionRow {
+    let supported = available_compute_requests();
+    let mut requests = supported.to_vec();
+    if !supported.contains(&snapshot.compute_request) {
+        requests.push(snapshot.compute_request);
+    }
+    let labels: Vec<_> = requests
+        .iter()
+        .map(|request| {
+            if supported.contains(request) {
+                request.display_name().to_owned()
+            } else {
+                format!("{} (unavailable)", request.display_name())
+            }
+        })
+        .collect();
+    let label_refs: Vec<_> = labels.iter().map(String::as_str).collect();
+    let dropdown = gtk::DropDown::from_strings(&label_refs);
+    let selected = requests
+        .iter()
+        .position(|request| *request == snapshot.compute_request)
+        .unwrap_or(0) as u32;
+    dropdown.set_selected(selected);
+    dropdown.set_sensitive(requests.len() > 1);
+    dropdown.set_valign(gtk::Align::Center);
+    let active_selection = Rc::new(Cell::new(selected));
+    let selection_for_signal = Rc::clone(&active_selection);
+    dropdown.connect_selected_notify(move |dropdown| {
+        let Some(request) = requests.get(dropdown.selected() as usize).copied() else {
+            return;
+        };
+        if !supported.contains(&request) {
+            dropdown.set_selected(selection_for_signal.get());
+            return;
+        }
+        selection_for_signal.set(dropdown.selected());
+        let _ = controller
+            .borrow_mut()
+            .handle_command(AppCommand::SetSttComputeBackend(request));
+        for label in &request_labels {
+            label.set_label(request.display_name());
+        }
+    });
+
+    let row = adw::ActionRow::builder()
+        .activatable_widget(&dropdown)
+        .subtitle("GPU options are available only in matching CUDA or ROCm builds")
+        .title("Compute Backend")
+        .build();
+    row.add_suffix(&dropdown);
+    row
+}
+
+/// สร้างตัวเลือก backend เสียง โดยให้ runtime เป็นผู้เปลี่ยน service จริง
+fn audio_backend_row(
+    snapshot: &UiSnapshot,
+    controller: Rc<RefCell<ApplicationController>>,
+) -> adw::ActionRow {
+    const BACKENDS: [AudioSourceBackend; 2] =
+        [AudioSourceBackend::PipeWire, AudioSourceBackend::PulseAudio];
+    let labels = BACKENDS.map(AudioSourceBackend::display_name);
+    let dropdown = gtk::DropDown::from_strings(&labels);
+    let selected = BACKENDS
+        .iter()
+        .position(|backend| *backend == snapshot.audio_backend)
+        .unwrap_or(0) as u32;
+    dropdown.set_selected(selected);
+    dropdown.set_valign(gtk::Align::Center);
+    let row = adw::ActionRow::builder()
+        .activatable_widget(&dropdown)
+        .subtitle(snapshot.audio_backend.description())
+        .title("Audio Backend")
+        .build();
+    let row_for_selection = row.clone();
+    dropdown.connect_selected_notify(move |dropdown| {
+        let Some(backend) = BACKENDS.get(dropdown.selected() as usize).copied() else {
+            return;
+        };
+        row_for_selection.set_subtitle(backend.description());
+        let _ = controller
+            .borrow_mut()
+            .handle_command(AppCommand::SetAudioSourceBackend(backend));
+    });
+
+    row.add_suffix(&dropdown);
     row
 }
 
@@ -1316,11 +1446,12 @@ fn duration_ms(duration: Duration) -> String {
 struct UiSnapshot {
     live_subtitles: bool,
     keep_running_when_closed: bool,
-    capture_mode: String,
+    audio_backend: AudioSourceBackend,
     configured_applications: usize,
     language: String,
     model: String,
-    backend: String,
+    compute_request: ComputeRequest,
+    compiled_backend: String,
     audio_step_ms: u32,
     context_window_ms: u32,
     vad_enabled: bool,
@@ -1342,12 +1473,12 @@ impl UiSnapshot {
         Self {
             live_subtitles: config.general.live_subtitles,
             keep_running_when_closed: config.general.keep_running_when_closed,
-            capture_mode: capture_mode_label(config),
+            audio_backend: config.audio.backend,
             configured_applications: config.audio.rules.len(),
             language: language_label(config),
             model: config.stt.model.clone(),
-            // แสดง backend ที่ไบนารีใช้จริง ไม่ใช่ค่าความต้องการ `auto` ใน config
-            backend: compiled_compute_backend().display_name().to_owned(),
+            compute_request: config.stt.backend,
+            compiled_backend: compiled_compute_backend().display_name().to_owned(),
             audio_step_ms: config.stt.step_ms,
             context_window_ms: config.stt.window_ms,
             vad_enabled: config.stt.vad_enabled,
@@ -1361,14 +1492,6 @@ impl UiSnapshot {
             show_metrics: config.performance.show_metrics,
             status: state_label(controller.state()).to_owned(),
         }
-    }
-}
-
-/// แปลงรหัส capture mode เป็นชื่อสำหรับผู้ใช้
-fn capture_mode_label(config: &AppConfig) -> String {
-    match config.audio.capture_mode.as_str() {
-        "selected" => "Selected Applications".to_owned(),
-        other => display_identifier(other),
     }
 }
 

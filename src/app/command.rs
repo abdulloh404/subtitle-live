@@ -1,5 +1,7 @@
 //! คำสั่งตามความต้องการของผู้ใช้ที่ application controller รองรับ
 
+use crate::{audio_source::AudioSourceBackend, config::ComputeRequest};
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// คำขอจาก UI หรือ tray ก่อนแปลงเป็นงานของ runtime
 pub enum AppCommand {
@@ -11,10 +13,14 @@ pub enum AppCommand {
     RetryPipeline,
     /// กำหนดว่าการปิดหน้าต่างตั้งค่าต้องซ่อนหน้าต่างเท่านั้นหรือไม่
     SetKeepRunningWhenClosed(bool),
+    /// เปลี่ยนบริการค้นหาและจับเสียง แล้วสร้าง audio service ใหม่เมื่อกำลังทำงาน
+    SetAudioSourceBackend(AudioSourceBackend),
     /// เปลี่ยนระยะเสียงใหม่ขั้นต่ำก่อนเรียก Whisper รอบถัดไป
     SetSttStepMs(u32),
     /// เปลี่ยนความยาวเสียงย้อนหลังที่ส่งเป็นบริบทให้ Whisper
     SetSttWindowMs(u32),
+    /// เปลี่ยน compute backend และโหลด Whisper session ใหม่เมื่อ pipeline ทำงานอยู่
+    SetSttComputeBackend(ComputeRequest),
     /// เปิดหรือปิดตัวกรองเสียงพลังงานต่ำก่อนเรียก Whisper
     SetVadEnabled(bool),
     /// เปิดหรือปิดการส่งข้อมูลถอดเสียงสดไปยังหน้า Debug เฉพาะเซสชันนี้

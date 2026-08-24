@@ -141,7 +141,8 @@ impl TranscriptReconciler {
                 fallback
             } else {
                 let mut segment = self.active_prefix.clone();
-                let tail = reconcile_mutable_tail(&self.active_prefix, &self.draft, &incoming, false);
+                let tail =
+                    reconcile_mutable_tail(&self.active_prefix, &self.draft, &incoming, false);
                 segment.extend(tail);
                 segment
             }
@@ -245,21 +246,14 @@ fn reconcile_mutable_tail(
         // บางรอบ Whisper เติมคำหลงมาหนึ่งคำหน้าประโยคเก่าที่เลื่อนพ้น window
         // ต้องข้ามคำนั้นก่อนตรวจ suffix เพื่อไม่ให้ประโยคเดิมกลับมาแสดงซ้ำชั่วคราว
         if let Some(tail_start) = stable_tail_start_after_leading_word(stable, incoming) {
-            return reconciled_partial_tail(
-                draft,
-                &incoming[tail_start..],
-                preserve_partial_draft,
-            );
+            return reconciled_partial_tail(draft, &incoming[tail_start..], preserve_partial_draft);
         }
     }
 
     // Whisper บางรอบย้อนกลับมาเหลือเพียง prefix ของ draft เดิมก่อนจะต่อคำใหม่
     // การรับผลนั้นทันทีทำให้ subtitle หด ทั้งที่ยังไม่มีคำแก้ไขมาหักล้างข้อความเดิม
     let draft_prefix = common_prefix_len(draft, incoming);
-    if preserve_partial_draft
-        && incoming.len() < draft.len()
-        && draft_prefix == incoming.len()
-    {
+    if preserve_partial_draft && incoming.len() < draft.len() && draft_prefix == incoming.len() {
         return draft.to_vec();
     }
 
@@ -337,10 +331,7 @@ fn shifted_window_start(draft: &[String], incoming: &[String]) -> Option<usize> 
 }
 
 /// คืนตำแหน่ง tail เมื่อ hypothesis มีคำหลงหนึ่งคำแล้วตามด้วย suffix ของประโยคที่ปิดแล้ว
-fn stable_tail_start_after_leading_word(
-    stable: &[String],
-    incoming: &[String],
-) -> Option<usize> {
+fn stable_tail_start_after_leading_word(stable: &[String], incoming: &[String]) -> Option<usize> {
     let overlap = longest_word_overlap(stable, incoming.get(1..)?);
     (overlap >= 3).then_some(overlap + 1)
 }
@@ -386,7 +377,9 @@ fn meaningful_overlap(previous: &[String], incoming: &[String], overlap: usize) 
 
 /// คืนตำแหน่งหลังคำจบประโยคล่าสุด โดยไม่ย้ายเศษประโยคปัจจุบันไปส่วนคงที่
 fn last_sentence_boundary(words: &[String]) -> usize {
-    let completed = words.get(..words.len().saturating_sub(1)).unwrap_or_default();
+    let completed = words
+        .get(..words.len().saturating_sub(1))
+        .unwrap_or_default();
     completed
         .iter()
         .rposition(|word| is_sentence_boundary_word(word))
@@ -599,11 +592,7 @@ mod tests {
     fn short_partial_from_the_stable_prefix_does_not_clear_the_live_draft() {
         let mut reconciler = TranscriptReconciler::default();
 
-        partial(
-            &mut reconciler,
-            1,
-            "First sentence. still speaking clearly",
-        );
+        partial(&mut reconciler, 1, "First sentence. still speaking clearly");
         partial(&mut reconciler, 1, "First sentence. still");
         assert_eq!(
             reconciler.presentation_text(),
@@ -627,11 +616,7 @@ mod tests {
             1,
             "So today I wanted to share with you what I do to practice and",
         );
-        partial(
-            &mut reconciler,
-            1,
-            "with you what I do to practice English",
-        );
+        partial(&mut reconciler, 1, "with you what I do to practice English");
         assert_eq!(
             reconciler.presentation_text(),
             "So today I wanted to share with you what I do to practice English"
@@ -694,11 +679,7 @@ mod tests {
             1,
             "First sentence ends here. current words keep moving",
         );
-        partial(
-            &mut reconciler,
-            1,
-            "current words keep moving forward",
-        );
+        partial(&mut reconciler, 1, "current words keep moving forward");
 
         assert_eq!(
             reconciler.presentation_text(),
@@ -714,7 +695,10 @@ mod tests {
         partial(&mut reconciler, 1, "I like blue cars. Next");
         partial(&mut reconciler, 1, "I like red cars. Next word");
 
-        assert_eq!(reconciler.presentation_text(), "I like blue cars. Next word");
+        assert_eq!(
+            reconciler.presentation_text(),
+            "I like blue cars. Next word"
+        );
     }
 
     #[test]
@@ -736,11 +720,7 @@ mod tests {
             1,
             "A complete thought. this phrase keeps moving slowly",
         );
-        partial(
-            &mut reconciler,
-            1,
-            "phrase keeps moving slowly forward",
-        );
+        partial(&mut reconciler, 1, "phrase keeps moving slowly forward");
 
         assert_eq!(
             reconciler.presentation_text(),
@@ -865,11 +845,7 @@ mod tests {
         let mut reconciler = TranscriptReconciler::default();
 
         partial(&mut reconciler, 1, "Old sentence. draft");
-        final_update(
-            &mut reconciler,
-            1,
-            "Revised sentence. Brand new sentence.",
-        );
+        final_update(&mut reconciler, 1, "Revised sentence. Brand new sentence.");
 
         assert_eq!(
             reconciler.presentation_text(),

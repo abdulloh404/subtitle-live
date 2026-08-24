@@ -2,7 +2,9 @@
 
 mod backend;
 
-pub use backend::{ComputeBackend, compiled_compute_backend};
+pub use backend::{
+    ComputeBackend, available_compute_requests, compiled_compute_backend, resolve_compute_backend,
+};
 
 use std::{
     collections::VecDeque,
@@ -21,7 +23,10 @@ use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
 };
 
-use crate::audio::{LatestQueue, MixedAudioChunk, SAMPLE_RATE_HZ};
+use crate::{
+    audio::{LatestQueue, MixedAudioChunk, SAMPLE_RATE_HZ},
+    config::ComputeRequest,
+};
 
 // คิว debug แยกจากเหตุการณ์หลัก เพื่อไม่ให้การเปิดหน้าดูข้อมูลรบกวน subtitle
 const DEBUG_QUEUE_CAPACITY: usize = 256;
@@ -60,6 +65,8 @@ pub struct SttStartConfig {
     pub model_path: PathBuf,
     /// รหัสภาษาที่ส่งให้ Whisper โดยระยะแรกรองรับเฉพาะภาษาอังกฤษ
     pub language: String,
+    /// compute backend ที่ร้องขอสำหรับ model session นี้
+    pub compute_backend: ComputeRequest,
     /// ช่วงเสียงใหม่ขั้นต่ำระหว่างผลชั่วคราวแต่ละรอบ
     pub step_ms: u32,
     /// ความยาวเสียงย้อนหลังสูงสุดที่ส่งเข้า Whisper
@@ -526,7 +533,9 @@ impl ActiveStt {
             )
         })?;
 
-        let context_parameters = WhisperContextParameters::default();
+        let compute_backend = resolve_compute_backend(config.compute_backend)?;
+        let mut context_parameters = WhisperContextParameters::default();
+        context_parameters.use_gpu(compute_backend.uses_gpu());
         let gpu_backend_requested = context_parameters.use_gpu;
         let gpu_device = context_parameters.gpu_device;
         let context = WhisperContext::new_with_params(&config.model_path, context_parameters)
@@ -611,9 +620,7 @@ impl ActiveStt {
         while let Some(chunk) = chunks.pop_front() {
             if self.speech_active
                 && self.last_speech_at.is_some_and(|last_speech_at| {
-                    chunk
-                        .captured_at
-                        .saturating_duration_since(last_speech_at)
+                    chunk.captured_at.saturating_duration_since(last_speech_at)
                         >= ENDPOINT_SILENCE_DURATION
                 })
             {
@@ -703,8 +710,7 @@ impl ActiveStt {
                 }));
         let forced_endpoint = self.utterance_audio.len() >= max_utterance_samples;
         let final_inference = silence_deadline_reached || forced_endpoint;
-        let enough_speech =
-            self.speech_samples >= duration_to_samples(MINIMUM_SPEECH_DURATION);
+        let enough_speech = self.speech_samples >= duration_to_samples(MINIMUM_SPEECH_DURATION);
 
         if final_inference && !enough_speech {
             self.reset_audio();
@@ -981,8 +987,8 @@ fn normalize_partial_hypothesis_text(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        final_hypothesis_or_previous, normalize_hypothesis_text,
-        normalize_partial_hypothesis_text, spawn_service,
+        final_hypothesis_or_previous, normalize_hypothesis_text, normalize_partial_hypothesis_text,
+        spawn_service,
     };
     use crate::audio::LatestQueue;
 
@@ -1010,7 +1016,10 @@ mod tests {
 
     #[test]
     fn terminal_punctuation_is_deferred_until_final() {
-        assert_eq!(normalize_partial_hypothesis_text("Welcome to my."), "Welcome to my");
+        assert_eq!(
+            normalize_partial_hypothesis_text("Welcome to my."),
+            "Welcome to my"
+        );
         assert_eq!(normalize_partial_hypothesis_text("So?"), "So");
         assert_eq!(normalize_partial_hypothesis_text("Wait,"), "Wait,");
     }

@@ -44,7 +44,7 @@ impl ConfigWriter {
                                 tracing::error!(
                                     config_path = %path.display(),
                                     error = %error,
-                                    "บันทึกการตั้งค่าล้มเหลว"
+                                    "Failed to save configuration"
                                 );
                             }
                             if should_shutdown {
@@ -69,7 +69,7 @@ impl ConfigWriter {
             .send(WriteCommand::Save(Box::new(config.clone())))
             .is_err()
         {
-            tracing::error!("ไม่สามารถติดต่อ config writer ได้");
+            tracing::error!("Configuration writer is unavailable");
         }
     }
 

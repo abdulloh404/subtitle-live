@@ -30,7 +30,7 @@ pub fn run_overlay_helper() -> io::Result<()> {
             drop(event_sender);
             let _ = join_helper_worker(event_writer, "overlay IPC writer");
             return Err(io::Error::other(format!(
-                "ไม่สามารถเปิด stdin ของ overlay helper ได้: {error}"
+                "failed to open stdin for the overlay helper: {error}"
             )));
         }
     };
@@ -218,7 +218,7 @@ fn report_command_result(
 fn join_helper_worker(worker: thread::JoinHandle<()>, name: &str) -> io::Result<()> {
     worker
         .join()
-        .map_err(|_| io::Error::other(format!("{name} หยุดทำงานด้วย panic")))
+        .map_err(|_| io::Error::other(format!("{name} panicked")))
 }
 
 /// เขียน event ใน worker เพื่อไม่ให้ stdout backpressure หยุดการวาด subtitle
@@ -234,7 +234,9 @@ fn spawn_event_writer(
                 match message {
                     WriterMessage::Event(event) => {
                         if let Err(error) = write_message(&mut writer, &event) {
-                            eprintln!("ไม่สามารถส่ง overlay event กลับ main process ได้: {error}");
+                            eprintln!(
+                                "Failed to send an overlay event to the main process: {error}"
+                            );
                             break;
                         }
                     }
