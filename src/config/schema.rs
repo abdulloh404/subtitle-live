@@ -292,7 +292,7 @@ pub struct SttConfig {
     pub model_path: Option<PathBuf>,
     /// backend ประมวลผลที่ร้องขอ เช่น `auto`
     pub backend: String,
-    /// ระยะห่างระหว่างรอบส่งเสียงเข้า STT
+    /// ระยะห่างระหว่างผลถอดเสียงชั่วคราวระหว่างที่กำลังพูด
     pub step_ms: u32,
     /// ความยาวเสียงย้อนหลังสูงสุดที่ใช้เป็น context
     pub window_ms: u32,
@@ -307,7 +307,7 @@ impl Default for SttConfig {
             model: "small.en".to_owned(),
             model_path: None,
             backend: "auto".to_owned(),
-            step_ms: 150,
+            step_ms: 450,
             window_ms: 3_000,
             vad_enabled: true,
         }
