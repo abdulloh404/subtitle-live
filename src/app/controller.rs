@@ -1,12 +1,13 @@
 //! ตัวควบคุมสถานะแอปพลิเคชันและกฎการเลือกแหล่งเสียง
 
 use crate::{
+    audio_source::{
+        ApplicationIdentity, ApplicationKey, CaptureTarget, StreamDiscriminator, StreamInfo,
+    },
     config::{
         AppConfig, ApplicationRule, SUBTITLE_POSITIONS, SUBTITLE_TEXT_ALIGNMENTS, StreamRule,
     },
-    pipewire::{
-        ApplicationIdentity, ApplicationKey, CaptureTarget, StreamDiscriminator, StreamInfo,
-    },
+    model::whisper_model,
 };
 
 use super::{AppCommand, AppEvent, ApplicationState};
@@ -26,10 +27,14 @@ pub struct ApplicationController {
     config: AppConfig,
     /// สถานะวงจรชีวิตล่าสุดของ pipeline
     state: ApplicationState,
-    /// snapshot ล่าสุดของ playback stream ที่ PipeWire ค้นพบ
+    /// snapshot ล่าสุดของ playback stream ที่ audio backend ค้นพบ
     streams: Vec<StreamInfo>,
     /// เลขลำดับคำขอ retry เพื่อให้ runtime เห็นคำสั่งจากผู้เรียกทุกช่องทาง
     retry_generation: u64,
+    /// เลขลำดับคำขอดาวน์โหลด model เพื่อให้ runtime ประมวลผลเพียงครั้งเดียว
+    model_download_generation: u64,
+    /// identifier ของ model ที่ผู้ใช้ขอดาวน์โหลดล่าสุด
+    model_download_request: Option<String>,
     /// สถานะ debug ชั่วคราว ซึ่งเริ่มปิดใหม่ทุกครั้งที่เปิดโปรแกรม
     debug_session: DebugSessionState,
 }
@@ -49,6 +54,8 @@ impl ApplicationController {
             state,
             streams: Vec::new(),
             retry_generation: 0,
+            model_download_generation: 0,
+            model_download_request: None,
             debug_session: DebugSessionState::default(),
         }
     }
@@ -61,6 +68,16 @@ impl ApplicationController {
     /// คืนเลขลำดับคำขอ retry ล่าสุดสำหรับให้ runtime ตรวจจับแบบไม่บล็อก
     pub const fn retry_generation(&self) -> u64 {
         self.retry_generation
+    }
+
+    /// คืนเลขลำดับคำขอดาวน์โหลด model ล่าสุด
+    pub const fn model_download_generation(&self) -> u64 {
+        self.model_download_generation
+    }
+
+    /// คืน identifier ของ model ที่ผู้ใช้ขอดาวน์โหลดล่าสุด
+    pub fn model_download_request(&self) -> Option<&str> {
+        self.model_download_request.as_deref()
     }
 
     /// คืนสถานะ debug ของเซสชันปัจจุบัน
@@ -83,7 +100,7 @@ impl ApplicationController {
         self.state = state;
     }
 
-    /// แทนที่รายการ stream ด้วย snapshot จาก PipeWire รอบล่าสุด
+    /// แทนที่รายการ stream ด้วย snapshot จาก audio backend รอบล่าสุด
     pub fn replace_streams(&mut self, streams: Vec<StreamInfo>) {
         self.streams = streams;
     }
@@ -283,6 +300,14 @@ impl ApplicationController {
                 self.config.general.keep_running_when_closed = enabled;
                 AppEvent::ConfigChanged("general.keep_running_when_closed")
             }
+            AppCommand::SetAudioSourceBackend(backend) => {
+                if self.config.audio.backend != backend {
+                    self.config.audio.backend = backend;
+                    self.streams.clear();
+                    self.request_pipeline_restart_if_running();
+                }
+                AppEvent::ConfigChanged("audio.backend")
+            }
             AppCommand::SetSttStepMs(step_ms) => {
                 if !(50..=1_000).contains(&step_ms) {
                     return AppEvent::Error(format!(
@@ -300,6 +325,32 @@ impl ApplicationController {
                 }
                 self.config.stt.window_ms = window_ms;
                 AppEvent::ConfigChanged("stt.window_ms")
+            }
+            AppCommand::SetSttModel(model) => {
+                if whisper_model(&model).is_none() {
+                    return AppEvent::Error(format!("Unsupported Whisper model: {model}"));
+                }
+                if self.config.stt.model != model || self.config.stt.model_path.is_some() {
+                    self.config.stt.model = model;
+                    self.config.stt.model_path = None;
+                    self.request_pipeline_restart_if_running();
+                }
+                AppEvent::ConfigChanged("stt.model")
+            }
+            AppCommand::DownloadSttModel(model) => {
+                if whisper_model(&model).is_none() {
+                    return AppEvent::Error(format!("Unsupported Whisper model: {model}"));
+                }
+                self.model_download_request = Some(model);
+                self.model_download_generation = self.model_download_generation.saturating_add(1);
+                AppEvent::SessionChanged
+            }
+            AppCommand::SetSttComputeBackend(backend) => {
+                if self.config.stt.backend != backend {
+                    self.config.stt.backend = backend;
+                    self.request_pipeline_restart_if_running();
+                }
+                AppEvent::ConfigChanged("stt.backend")
             }
             AppCommand::SetVadEnabled(enabled) => {
                 self.config.stt.vad_enabled = enabled;
@@ -377,6 +428,15 @@ impl ApplicationController {
             AppCommand::Quit => AppEvent::QuitRequested,
         }
     }
+
+    /// ทำให้ runtime เห็นการเปลี่ยนค่าที่ต้องสร้าง service/session ใหม่ โดยไม่ restart ตอนหยุดอยู่
+    fn request_pipeline_restart_if_running(&mut self) {
+        if !self.config.general.live_subtitles {
+            return;
+        }
+        self.state = ApplicationState::Starting;
+        self.retry_generation = self.retry_generation.saturating_add(1);
+    }
 }
 
 /// ปรับค่าคำบรรยายที่โหลดจากไฟล์ให้อยู่ในช่วงที่ UI รองรับ
@@ -390,7 +450,7 @@ fn normalize_subtitle_config(config: &mut AppConfig) {
     config.subtitle.font_size = config.subtitle.font_size.clamp(16, 72);
 }
 
-/// สร้างกฎ application จาก stable metadata ที่ PipeWire รายงาน
+/// สร้างกฎ application จาก stable metadata ที่ audio backend รายงาน
 fn application_rule(application: &ApplicationIdentity, enabled: bool) -> ApplicationRule {
     ApplicationRule {
         enabled,
@@ -473,7 +533,8 @@ fn non_empty(value: &Option<String>) -> Option<&str> {
 mod tests {
     use crate::{
         app::{AppCommand, AppEvent, ApplicationController, ApplicationState},
-        config::{AppConfig, ApplicationRule},
+        audio_source::AudioSourceBackend,
+        config::{AppConfig, ApplicationRule, ComputeRequest},
     };
 
     #[test]
@@ -508,5 +569,40 @@ mod tests {
 
         assert_eq!(event, AppEvent::ConfigChanged("subtitle.monitor_id"));
         assert_eq!(controller.config().subtitle.monitor_id, "connector:DP-1");
+    }
+
+    #[test]
+    fn compute_backend_change_requests_a_running_pipeline_restart() {
+        let mut config = AppConfig::default();
+        config.general.live_subtitles = true;
+        let mut controller = ApplicationController::new(config);
+        let generation_before_change = controller.retry_generation();
+
+        let event =
+            controller.handle_command(AppCommand::SetSttComputeBackend(ComputeRequest::Cuda));
+
+        assert_eq!(event, AppEvent::ConfigChanged("stt.backend"));
+        assert_eq!(controller.config().stt.backend, ComputeRequest::Cuda);
+        assert_eq!(controller.retry_generation(), generation_before_change + 1);
+        assert_eq!(controller.state(), ApplicationState::Starting);
+    }
+
+    #[test]
+    fn audio_backend_change_requests_a_running_pipeline_restart() {
+        let mut config = AppConfig::default();
+        config.general.live_subtitles = true;
+        let mut controller = ApplicationController::new(config);
+        let generation_before_change = controller.retry_generation();
+
+        let event = controller.handle_command(AppCommand::SetAudioSourceBackend(
+            AudioSourceBackend::PulseAudio,
+        ));
+
+        assert_eq!(event, AppEvent::ConfigChanged("audio.backend"));
+        assert_eq!(
+            controller.config().audio.backend,
+            AudioSourceBackend::PulseAudio
+        );
+        assert_eq!(controller.retry_generation(), generation_before_change + 1);
     }
 }

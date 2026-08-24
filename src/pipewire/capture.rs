@@ -10,9 +10,10 @@ use libspa_sys as spa_sys;
 use pipewire as pw;
 use pw::{prelude::*, spa};
 
-use crate::audio::{AudioBufferPool, LatestQueue, SAMPLE_RATE_HZ, SourceAudioChunk};
-
-use super::{PipeWireEvent, StreamInfo};
+use crate::{
+    audio::{AudioBufferPool, LatestQueue, SAMPLE_RATE_HZ, SourceAudioChunk},
+    audio_source::{AudioSourceEvent, StreamInfo},
+};
 
 /// สถานะที่ผูกกับ PipeWire callback ของ stream เดียว
 struct CaptureUserData {
@@ -55,7 +56,7 @@ pub(super) fn create_capture(
     info: &StreamInfo,
     generation: u64,
     audio: LatestQueue<SourceAudioChunk>,
-    events: std::sync::mpsc::Sender<PipeWireEvent>,
+    events: std::sync::mpsc::Sender<AudioSourceEvent>,
 ) -> Result<CaptureSession, String> {
     let target = info
         .object_serial
@@ -92,13 +93,13 @@ pub(super) fn create_capture(
         let audio_generation = generation;
         move |_, state| match state {
             pw::stream::StreamState::Streaming => {
-                let _ = state_events.send(PipeWireEvent::CaptureStarted {
+                let _ = state_events.send(AudioSourceEvent::CaptureStarted {
                     runtime_id: source_id,
                     audio_generation,
                 });
             }
             pw::stream::StreamState::Error(message) => {
-                let _ = state_events.send(PipeWireEvent::CaptureError {
+                let _ = state_events.send(AudioSourceEvent::CaptureError {
                     runtime_id: source_id,
                     audio_generation,
                     message: format!("PipeWire capture failed for stream {source_id}: {message}"),

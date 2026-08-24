@@ -18,6 +18,7 @@ use subtitle_live::{
         OverlayEvent, OverlayRuntimeBackend, run_overlay_helper,
     },
     runtime::ApplicationRuntime,
+    stt::{available_compute_requests, preferred_compute_request},
     ui::SettingsPresenter,
 };
 
@@ -157,9 +158,10 @@ fn main() -> Result<(), AppError> {
 
     // ถ้า config เสีย แอปยังเปิดได้ด้วยค่า default แต่จะไม่เขียนทับไฟล์เดิมโดยไม่ตั้งใจ
     let config_path = config::default_path()?;
-    let loaded = config::load_config(&config_path)?;
+    let config_exists = config_path.is_file();
+    let mut loaded = config::load_config(&config_path)?;
     let persistence_enabled = loaded.warning.is_none();
-    let startup_warning = loaded.warning.map(|warning| {
+    let startup_warning = loaded.warning.take().map(|warning| {
         tracing::warn!(
             config_path = %config_path.display(),
             warning = %warning,
@@ -167,16 +169,25 @@ fn main() -> Result<(), AppError> {
         );
         warning.to_string()
     });
-    let default_model_path = config::default_model_path()?;
+    let available_requests = available_compute_requests();
+    let configured_compute_request = loaded.config.stt.backend;
+    let selected_compute_request = if !config_exists {
+        preferred_compute_request()
+    } else if available_requests.contains(&configured_compute_request) {
+        configured_compute_request
+    } else {
+        preferred_compute_request()
+    };
+    if config_exists && configured_compute_request != selected_compute_request {
+        tracing::warn!(
+            requested_backend = configured_compute_request.as_str(),
+            fallback_backend = selected_compute_request.as_str(),
+            "Saved compute backend is unavailable; using the preferred available backend"
+        );
+    }
+    loaded.config.stt.backend = selected_compute_request;
+    let models_directory = config::default_model_directory()?;
     let controller = Rc::new(RefCell::new(ApplicationController::new(loaded.config)));
-    let model_path = controller
-        .borrow()
-        .config()
-        .stt
-        .model_path
-        .clone()
-        .unwrap_or_else(|| default_model_path.clone());
-    let model_ready = model_path.is_file();
     let runtime = Rc::new(RefCell::new(None::<ApplicationRuntime>));
     let desktop_session = DesktopSession::detect();
     let overlay_backend = OverlayRuntimeBackend::detect(desktop_session);
@@ -209,6 +220,7 @@ fn main() -> Result<(), AppError> {
         desktop_session = desktop_session.as_str(),
         settings_backend = desktop_session.as_str(),
         overlay_backend = effective_overlay_backend.as_str(),
+        compute_backend = selected_compute_request.as_str(),
         xwayland_available = effective_overlay_backend == OverlayRuntimeBackend::XWayland,
         "Subtitle-live initialized"
     );
@@ -227,8 +239,7 @@ fn main() -> Result<(), AppError> {
             *startup_runtime.borrow_mut() = Some(ApplicationRuntime::new(
                 Rc::clone(&startup_controller),
                 startup_config_path.clone(),
-                default_model_path.clone(),
-                model_ready,
+                models_directory.clone(),
                 persistence_enabled,
                 startup_warning.clone(),
             ));
@@ -263,14 +274,14 @@ fn main() -> Result<(), AppError> {
                 OverlayRuntimeBackend::Unavailable => DesktopOverlay::Unavailable,
             };
 
-            let (model_path, model_exists) = {
+            let model_status = {
                 let runtime = activate_runtime.borrow();
                 let runtime = runtime
                     .as_ref()
                     .expect("primary application runtime was not initialized");
-                (runtime.model_path(), runtime.model_exists())
+                runtime.model_status()
             };
-            settings.update_model_status(&model_path, model_exists);
+            settings.update_model_status(&model_status);
             *activate_desktop.borrow_mut() = Some(DesktopUi { settings, overlay });
 
             install_runtime_poll(
@@ -335,7 +346,7 @@ fn install_runtime_poll(
             }
         }
 
-        let (state, last_error, metrics, pipewire_status) = {
+        let (state, last_error, metrics, audio_source_status) = {
             let runtime = runtime.borrow();
             let runtime = runtime
                 .as_ref()
@@ -344,7 +355,7 @@ fn install_runtime_poll(
                 runtime.state(),
                 runtime.last_error().map(str::to_owned),
                 runtime.metrics_snapshot(),
-                runtime.pipewire_status(),
+                runtime.audio_source_status(),
             )
         };
         let subtitle_config = controller.borrow().config().subtitle.clone();
@@ -352,15 +363,18 @@ fn install_runtime_poll(
             // งานส่วนนี้มีเฉพาะการอัปเดต widget; model load และ inference อยู่บน worker ทั้งหมด
             desktop.settings.update_state(state, last_error.as_deref());
             desktop.settings.update_metrics(metrics);
-            desktop.settings.update_pipewire_status(pipewire_status);
             desktop
                 .settings
-                .append_debug_records(&update.debug_records);
+                .update_audio_source_status(&audio_source_status);
+            desktop.settings.append_debug_records(&update.debug_records);
             if let Some(status) = update.debug_log_status.as_ref() {
                 desktop.settings.update_debug_log_status(status);
             }
             if let Some(counts) = update.debug_drop_counts.as_ref() {
                 desktop.settings.update_debug_drop_counts(counts);
+            }
+            if let Some(status) = update.model_status.as_ref() {
+                desktop.settings.update_model_status(status);
             }
             let overlay_events = desktop.overlay.poll_events();
             for event in &overlay_events {

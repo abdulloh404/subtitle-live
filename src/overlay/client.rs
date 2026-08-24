@@ -81,7 +81,7 @@ impl OverlayClient {
         if backend == OverlayRuntimeBackend::Unavailable {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                "desktop session นี้ไม่มี X11 display สำหรับ subtitle overlay",
+                "this desktop session has no X11 display for the subtitle overlay",
             ));
         }
 
@@ -99,14 +99,14 @@ impl OverlayClient {
             terminate_child(&mut child);
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
-                "helper ไม่มี stdin pipe",
+                "the overlay helper has no stdin pipe",
             ));
         };
         let Some(child_stdout) = child.stdout.take() else {
             terminate_child(&mut child);
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
-                "helper ไม่มี stdout pipe",
+                "the overlay helper has no stdout pipe",
             ));
         };
 
@@ -222,7 +222,7 @@ impl OverlayClient {
                         && !self.shutdown_requested.load(Ordering::Acquire)
                         && self.status.get() != OverlayClientStatus::Error
                     {
-                        let message = "ช่องรับ event จาก overlay helper ถูกปิด".to_owned();
+                        let message = "the overlay helper event channel was closed".to_owned();
                         self.record_error(message.clone());
                         events.push(OverlayEvent::Error { message });
                     }
@@ -263,7 +263,7 @@ impl OverlayClient {
             return false;
         }
         if !self.command_mailbox.enqueue(command) {
-            self.record_error("ช่องส่งคำสั่งไป overlay helper ถูกปิด".to_owned());
+            self.record_error("the overlay helper command channel was closed".to_owned());
             return false;
         }
         true
@@ -300,14 +300,14 @@ impl OverlayClient {
         match child.try_wait() {
             Ok(Some(status)) => {
                 self.exit_reported.set(true);
-                let message = format!("overlay helper ออกก่อนกำหนด: {status}");
+                let message = format!("the overlay helper exited unexpectedly: {status}");
                 self.record_error(message.clone());
                 events.push(OverlayEvent::Error { message });
             }
             Ok(None) => {}
             Err(error) => {
                 self.exit_reported.set(true);
-                let message = format!("ตรวจสถานะ overlay helper ไม่สำเร็จ: {error}");
+                let message = format!("failed to check the overlay helper status: {error}");
                 self.record_error(message.clone());
                 events.push(OverlayEvent::Error { message });
             }
@@ -346,7 +346,7 @@ impl OverlayClient {
                     child_slot.take();
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
-                        "overlay helper ไม่หยุดภายในเวลาที่กำหนดและถูกบังคับปิด",
+                        "the overlay helper did not stop before the timeout and was terminated",
                     ));
                 }
                 Err(error) => {
@@ -548,7 +548,9 @@ fn spawn_command_writer(
                         && !transport_failed.swap(true, Ordering::AcqRel)
                     {
                         let _ = event_sender.send(OverlayEvent::Error {
-                            message: format!("ส่งคำสั่งไป overlay helper ไม่สำเร็จ: {error}"),
+                            message: format!(
+                                "failed to send a command to the overlay helper: {error}"
+                            ),
                         });
                     }
                     command_mailbox.close();
@@ -587,7 +589,7 @@ fn spawn_event_reader(
                         {
                             command_mailbox.close();
                             let _ = event_sender.send(OverlayEvent::Error {
-                                message: "overlay helper ปิด output pipe".to_owned(),
+                                message: "the overlay helper closed its output pipe".to_owned(),
                             });
                         }
                         break;
@@ -598,7 +600,9 @@ fn spawn_event_reader(
                         {
                             command_mailbox.close();
                             let _ = event_sender.send(OverlayEvent::Error {
-                                message: format!("อ่าน event จาก overlay helper ไม่สำเร็จ: {error}"),
+                                message: format!(
+                                    "failed to read an event from the overlay helper: {error}"
+                                ),
                             });
                         }
                         break;
@@ -622,9 +626,11 @@ fn join_worker(
     let Some(worker) = worker.borrow_mut().take() else {
         return Ok(());
     };
-    worker
-        .join()
-        .map_err(|_| io::Error::other(format!("{worker_name} panic ระหว่างปิด overlay helper")))
+    worker.join().map_err(|_| {
+        io::Error::other(format!(
+            "{worker_name} panicked while stopping the overlay helper"
+        ))
+    })
 }
 
 /// Join ใน Drop โดยห้าม panic ซ้ำระหว่าง unwinding

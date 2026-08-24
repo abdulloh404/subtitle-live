@@ -179,7 +179,7 @@ mod tests {
             tracker.record_end_to_end(duration);
         }
 
-        let inner = tracker.inner.lock().expect("ล็อกชุดตัวอย่างได้");
+        let inner = tracker.inner.lock().expect("latency samples lock");
         assert_eq!(inner.audio_buffer.len(), SAMPLE_CAPACITY);
         assert_eq!(inner.whisper.len(), SAMPLE_CAPACITY);
         assert_eq!(inner.end_to_end.len(), SAMPLE_CAPACITY);

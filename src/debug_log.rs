@@ -3,8 +3,8 @@
 use std::{
     fs::{self, DirBuilder, File, OpenOptions, Permissions},
     io::{BufWriter, Write},
-    path::PathBuf,
     os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -17,6 +17,7 @@ use std::{
 use serde::Serialize;
 
 use crate::{audio::LatestQueue, stt::SttDebugRecord};
+use gtk::glib;
 
 // จำกัด raw transcript ที่รอเขียน เพื่อไม่ให้หน่วยความจำโตเมื่อดิสก์ทำงานช้า
 const RECORD_QUEUE_CAPACITY: usize = 512;
@@ -207,17 +208,18 @@ fn open_output(path: &PathBuf) -> Result<File, String> {
     directory_builder.recursive(true).mode(0o700);
     directory_builder
         .create(parent)
-        .map_err(|error| format!("สร้าง directory debug log ไม่สำเร็จ: {error}"))?;
-    fs::set_permissions(parent, Permissions::from_mode(0o700))
-        .map_err(|error| format!("กำหนดสิทธิ์ directory debug log เป็น 0700 ไม่สำเร็จ: {error}"))?;
+        .map_err(|error| format!("failed to create debug log directory: {error}"))?;
+    fs::set_permissions(parent, Permissions::from_mode(0o700)).map_err(|error| {
+        format!("failed to set debug log directory permissions to 0700: {error}")
+    })?;
     let file = OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
         .open(path)
-        .map_err(|error| format!("เปิดไฟล์ debug log ไม่สำเร็จ: {error}"))?;
+        .map_err(|error| format!("failed to open debug log file: {error}"))?;
     file.set_permissions(Permissions::from_mode(0o600))
-        .map_err(|error| format!("กำหนดสิทธิ์ไฟล์ debug log เป็น 0600 ไม่สำเร็จ: {error}"))?;
+        .map_err(|error| format!("failed to set debug log file permissions to 0600: {error}"))?;
     Ok(file)
 }
 
@@ -228,19 +230,19 @@ fn write_pending(
     for record in records.drain() {
         let line = JsonRecord::from(&record);
         serde_json::to_writer(&mut *writer, &line)
-            .map_err(|error| format!("เขียน JSON debug log ไม่สำเร็จ: {error}"))?;
+            .map_err(|error| format!("failed to serialize a debug log record: {error}"))?;
         writer
             .write_all(b"\n")
-            .map_err(|error| format!("เขียนบรรทัด debug log ไม่สำเร็จ: {error}"))?;
+            .map_err(|error| format!("failed to write a debug log line: {error}"))?;
     }
     writer
         .flush()
-        .map_err(|error| format!("flush debug log ไม่สำเร็จ: {error}"))
+        .map_err(|error| format!("failed to flush the debug log: {error}"))
 }
 
 #[derive(Serialize)]
 struct JsonRecord<'a> {
-    timestamp_unix_ms: u64,
+    timestamp: String,
     audio_generation: u64,
     segment_id: u64,
     kind: &'static str,
@@ -258,7 +260,7 @@ struct JsonRecord<'a> {
 impl<'a> From<&'a SttDebugRecord> for JsonRecord<'a> {
     fn from(record: &'a SttDebugRecord) -> Self {
         Self {
-            timestamp_unix_ms: record.timestamp_unix_ms,
+            timestamp: utc_timestamp(record.timestamp_unix_ms),
             audio_generation: record.audio_generation,
             segment_id: record.segment_id,
             kind: record.kind.as_str(),
@@ -273,4 +275,16 @@ impl<'a> From<&'a SttDebugRecord> for JsonRecord<'a> {
             window_ms: record.window_ms,
         }
     }
+}
+
+/// แปลง Unix timestamp เป็น ISO 8601 แบบ UTC พร้อม millisecond
+fn utc_timestamp(timestamp_unix_ms: u64) -> String {
+    let seconds = i64::try_from(timestamp_unix_ms / 1_000).unwrap_or(i64::MAX);
+    let milliseconds = timestamp_unix_ms % 1_000;
+    glib::DateTime::from_unix_utc(seconds)
+        .and_then(|timestamp| timestamp.format("%Y-%m-%dT%H:%M:%S"))
+        .map_or_else(
+            |_| timestamp_unix_ms.to_string(),
+            |timestamp| format!("{timestamp}.{milliseconds:03}Z"),
+        )
 }

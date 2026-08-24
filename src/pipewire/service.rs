@@ -15,12 +15,12 @@ use std::{
 use pipewire as pw;
 use pw::spa::prelude::*;
 
-use crate::audio::{LatestQueue, SourceAudioChunk};
-
-use super::{
-    ApplicationIdentity, CaptureTarget, PipeWireEvent, StreamInfo,
-    capture::{CaptureSession, create_capture},
+use crate::{
+    audio::{LatestQueue, SourceAudioChunk},
+    audio_source::{ApplicationIdentity, AudioSourceEvent, CaptureTarget, StreamInfo},
 };
+
+use super::capture::{CaptureSession, create_capture};
 
 /// คำสั่งข้าม thread ที่เปลี่ยนสถานะ capture ภายใน PipeWire main loop
 #[derive(Clone)]
@@ -72,7 +72,7 @@ impl PipeWireCommandSender {
 /// handle ฝั่ง application สำหรับส่งคำสั่งและรับ event แบบไม่บล็อก
 pub struct PipeWireService {
     commands: PipeWireCommandSender,
-    events: Arc<Mutex<mpsc::Receiver<PipeWireEvent>>>,
+    events: Arc<Mutex<mpsc::Receiver<AudioSourceEvent>>>,
     /// สิทธิ์ join เธรด PipeWire ซึ่งอยู่กับ service หลักเพียงตัวเดียว
     worker: Option<thread::JoinHandle<()>>,
 }
@@ -83,17 +83,17 @@ impl PipeWireService {
         self.commands.clone()
     }
 
-    pub fn set_selected(
-        &self,
-        targets: Vec<CaptureTarget>,
-        audio_generation: u64,
-    ) -> Result<(), PipeWireServiceError> {
-        self.commands.set_selected(targets, audio_generation)
-    }
+    // pub fn set_selected(
+    //     &self,
+    //     targets: Vec<CaptureTarget>,
+    //     audio_generation: u64,
+    // ) -> Result<(), PipeWireServiceError> {
+    //     self.commands.set_selected(targets, audio_generation)
+    // }
 
-    pub fn stop_capture(&self) -> Result<(), PipeWireServiceError> {
-        self.commands.stop_capture()
-    }
+    // pub fn stop_capture(&self) -> Result<(), PipeWireServiceError> {
+    //     self.commands.stop_capture()
+    // }
 
     pub fn shutdown(&self) -> Result<(), PipeWireServiceError> {
         self.commands.shutdown()
@@ -119,7 +119,7 @@ impl PipeWireService {
     }
 
     /// ดึง event ที่รออยู่ทั้งหมดโดยไม่รอ PipeWire สร้าง event ใหม่
-    pub fn drain_events(&self) -> Vec<PipeWireEvent> {
+    pub fn drain_events(&self) -> Vec<AudioSourceEvent> {
         let Ok(events) = self.events.try_lock() else {
             return Vec::new();
         };
@@ -160,7 +160,7 @@ pub fn spawn_service(audio: LatestQueue<SourceAudioChunk>) -> PipeWireService {
     {
         Ok(worker) => Some(worker),
         Err(error) => {
-            let _ = failure_events.send(PipeWireEvent::Error(format!(
+            let _ = failure_events.send(AudioSourceEvent::Error(format!(
                 "failed to start PipeWire service thread: {error}"
             )));
             None
@@ -176,7 +176,7 @@ pub fn spawn_service(audio: LatestQueue<SourceAudioChunk>) -> PipeWireService {
 
 fn run_service(
     command_receiver: pw::channel::Receiver<Command>,
-    events: mpsc::Sender<PipeWireEvent>,
+    events: mpsc::Sender<AudioSourceEvent>,
     audio: LatestQueue<SourceAudioChunk>,
 ) {
     pw::init();
@@ -196,7 +196,7 @@ fn run_service(
         let _core_listener = core
             .add_listener_local()
             .error(move |id, _, result, message| {
-                let _ = core_events.send(PipeWireEvent::Error(format!(
+                let _ = core_events.send(AudioSourceEvent::Error(format!(
                     "PipeWire core error on object {id} ({result}): {message}"
                 )));
             })
@@ -240,7 +240,7 @@ fn run_service(
     })();
 
     if let Err(error) = result {
-        let _ = events.send(PipeWireEvent::Error(format!(
+        let _ = events.send(AudioSourceEvent::Error(format!(
             "PipeWire service unavailable: {error}"
         )));
     }
@@ -251,7 +251,7 @@ struct ServiceState {
     /// main loop ที่ใช้สร้างและควบคุม capture stream
     mainloop: pw::MainLoop,
     /// channel ส่ง graph/capture event กลับไปยัง application runtime
-    events: mpsc::Sender<PipeWireEvent>,
+    events: mpsc::Sender<AudioSourceEvent>,
     /// คิวเสียงร่วมที่ callback ใช้ส่งข้อมูลไป mixer โดยไม่รอ
     audio: LatestQueue<SourceAudioChunk>,
     /// playback stream ปัจจุบัน indexed ด้วย runtime node ID
@@ -269,7 +269,7 @@ struct ServiceState {
 impl ServiceState {
     fn new(
         mainloop: pw::MainLoop,
-        events: mpsc::Sender<PipeWireEvent>,
+        events: mpsc::Sender<AudioSourceEvent>,
         audio: LatestQueue<SourceAudioChunk>,
     ) -> Self {
         Self {
@@ -362,7 +362,7 @@ impl ServiceState {
                     self.captures.insert(stream.runtime_id, capture);
                 }
                 Err(message) => {
-                    let _ = self.events.send(PipeWireEvent::CaptureError {
+                    let _ = self.events.send(AudioSourceEvent::CaptureError {
                         runtime_id: stream.runtime_id,
                         audio_generation: self.audio_generation,
                         message,
@@ -378,7 +378,7 @@ impl ServiceState {
         };
         let audio_generation = capture.generation();
         capture.disconnect();
-        let _ = self.events.send(PipeWireEvent::CaptureStopped {
+        let _ = self.events.send(AudioSourceEvent::CaptureStopped {
             runtime_id,
             audio_generation,
         });
@@ -387,7 +387,7 @@ impl ServiceState {
     fn emit_snapshot(&self) {
         let mut streams: Vec<_> = self.streams.values().cloned().collect();
         streams.sort_by_key(|stream| stream.runtime_id);
-        let _ = self.events.send(PipeWireEvent::StreamsChanged(streams));
+        let _ = self.events.send(AudioSourceEvent::StreamsChanged(streams));
     }
 }
 

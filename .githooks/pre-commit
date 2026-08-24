@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repository_root="$(git rev-parse --show-toplevel)"
+cd "$repository_root"
+
+make format
+
+staged_tree_dir="$(mktemp -d "${TMPDIR:-/tmp}/subtitle-live-pre-commit.XXXXXX")"
+
+cleanup() {
+    rm -rf -- "$staged_tree_dir"
+}
+
+trap cleanup EXIT
+
+git checkout-index --all --prefix="${staged_tree_dir}/"
+
+if ! (
+    cd "$staged_tree_dir"
+    cargo fmt --all -- --check
+); then
+    printf '%s\n' 'Staged Rust code is not formatted. Stage the formatted files and commit again.' >&2
+    exit 1
+fi

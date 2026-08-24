@@ -7,6 +7,8 @@
 pub mod app;
 /// การจับ แปลง ผสมเสียง และคิวเสียงแบบจำกัดขนาด
 pub mod audio;
+/// ขอบเขตกลางสำหรับเลือกและควบคุม PipeWire หรือ PulseAudio capture backend
+pub mod audio_source;
 /// การตั้งค่าผู้ใช้แบบมีเวอร์ชันและการบันทึกแบบเบื้องหลัง
 pub mod config;
 /// ตัวเขียนไฟล์ debug แบบไม่บล็อกเธรด GTK และ STT
@@ -17,10 +19,12 @@ pub mod error;
 pub mod logging;
 /// การวัด latency และสถานะของคิว
 pub mod metrics;
+/// Catalog และ download service สำหรับ Whisper model ภายในเครื่อง
+pub mod model;
 /// การแสดงหน้าต่างคำบรรยายแบบไม่รับอินพุต
 pub mod overlay;
-/// การค้นหา graph ของ PipeWire และจับเฉพาะ stream ที่เลือก
-pub mod pipewire;
+/// implementation ของ native PipeWire ซึ่งเข้าถึงผ่าน `audio_source` เท่านั้น
+mod pipewire;
 /// การประสานงานระหว่างสถานะ UI และบริการเบื้องหลัง
 pub mod runtime;
 /// การเชื่อมต่อ Whisper เพื่อถอดเสียงภายในเครื่อง

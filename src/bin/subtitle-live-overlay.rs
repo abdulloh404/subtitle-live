@@ -6,7 +6,7 @@ fn main() -> ExitCode {
     match subtitle_live::overlay::run_overlay_helper() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("ไม่สามารถเริ่ม subtitle overlay helper ได้: {error}");
+            eprintln!("Failed to start the subtitle overlay helper: {error}");
             ExitCode::FAILURE
         }
     }
