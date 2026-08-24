@@ -3,7 +3,8 @@
 mod backend;
 
 pub use backend::{
-    ComputeBackend, available_compute_requests, compiled_compute_backend, resolve_compute_backend,
+    ComputeBackend, available_compute_requests, compiled_compute_backend,
+    preferred_compute_request, resolve_compute_backend,
 };
 
 use std::{

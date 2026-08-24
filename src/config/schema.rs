@@ -291,7 +291,7 @@ pub struct SttConfig {
     pub model: String,
     /// path โมเดลแบบกำหนดเอง หรือ `None` เพื่อใช้ตำแหน่งมาตรฐาน
     pub model_path: Option<PathBuf>,
-    /// backend ประมวลผลที่ร้องขอสำหรับ Whisper
+    /// compute backend ที่ร้องขอสำหรับ Whisper และบันทึกใน TOML
     pub backend: ComputeRequest,
     /// ระยะห่างระหว่างผลถอดเสียงชั่วคราวระหว่างที่กำลังพูด
     pub step_ms: u32,
@@ -393,6 +393,14 @@ mod tests {
             .expect("legacy STT config should be readable");
 
         assert_eq!(config.backend, ComputeRequest::Cpu);
+    }
+
+    #[test]
+    fn toml_compute_backend_is_loaded() {
+        let config: SttConfig =
+            serde_json::from_str(r#"{"backend":"rocm"}"#).expect("STT config should be readable");
+
+        assert_eq!(config.backend, ComputeRequest::Rocm);
     }
 
     #[test]

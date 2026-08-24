@@ -1293,7 +1293,7 @@ fn value_row_with_label(title: &str, value_label: &gtk::Label) -> adw::ActionRow
     row
 }
 
-/// สร้างตัวเลือก compute เฉพาะ backend ที่ไบนารีปัจจุบันรองรับจริง
+// สร้างตัวเลือก compute โดยเรียง GPU ที่ตรวจพบก่อน CPU
 fn compute_backend_row(
     snapshot: &UiSnapshot,
     controller: Rc<RefCell<ApplicationController>>,
@@ -1344,7 +1344,7 @@ fn compute_backend_row(
 
     let row = adw::ActionRow::builder()
         .activatable_widget(&dropdown)
-        .subtitle("GPU options are available only in matching CUDA or ROCm builds")
+        .subtitle("GPU options require a matching build and detected device")
         .title("Compute Backend")
         .build();
     row.add_suffix(&dropdown);

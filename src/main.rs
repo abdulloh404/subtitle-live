@@ -18,6 +18,7 @@ use subtitle_live::{
         OverlayEvent, OverlayRuntimeBackend, run_overlay_helper,
     },
     runtime::ApplicationRuntime,
+    stt::{available_compute_requests, preferred_compute_request},
     ui::SettingsPresenter,
 };
 
@@ -157,9 +158,10 @@ fn main() -> Result<(), AppError> {
 
     // ถ้า config เสีย แอปยังเปิดได้ด้วยค่า default แต่จะไม่เขียนทับไฟล์เดิมโดยไม่ตั้งใจ
     let config_path = config::default_path()?;
-    let loaded = config::load_config(&config_path)?;
+    let config_exists = config_path.is_file();
+    let mut loaded = config::load_config(&config_path)?;
     let persistence_enabled = loaded.warning.is_none();
-    let startup_warning = loaded.warning.map(|warning| {
+    let startup_warning = loaded.warning.take().map(|warning| {
         tracing::warn!(
             config_path = %config_path.display(),
             warning = %warning,
@@ -167,6 +169,23 @@ fn main() -> Result<(), AppError> {
         );
         warning.to_string()
     });
+    let available_requests = available_compute_requests();
+    let configured_compute_request = loaded.config.stt.backend;
+    let selected_compute_request = if !config_exists {
+        preferred_compute_request()
+    } else if available_requests.contains(&configured_compute_request) {
+        configured_compute_request
+    } else {
+        preferred_compute_request()
+    };
+    if config_exists && configured_compute_request != selected_compute_request {
+        tracing::warn!(
+            requested_backend = configured_compute_request.as_str(),
+            fallback_backend = selected_compute_request.as_str(),
+            "Saved compute backend is unavailable; using the preferred available backend"
+        );
+    }
+    loaded.config.stt.backend = selected_compute_request;
     let default_model_path = config::default_model_path()?;
     let controller = Rc::new(RefCell::new(ApplicationController::new(loaded.config)));
     let model_path = controller
@@ -209,6 +228,7 @@ fn main() -> Result<(), AppError> {
         desktop_session = desktop_session.as_str(),
         settings_backend = desktop_session.as_str(),
         overlay_backend = effective_overlay_backend.as_str(),
+        compute_backend = selected_compute_request.as_str(),
         xwayland_available = effective_overlay_backend == OverlayRuntimeBackend::XWayland,
         "Subtitle-live initialized"
     );
