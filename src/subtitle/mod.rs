@@ -238,6 +238,16 @@ fn reconcile_mutable_tail(
             );
         }
 
+        // Final ที่เริ่มเหมือน stable sentence แล้วแก้คำภายในเป็นฉบับของประโยคเดิม
+        // จึงตัดประโยคนั้นออกและรับเฉพาะประโยคใหม่ที่ตามมา
+        if !preserve_prefix_shrink && stable_prefix >= MIN_ROLLING_OVERLAP_WORDS {
+            let tail_start = incoming
+                .iter()
+                .position(|word| is_sentence_boundary_word(word))
+                .map_or(incoming.len(), |index| index + 1);
+            return incoming[tail_start..].to_vec();
+        }
+
         // Rolling window อาจเริ่มกลางประโยคที่อยู่ท้าย stable prefix แล้ว จึงต้อง
         // ตัดส่วนที่ซ้ำออกแทนการ commit ประโยคเดิมซ้ำอีกครั้ง
         let stable_overlap = longest_word_overlap(stable, incoming);
@@ -273,12 +283,16 @@ fn reconcile_mutable_tail(
     // Whisper อาจแก้คำสุดท้ายพร้อมกับเลื่อนหน้าต่าง เช่น
     // `... consistent with creation` -> `consistent with creating` ทำให้ suffix
     // ไม่ตรงทั้งหมด หา prefix ของผลใหม่ภายใน draft เดิมเพื่อรักษาคำที่เลื่อนพ้นจอ
-    if preserve_prefix_shrink {
-        if let Some(start) = shifted_window_start(draft, incoming) {
+    if let Some(start) = shifted_window_start(draft, incoming) {
+        if preserve_prefix_shrink {
             let mut merged = draft[..start].to_vec();
             merged.extend(incoming.iter().cloned());
             return merged;
         }
+
+        // Final ที่ตรงกับช่วงกลางของ draft เป็นผลแทนที่ทั้งช่วง จึงไม่เก็บ
+        // prefix ชั่วคราวซึ่ง Final ไม่ได้ยืนยัน
+        return incoming.to_vec();
     }
 
     if let Some(start) = aligned_draft_start(draft, incoming) {
