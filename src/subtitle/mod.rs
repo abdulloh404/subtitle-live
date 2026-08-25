@@ -113,7 +113,7 @@ impl TranscriptReconciler {
             return;
         }
 
-        let tail = reconcile_mutable_tail(&self.active_prefix, &self.draft, &incoming, true);
+        let tail = reconcile_mutable_tail(&self.active_prefix, &self.draft, &incoming, true, true);
         self.set_active_tail(tail);
     }
 
@@ -141,8 +141,13 @@ impl TranscriptReconciler {
                 fallback
             } else {
                 let mut segment = self.active_prefix.clone();
-                let tail =
-                    reconcile_mutable_tail(&self.active_prefix, &self.draft, &incoming, false);
+                let tail = reconcile_mutable_tail(
+                    &self.active_prefix,
+                    &self.draft,
+                    &incoming,
+                    false,
+                    true,
+                );
                 segment.extend(tail);
                 segment
             }
@@ -215,20 +220,21 @@ fn reconcile_mutable_tail(
     stable: &[String],
     draft: &[String],
     incoming: &[String],
-    preserve_partial_draft: bool,
+    preserve_prefix_shrink: bool,
+    preserve_unaligned_shrink: bool,
 ) -> Vec<String> {
     if !stable.is_empty() {
         let stable_prefix = common_prefix_len(stable, incoming);
         if stable_prefix == incoming.len() {
             // สมมติฐานสั้นที่ย้อนกลับไปมีเพียงประโยคที่ปิดแล้วต้องไม่ลบ draft
             // ซึ่งยังแสดงอยู่ รอผลที่ต่อเนื่องหรือ Final มาตัดสินแทน
-            return reconciled_partial_tail(draft, &[], preserve_partial_draft);
+            return reconciled_partial_tail(draft, &[], preserve_prefix_shrink);
         }
         if stable_prefix == stable.len() {
             return reconciled_partial_tail(
                 draft,
                 &incoming[stable_prefix..],
-                preserve_partial_draft,
+                preserve_prefix_shrink,
             );
         }
 
@@ -239,21 +245,21 @@ fn reconcile_mutable_tail(
             return reconciled_partial_tail(
                 draft,
                 &incoming[stable_overlap..],
-                preserve_partial_draft,
+                preserve_prefix_shrink,
             );
         }
 
         // บางรอบ Whisper เติมคำหลงมาหนึ่งคำหน้าประโยคเก่าที่เลื่อนพ้น window
         // ต้องข้ามคำนั้นก่อนตรวจ suffix เพื่อไม่ให้ประโยคเดิมกลับมาแสดงซ้ำชั่วคราว
         if let Some(tail_start) = stable_tail_start_after_leading_word(stable, incoming) {
-            return reconciled_partial_tail(draft, &incoming[tail_start..], preserve_partial_draft);
+            return reconciled_partial_tail(draft, &incoming[tail_start..], preserve_prefix_shrink);
         }
     }
 
     // Whisper บางรอบย้อนกลับมาเหลือเพียง prefix ของ draft เดิมก่อนจะต่อคำใหม่
     // การรับผลนั้นทันทีทำให้ subtitle หด ทั้งที่ยังไม่มีคำแก้ไขมาหักล้างข้อความเดิม
     let draft_prefix = common_prefix_len(draft, incoming);
-    if preserve_partial_draft && incoming.len() < draft.len() && draft_prefix == incoming.len() {
+    if preserve_prefix_shrink && incoming.len() < draft.len() && draft_prefix == incoming.len() {
         return draft.to_vec();
     }
 
@@ -267,7 +273,7 @@ fn reconcile_mutable_tail(
     // Whisper อาจแก้คำสุดท้ายพร้อมกับเลื่อนหน้าต่าง เช่น
     // `... consistent with creation` -> `consistent with creating` ทำให้ suffix
     // ไม่ตรงทั้งหมด หา prefix ของผลใหม่ภายใน draft เดิมเพื่อรักษาคำที่เลื่อนพ้นจอ
-    if preserve_partial_draft {
+    if preserve_prefix_shrink {
         if let Some(start) = shifted_window_start(draft, incoming) {
             let mut merged = draft[..start].to_vec();
             merged.extend(incoming.iter().cloned());
@@ -279,16 +285,22 @@ fn reconcile_mutable_tail(
         return incoming[start..].to_vec();
     }
 
+    // ผลที่สั้นกว่าแต่หาแนวต่อไม่ได้ยังไม่มีหลักฐานพอให้ลบคำเดิม โดยเฉพาะเมื่อ
+    // rolling window เลื่อนต้นประโยคออกไปหรือ Whisper เปลี่ยนรูปประโยคชั่วคราว
+    if preserve_unaligned_shrink && incoming.len() < draft.len() {
+        return draft.to_vec();
+    }
+
     incoming.to_vec()
 }
 
-/// รักษา draft เดิมเมื่อ Partial ใหม่เป็นเพียง prefix ที่สั้นกว่า แต่ให้ Final ตัดคำได้
+/// รักษา draft เดิมเมื่อ hypothesis ใหม่เป็นเพียง prefix ที่สั้นกว่า
 fn reconciled_partial_tail(
     draft: &[String],
     incoming_tail: &[String],
-    preserve_partial_draft: bool,
+    preserve_prefix_shrink: bool,
 ) -> Vec<String> {
-    if preserve_partial_draft
+    if preserve_prefix_shrink
         && incoming_tail.len() < draft.len()
         && common_prefix_len(draft, incoming_tail) == incoming_tail.len()
     {
@@ -425,19 +437,33 @@ impl CaptionLineBuffer {
     where
         F: FnMut(&str) -> bool,
     {
-        let incoming = words(text);
+        let mut incoming = words(text);
         if incoming.is_empty() {
             return self.presentation(max_lines);
         }
 
         if !self.previous_words.is_empty() {
             let common_prefix = common_prefix_len(&self.previous_words, &incoming);
+            let mut history_aligned = common_prefix > 0;
             if common_prefix == 0 {
                 let shifted_overlap = longest_word_overlap(&self.previous_words, &incoming);
                 if shifted_overlap >= 3 && shifted_overlap < self.previous_words.len() {
+                    history_aligned = true;
                     let removed_prefix = self.previous_words.len() - shifted_overlap;
-                    self.active_start = self.active_start.saturating_sub(removed_prefix);
+                    if removed_prefix > self.active_start {
+                        // คำที่หลุดจาก source ยังอยู่บนบรรทัดปัจจุบัน จึงรักษาไว้และต่อเฉพาะ suffix ใหม่
+                        let mut stabilized = self.previous_words.clone();
+                        stabilized.extend(incoming[shifted_overlap..].iter().cloned());
+                        incoming = stabilized;
+                    } else {
+                        self.active_start -= removed_prefix;
+                    }
                 }
+            }
+
+            // ผลที่สั้นลงแต่ยังอยู่ในหน้าต่างเดิมต้องไม่ดึงคำที่ผู้ใช้อ่านแล้วออกจากจอ
+            if history_aligned && incoming.len() < self.previous_words.len() {
+                return self.presentation(max_lines);
             }
         }
 
@@ -604,6 +630,40 @@ mod tests {
         assert_eq!(
             reconciler.presentation_text(),
             "First sentence. still speaking clearly"
+        );
+    }
+
+    #[test]
+    fn shorter_unaligned_partial_does_not_erase_the_existing_draft() {
+        let mut reconciler = TranscriptReconciler::default();
+
+        partial(
+            &mut reconciler,
+            1,
+            "My name is Alba and I'm an English teacher",
+        );
+        partial(&mut reconciler, 1, "I'm Alba and I'm an English teacher");
+
+        assert_eq!(
+            reconciler.presentation_text(),
+            "My name is Alba and I'm an English teacher"
+        );
+    }
+
+    #[test]
+    fn shorter_unaligned_final_does_not_erase_the_existing_draft() {
+        let mut reconciler = TranscriptReconciler::default();
+
+        partial(
+            &mut reconciler,
+            1,
+            "My name is Alba and I'm an English teacher",
+        );
+        final_update(&mut reconciler, 1, "I'm Alba and I'm an English teacher");
+
+        assert_eq!(
+            reconciler.presentation_text(),
+            "My name is Alba and I'm an English teacher"
         );
     }
 
@@ -1038,6 +1098,34 @@ mod tests {
         assert_eq!(
             caption(&mut buffer, "one too three", 2, 7),
             "one two\nthree"
+        );
+    }
+
+    #[test]
+    fn words_trimmed_from_the_source_do_not_shrink_the_visible_line() {
+        let mut buffer = CaptionLineBuffer::default();
+
+        assert_eq!(
+            caption(&mut buffer, "one two three four", 2, 100),
+            "one two three four"
+        );
+        assert_eq!(
+            caption(&mut buffer, "two three four five", 2, 100),
+            "one two three four five"
+        );
+    }
+
+    #[test]
+    fn a_shorter_aligned_partial_keeps_the_visible_words() {
+        let mut buffer = CaptionLineBuffer::default();
+
+        assert_eq!(
+            caption(&mut buffer, "one two three four", 2, 100),
+            "one two three four"
+        );
+        assert_eq!(
+            caption(&mut buffer, "one two three", 2, 100),
+            "one two three four"
         );
     }
 
