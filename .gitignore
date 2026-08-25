@@ -6,5 +6,4 @@
 /models/
 
 # เอกสาร requirement ภายใน workspace เป็นบริบทเฉพาะเครื่องและไม่รวมใน source package
-*.md
 AGENTS.md
