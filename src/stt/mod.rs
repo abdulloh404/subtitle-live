@@ -483,7 +483,7 @@ struct ActiveStt {
     window_samples: usize,
     /// จำนวนตัวอย่างใหม่ขั้นต่ำก่อนสร้างผลชั่วคราวครั้งถัดไป
     step_samples: usize,
-    /// เสียงทั้ง utterance ปัจจุบันสำหรับอนุมาน Final หลังพบ endpoint
+    /// เสียงทั้ง utterance ปัจจุบันสำหรับตรวจขีดจำกัดความยาวของ segment
     utterance_audio: Vec<f32>,
     /// เสียงก่อนเริ่ม utterance เล็กน้อยเพื่อรักษาต้นคำที่อยู่ก่อน threshold
     pre_roll_audio: VecDeque<f32>,
@@ -503,10 +503,63 @@ struct ActiveStt {
     observed_dropped: u64,
     /// รหัสช่วงคำพูดปัจจุบัน เพิ่มเมื่อยืนยันผลหรือเสียงขาดตอน
     segment_id: u64,
-    /// ผลชั่วคราวล่าสุด ใช้ไม่ส่งข้อความเดิมซ้ำโดยไม่จำเป็น
+    /// ยืนยันคำต่อเนื่องและสะสม context ก่อนส่งเป็น Partial
+    partial_stability: PartialStabilityGate,
+    /// ผล Partial ที่ผ่าน stability gate ล่าสุด ใช้ fallback และป้องกัน event ซ้ำ
     previous_partial: String,
     /// ระบุว่ากำลังสะสม utterance ซึ่งยังแก้ไขได้
     speech_active: bool,
+}
+
+/// ยืนยันช่วงคำจาก hypothesis ต่อเนื่องและสะสม context ที่ส่งออกภายใน segment
+#[derive(Debug, Default)]
+struct PartialStabilityGate {
+    /// hypothesis ดิบจาก inference ก่อนหน้า ใช้เทียบกับผลรอบใหม่
+    previous_hypothesis: Vec<String>,
+    /// คำที่ยืนยันและส่งออกแล้ว ใช้รักษา anchor เมื่อ rolling window เหลือคำซ้อนเดียว
+    confirmed_context: Vec<String>,
+}
+
+impl PartialStabilityGate {
+    /// คืน confirmed context ที่ต่อจากรอบก่อน และเก็บ hypothesis ใหม่ไว้เทียบรอบถัดไป
+    fn confirm(&mut self, hypothesis: &str) -> Option<String> {
+        let incoming = hypothesis
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if incoming.is_empty() {
+            self.previous_hypothesis.clear();
+            return None;
+        }
+
+        let previous = std::mem::replace(&mut self.previous_hypothesis, incoming);
+        let current = &self.previous_hypothesis;
+        let (current_start, confirmed_words) = longest_common_word_run(&previous, current)?;
+
+        // คำเดียวมีโอกาสตรงกันโดยบังเอิญสูง ยกเว้น hypothesis ฝั่งใดฝั่งหนึ่ง
+        // มีคำเดียวจริง ซึ่งเป็นกรณีเริ่มพูดหรือรอยต่อของ rolling window
+        if confirmed_words == 1 && previous.len() > 1 && current.len() > 1 {
+            return None;
+        }
+
+        let confirmed = current[current_start..current_start + confirmed_words].to_vec();
+        if self.confirmed_context.is_empty() {
+            self.confirmed_context = confirmed;
+        } else if !confirmed_run_is_contained(&self.confirmed_context, &confirmed) {
+            let append_start = confirmed_context_append_start(&self.confirmed_context, &confirmed)
+                .unwrap_or_default();
+            self.confirmed_context
+                .extend(confirmed[append_start..].iter().cloned());
+        }
+
+        Some(self.confirmed_context.join(" "))
+    }
+
+    /// ล้าง candidate และ confirmed context เมื่อจบ segment หรือเกิด audio discontinuity
+    fn clear(&mut self) {
+        self.previous_hypothesis.clear();
+        self.confirmed_context.clear();
+    }
 }
 
 /// ผลจากการอนุมานหนึ่งรอบพร้อมค่าหน่วงเวลาสำหรับหน้า Performance
@@ -570,6 +623,7 @@ impl ActiveStt {
             last_speech_at: None,
             observed_dropped,
             segment_id: 1,
+            partial_stability: PartialStabilityGate::default(),
             previous_partial: String::new(),
             speech_active: false,
         })
@@ -723,11 +777,9 @@ impl ActiveStt {
             return Ok(None);
         }
 
-        let audio: Vec<f32> = if final_inference {
-            self.utterance_audio.clone()
-        } else {
-            self.rolling_audio.iter().copied().collect()
-        };
+        // Final ใช้ rolling window เดียวกับ Partial เพื่อไม่ให้ worker ต้องถอดเสียง
+        // ทั้ง utterance ซ้ำและหยุดส่ง subtitle นานขึ้นเมื่อ segment มีความยาวมาก
+        let audio: Vec<f32> = self.rolling_audio.iter().copied().collect();
         if audio.is_empty() {
             return Ok(None);
         }
@@ -808,7 +860,7 @@ impl ActiveStt {
         }))
     }
 
-    /// สร้างผลตาม endpoint และไม่ใช้ข้อความซ้ำสองรอบเป็นหลักฐานว่าประโยคจบแล้ว
+    /// สร้าง Partial จากคำที่ stability gate ยืนยัน หรือสร้าง Final ตาม endpoint
     fn make_update(
         &mut self,
         hypothesis: String,
@@ -822,7 +874,8 @@ impl ActiveStt {
                 text,
             });
         }
-        if hypothesis.is_empty() || hypothesis == self.previous_partial {
+        let hypothesis = self.partial_stability.confirm(&hypothesis)?;
+        if hypothesis == self.previous_partial {
             None
         } else {
             self.previous_partial.clone_from(&hypothesis);
@@ -843,6 +896,7 @@ impl ActiveStt {
         self.trailing_silence_samples = 0;
         self.pending_audio_started_at = None;
         self.last_speech_at = None;
+        self.partial_stability.clear();
         self.previous_partial.clear();
         self.speech_active = false;
     }
@@ -853,6 +907,73 @@ impl ActiveStt {
         self.deferred_audio.clear();
         self.segment_id = self.segment_id.saturating_add(1);
     }
+}
+
+/// หาช่วงคำต่อเนื่องที่ยาวที่สุดซึ่งพบใน hypothesis สองรอบโดยไม่สนวรรคตอนท้าย
+fn longest_common_word_run(previous: &[String], current: &[String]) -> Option<(usize, usize)> {
+    let mut best_current_start = 0;
+    let mut best_length = 0;
+
+    for previous_start in 0..previous.len() {
+        for current_start in 0..current.len() {
+            let mut length = 0;
+            while previous_start + length < previous.len()
+                && current_start + length < current.len()
+                && stability_words_equal(
+                    &previous[previous_start + length],
+                    &current[current_start + length],
+                )
+            {
+                length += 1;
+            }
+
+            let current_end = current_start + length;
+            let best_end = best_current_start + best_length;
+            if length > best_length || (length == best_length && current_end > best_end) {
+                best_current_start = current_start;
+                best_length = length;
+            }
+        }
+    }
+
+    (best_length > 0).then_some((best_current_start, best_length))
+}
+
+/// ตรวจว่าช่วงยืนยันใหม่มีอยู่ครบแล้วภายใน confirmed context เดิมหรือไม่
+fn confirmed_run_is_contained(previous: &[String], incoming: &[String]) -> bool {
+    longest_common_word_run(previous, incoming)
+        .is_some_and(|(_, matched)| matched == incoming.len())
+}
+
+/// หาตำแหน่งคำใหม่หลัง anchor ที่เชื่อมกับท้าย confirmed context ได้ดีที่สุด
+fn confirmed_context_append_start(previous: &[String], incoming: &[String]) -> Option<usize> {
+    let mut best = None;
+    for incoming_start in 0..incoming.len() {
+        let maximum = previous.len().min(incoming.len() - incoming_start);
+        let overlap = (1..=maximum).rev().find(|&length| {
+            previous[previous.len() - length..]
+                .iter()
+                .zip(&incoming[incoming_start..incoming_start + length])
+                .all(|(left, right)| stability_words_equal(left, right))
+        });
+        let Some(overlap) = overlap else {
+            continue;
+        };
+        let append_start = incoming_start + overlap;
+        if best.is_none_or(|(best_overlap, best_append_start)| {
+            overlap > best_overlap || (overlap == best_overlap && append_start > best_append_start)
+        }) {
+            best = Some((overlap, append_start));
+        }
+    }
+    best.map(|(_, append_start)| append_start)
+}
+
+/// เทียบคำสำหรับ stability gate โดยไม่ให้ตัวพิมพ์หรือวรรคตอนรอบคำสร้างผลต่างเทียม
+fn stability_words_equal(left: &str, right: &str) -> bool {
+    let left = left.trim_matches(|character: char| !character.is_alphanumeric());
+    let right = right.trim_matches(|character: char| !character.is_alphanumeric());
+    !left.is_empty() && left.eq_ignore_ascii_case(right)
 }
 
 /// ใช้ partial ล่าสุดเมื่อ Whisper คืน Final ว่าง เพื่อไม่ลบข้อความที่เคยแสดงแล้ว
@@ -988,8 +1109,8 @@ fn normalize_partial_hypothesis_text(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        final_hypothesis_or_previous, normalize_hypothesis_text, normalize_partial_hypothesis_text,
-        spawn_service,
+        PartialStabilityGate, final_hypothesis_or_previous, normalize_hypothesis_text,
+        normalize_partial_hypothesis_text, spawn_service,
     };
     use crate::audio::LatestQueue;
 
@@ -1023,6 +1144,82 @@ mod tests {
         );
         assert_eq!(normalize_partial_hypothesis_text("So?"), "So");
         assert_eq!(normalize_partial_hypothesis_text("Wait,"), "Wait,");
+    }
+
+    #[test]
+    fn unstable_replacement_is_not_emitted_before_a_second_matching_result() {
+        let mut gate = PartialStabilityGate::default();
+
+        assert_eq!(gate.confirm("We can't"), None);
+        assert_eq!(gate.confirm("speaking"), None);
+        assert_eq!(gate.confirm("speaking"), Some("speaking".to_owned()));
+        assert_eq!(
+            gate.confirm("speaking I couldn't"),
+            Some("speaking".to_owned())
+        );
+        assert_eq!(
+            gate.confirm("speaking I couldn't"),
+            Some("speaking I couldn't".to_owned())
+        );
+    }
+
+    #[test]
+    fn rolling_window_emits_only_the_words_confirmed_by_adjacent_results() {
+        let mut gate = PartialStabilityGate::default();
+
+        assert_eq!(gate.confirm("started making friends who were native"), None);
+        assert_eq!(
+            gate.confirm("making friends who were native speakers"),
+            Some("making friends who were native".to_owned())
+        );
+        assert_eq!(
+            gate.confirm("friends who were native speakers"),
+            Some("making friends who were native speakers".to_owned())
+        );
+    }
+
+    #[test]
+    fn confirmed_context_bridges_a_single_word_window_shift() {
+        let mut gate = PartialStabilityGate::default();
+
+        assert_eq!(gate.confirm("listening and just overall"), None);
+        assert_eq!(
+            gate.confirm("listening and just overall"),
+            Some("listening and just overall".to_owned())
+        );
+        assert_eq!(
+            gate.confirm("and just overall confident"),
+            Some("listening and just overall".to_owned())
+        );
+        assert_eq!(gate.confirm("overall confidence"), None);
+        assert_eq!(
+            gate.confirm("overall confidence"),
+            Some("listening and just overall confidence".to_owned())
+        );
+        assert_eq!(gate.confirm("confidence So here's the"), None);
+        assert_eq!(
+            gate.confirm("confidence So here's the thing"),
+            Some("listening and just overall confidence So here's the".to_owned())
+        );
+    }
+
+    #[test]
+    fn confirmed_revision_appends_only_words_after_the_previous_tail() {
+        let mut gate = PartialStabilityGate::default();
+
+        assert_eq!(gate.confirm("people especially and fast"), None);
+        assert_eq!(
+            gate.confirm("people especially and fast"),
+            Some("people especially and fast".to_owned())
+        );
+        assert_eq!(
+            gate.confirm("people especially in fast casual"),
+            Some("people especially and fast".to_owned())
+        );
+        assert_eq!(
+            gate.confirm("people especially in fast casual"),
+            Some("people especially and fast casual".to_owned())
+        );
     }
 
     #[test]

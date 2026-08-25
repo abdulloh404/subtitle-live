@@ -33,9 +33,6 @@ run:
 format:
 	cargo fmt --all
 
-install-hooks:
-	git config core.hooksPath .githooks
-
 lint:
 	$(COMPUTE_ENV) && cargo clippy --all-targets $(COMPUTE_FEATURES) -- -D warnings
 
