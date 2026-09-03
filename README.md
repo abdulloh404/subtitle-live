@@ -35,7 +35,7 @@ subtitle export are intentionally outside the current scope.
 
 - [ROCm/HIP quick start](#rocmhip-quick-start)
 - [Install the build dependencies](#1-install-the-build-dependencies)
-- [Install ROCm/HIP](#2-install-rocmhip)
+- [Install ROCm, HIP, and hipBLAS](#2-install-rocm-hip-and-hipblas)
 - [Install Rust](#3-install-rust)
 - [Get the source and model](#4-get-the-source-and-model)
 - [Build and run](#5-build-and-run)
@@ -79,6 +79,7 @@ sudo apt update
 sudo apt install --yes --no-install-recommends \
   ca-certificates curl git gnupg wget \
   build-essential clang cmake libclang-dev pkg-config \
+  libatomic1 libquadmath0 \
   libgtk-4-dev libadwaita-1-dev \
   libpipewire-0.3-dev libspa-0.2-dev \
   pulseaudio-utils xwayland
@@ -93,73 +94,171 @@ sudo apt install gnome-shell-extension-appindicator
 The tray is optional. The settings window and subtitle pipeline can still run
 when the desktop has no StatusNotifier/AppIndicator host.
 
-## 2. Install ROCm/HIP
+## 2. Install ROCm, HIP, and hipBLAS
 
-ROCm packages and supported GPUs change independently of this project. Check
-the exact GPU, Ubuntu release, and kernel before installing or changing the AMD
-driver:
+`COMPUTE_BACKEND=rocm` enables the `whisper-rs/hipblas` feature. Compiling that
+backend requires all of the following, not only the ROCm runtime:
 
-- [ROCm system requirements](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html)
-- [Ubuntu package-manager installation](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/install/install-methods/package-manager/package-manager-ubuntu.html)
-- [Radeon and Ryzen installation guides](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/)
+- a supported AMD GPU and a working `amdgpu` kernel driver;
+- the HIP runtime and `hipcc` compiler;
+- the hipBLAS and rocBLAS shared libraries; and
+- HIP, hipBLAS, and rocBLAS headers and CMake package files.
 
-Follow the AMD guide that matches the hardware. Do not copy a versioned AMD
-repository URL from an old guide. For the standard Ubuntu package-manager path,
-AMD currently provides the complete `rocm` meta-package after its repository is
-configured:
+Check the [ROCm compatibility matrix](https://rocm.docs.amd.com/en/latest/compatibility/compatibility-matrix.html)
+for the exact GPU, Ubuntu release, and kernel before changing a driver. Radeon
+and Ryzen systems can have different kernel requirements; follow AMD's
+[hardware-specific guides](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/)
+instead of replacing the installed driver automatically.
 
-```bash
-sudo apt install rocm
-```
+### Do not mix the two ROCm package streams
 
-The build needs HIP development tools and libraries, including `hipcc`,
-HIPBLAS, and rocBLAS. A runtime-only HIP installation is not enough to compile
-the project.
+AMD changed package names and the installation root in ROCm Core SDK 7.14:
 
-Grant the current user access to the GPU, then log out and back in or reboot:
+| Release stream | Package names | Installation root | Use in this guide |
+| --- | --- | --- | --- |
+| ROCm Core SDK 7.14 | `amdrocm-*` | `/opt/rocm/core` | Recommended |
+| Legacy ROCm 7.2.x | `rocm-*`, `hipblas-*`, `rocblas-*` | `/opt/rocm` | Existing legacy installations only |
 
-```bash
-sudo usermod -a -G video,render "$LOGNAME"
-```
+Do not install packages from both streams. Migrate or uninstall the legacy
+stack first by following AMD's
+[ROCm 7.14 transition guide](https://rocm.docs.amd.com/en/latest/about/transition-guide-TheRock.html).
+The project helper defaults to `/opt/rocm/core`, so ROCm Core SDK 7.14 needs no
+ROCm-root override.
 
-Complete AMD's linker setup if the installer did not do it:
+### Recommended installation: ROCm Core SDK 7.14
 
-```bash
-sudo tee /etc/ld.so.conf.d/rocm.conf >/dev/null <<'EOF'
-/opt/rocm/lib
-/opt/rocm/lib64
-EOF
-sudo ldconfig
-```
-
-Verify the installation before building Subtitle-live:
+These commands cover x86-64 Ubuntu 24.04 and 22.04. Confirm the installed
+release first:
 
 ```bash
-groups
-hipcc --version
-rocminfo | grep -i "Marketing Name:"
-ls -l /dev/kfd /dev/dri/renderD*
+uname -m
+. /etc/os-release
+printf '%s\n' "$PRETTY_NAME"
 ```
 
-The current project helper defaults to this development layout:
-
-```text
-ROCm root:     /opt/rocm/core
-ROCm libclang: /opt/rocm/core/llvm/lib
-Host GCC:      /usr/lib/gcc/x86_64-linux-gnu/11
-```
-
-Official ROCm packages commonly expose `/opt/rocm` directly. Override the
-defaults when the local layout differs:
+Register AMD's signing key once:
 
 ```bash
+sudo mkdir --parents --mode=0755 /etc/apt/keyrings
+wget https://repo.amd.com/rocm/packages-multi-arch/gpg/rocm.gpg -O - | \
+  gpg --dearmor | sudo tee /etc/apt/keyrings/amdrocm.gpg >/dev/null
+```
+
+For **Ubuntu 24.04**, register this repository:
+
+```bash
+echo 'deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.gpg] https://repo.amd.com/rocm/packages-multi-arch/ubuntu2404 stable main' | \
+  sudo tee /etc/apt/sources.list.d/rocm.list
+```
+
+For **Ubuntu 22.04**, use this repository instead:
+
+```bash
+echo 'deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.gpg] https://repo.amd.com/rocm/packages-multi-arch/ubuntu2204 stable main' | \
+  sudo tee /etc/apt/sources.list.d/rocm.list
+```
+
+Choose exactly one repository above, then update APT and install the complete
+developer SDK:
+
+```bash
+sudo apt update
+sudo apt install --yes amdrocm-core-sdk7.14
+```
+
+This is the simplest option and supports every GPU architecture packaged in
+the release, but it uses the most disk space. AMD's
+[hipBLAS installation guide](https://rocm.docs.amd.com/projects/hipBLAS/en/latest/install/install.html)
+recommends `amdrocm-core-sdk` for a complete developer installation.
+
+If the exact GPU target is already known, the developer-essentials package is
+smaller and still contains the compiler, runtime, headers, CMake files,
+hipBLAS, and rocBLAS needed by Subtitle-live. For example, use this only for a
+GPU that AMD identifies as `gfx1100`:
+
+```bash
+sudo apt install --yes amdrocm-core-dev7.14-gfx1100
+```
+
+Replace `gfx1100` only with a target listed for the GPU in AMD's compatibility
+matrix. If the target is uncertain, use the all-architecture SDK above. Do not
+install `amdrocm-blas-dev7.14` by itself: it supplies BLAS development files,
+but it is not a complete HIP compiler and GPU runtime installation. In the
+7.14 package stream, `hipcc` is provided by `amdrocm-llvm`, while hipBLAS and
+rocBLAS are consolidated under `amdrocm-blas`.
+
+### Legacy ROCm 7.2.x installation
+
+Use this only when the machine is intentionally kept on AMD's legacy 7.2.x
+repository. The appropriate developer meta-package is:
+
+```bash
+sudo apt install --yes rocm-hip-sdk
+```
+
+`rocm-hip-sdk` includes `hipcc`, `hipblas-dev`, `rocblas-dev`, their runtime
+libraries, headers, and CMake files. Installing only `hipblas` or
+`rocm-hip-runtime` is insufficient for compiling Subtitle-live. Follow AMD's
+[legacy package details](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/package-manager-integration.html)
+when maintaining this stream.
+
+### Configure GPU access and the shell
+
+Add the current user to the groups that own the KFD and DRM render devices:
+
+```bash
+sudo usermod -a -G render,video "$LOGNAME"
+```
+
+Reboot, or log out of the entire desktop session and log back in, before
+continuing. Then expose the ROCm Core SDK commands in the current shell:
+
+```bash
+export PATH="/opt/rocm/core/bin:${PATH}"
+```
+
+For a legacy `/opt/rocm` installation, use these overrides instead:
+
+```bash
+export PATH="/opt/rocm/bin:${PATH}"
 export SUBTITLE_LIVE_ROCM_CORE=/opt/rocm
-export SUBTITLE_LIVE_HIP_GCC_DIR="$(dirname "$(gcc -print-libgcc-file-name)")"
 export SUBTITLE_LIVE_LIBCLANG_PATH=/opt/rocm/llvm/lib
 ```
 
-Only set `SUBTITLE_LIVE_ROCM_CORE` and `SUBTITLE_LIVE_LIBCLANG_PATH` when those
-paths exist on the machine.
+The build helper currently defaults to GCC 11. Select the GCC installation
+that is actually active on the machine:
+
+```bash
+export SUBTITLE_LIVE_HIP_GCC_DIR="$(dirname "$(gcc -print-libgcc-file-name)")"
+```
+
+### Verify HIP and hipBLAS before building
+
+For ROCm Core SDK 7.14, all commands below must succeed:
+
+```bash
+ROCM_ROOT=/opt/rocm/core
+
+groups
+ls -l /dev/kfd /dev/dri/renderD*
+"$ROCM_ROOT/bin/hipcc" --version
+"$ROCM_ROOT/bin/rocminfo" | grep -E 'Name:[[:space:]]+gfx|Marketing Name'
+
+ls -l \
+  "$ROCM_ROOT/include/hipblas/hipblas.h" \
+  "$ROCM_ROOT/lib/cmake/hip/hip-config.cmake" \
+  "$ROCM_ROOT/lib/cmake/hipblas/hipblas-config.cmake" \
+  "$ROCM_ROOT/lib/cmake/rocblas/rocblas-config.cmake" \
+  "$ROCM_ROOT/lib/libhipblas.so" \
+  "$ROCM_ROOT/lib/librocblas.so"
+
+ldconfig -p | grep -E 'lib(hip|roc)blas\.so'
+```
+
+For a legacy installation, set `ROCM_ROOT=/opt/rocm` before running the same
+checks. If a header, CMake file, or unversioned `.so` link is missing, install
+the development meta-package for the selected stream instead of working around
+the missing file with a manual symlink.
 
 ## 3. Install Rust
 
@@ -384,29 +483,37 @@ Complete the ROCm installation and ensure the active ROCm `bin` directory is on
 `PATH`:
 
 ```bash
-export PATH="/opt/rocm/bin:${PATH}"
+export PATH="/opt/rocm/core/bin:${PATH}"
 hipcc --version
 ```
 
-For a versioned or alternative layout, use the path selected by AMD's installer.
+Use `/opt/rocm/bin` only for a legacy ROCm installation.
 
-### CMake cannot find HIP, HIPBLAS, or rocBLAS
+### CMake cannot find HIP, hipBLAS, or rocBLAS
 
 Point the project helper at the ROCm root that contains the CMake package files:
 
 ```bash
-export SUBTITLE_LIVE_ROCM_CORE=/opt/rocm
+export SUBTITLE_LIVE_ROCM_CORE=/opt/rocm/core
 COMPUTE_BACKEND=rocm make build
 ```
+
+If `/opt/rocm/core/lib/cmake/hipblas/hipblas-config.cmake` or
+`rocblas/rocblas-config.cmake` is absent, the ROCm development packages are
+incomplete. Install `amdrocm-core-sdk7.14` or the correct architecture-specific
+`amdrocm-core-dev7.14-*` package. Legacy ROCm users should use
+`SUBTITLE_LIVE_ROCM_CORE=/opt/rocm`.
 
 ### Bindgen cannot load `libclang`
 
 Set the directory containing the ROCm or system `libclang` shared library:
 
 ```bash
-export SUBTITLE_LIVE_LIBCLANG_PATH=/opt/rocm/llvm/lib
+export SUBTITLE_LIVE_LIBCLANG_PATH=/opt/rocm/core/llvm/lib
 COMPUTE_BACKEND=rocm make build
 ```
+
+Use `/opt/rocm/llvm/lib` only for a legacy ROCm installation.
 
 ### HIP selects the wrong host GCC
 
